@@ -1,0 +1,40 @@
+{
+  "schema": "r1_a7_dual_linker_o6_platform_v1",
+  "configuration_id": "r1_a7_dual_linker_o6_v1",
+  "robot": "Unitree R1-A7",
+  "left_end_effector": "Linker Hand O6",
+  "right_end_effector": "Linker Hand O6",
+  "combined_urdf": {
+    "workspace_relative_path": "../unitree-r1-a7-linker-o6/models/r1_a7_linker_o6.urdf",
+    "pinocchio_package_dir_workspace_relative": "../unitree-r1-a7-linker-o6/models",
+    "sha256": "5a64e7c2e6d4fa6b11e3243ffb4d7bf398e3537338cc0cf147c46ab1b8ef3bc5"
+  },
+  "mechanical_acceptance": {
+    "workspace_relative_path": "../unitree-r1-a7-linker-o6/reports/physical_mechanical_acceptance_2026-09-02.json",
+    "result": "PASS",
+    "evidence_kind": "operator_attestation"
+  },
+  "o6_readonly_state": {
+    "schema": "linker_o6_readonly_state_v1",
+    "transport": "pc2_fc04_only_via_ssh_stdin",
+    "left_device": "/dev/ttyHAND0",
+    "left_slave_id": 40,
+    "right_device": "/dev/ttyHAND1",
+    "right_slave_id": 39,
+    "open_minimum_raw": 250,
+    "open_stability_frames": 3,
+    "maximum_open_span_raw": 1,
+    "freshness_timeout_s": 0.25,
+    "actuation_enabled": false
+  },
+  "test_policy": {
+    "combined_system_claim_requires_this_profile": true,
+    "r1_only_tests_are_component_tests": true
+  },
+  "current_safety_state": {
+    "physical_publishing_enabled": false,
+    "o6_actuation_enabled": false,
+    "combined_collision_bridge_integrated": true,
+    "mode": "shadow-only"
+  }
+}

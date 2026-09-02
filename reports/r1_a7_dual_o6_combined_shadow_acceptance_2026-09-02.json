@@ -1,0 +1,99 @@
+{
+  "schema": "r1_a7_dual_o6_combined_shadow_acceptance_v1",
+  "configuration_id": "r1_a7_dual_linker_o6_v1",
+  "date": "2026-09-02",
+  "result": "PASS",
+  "scope": "combined collision model, dual-O6 FC04 read-only state, and arm shadow candidate chain",
+  "safety_state": {
+    "physical_publishing_enabled": false,
+    "o6_actuation_enabled": false,
+    "dds_command_publisher_created": false,
+    "serial_holding_register_write_enabled": false,
+    "mode": "shadow-only"
+  },
+  "artifacts": {
+    "combined_urdf_sha256": "5a64e7c2e6d4fa6b11e3243ffb4d7bf398e3537338cc0cf147c46ab1b8ef3bc5",
+    "pc2_fc04_source_sha256": "97c3ddc846f21c69846573265cbb2b5f5b99ae18a33f7804471aabef241869e7",
+    "pc2_fc04_binary_sha256": "4ccb7f0d3044c8b23c01ad308992860a2891b416b1bc755d862000cb0e31e99f",
+    "pc2_fc04_binary_build_id": "b29e763742cf9174757052848930f9d1244d0867",
+    "o6_contract_sha256": "7670482194855ad5dd99bca578a634a6990c1bfa51f00e84b52c1366d17dbebb",
+    "o6_receiver_sha256": "90d4ab4ca138d8b956bdd924b632caf8cf4ce2ee1d9293552b7196b6ca4bb307",
+    "arm_bridge_sha256": "5ab72119679221dd65d079ed0d050d0f0782213b8c216143ec34c38dada44bfa",
+    "publisher_shadow_sha256": "482b31ffb2da387e54fe7b3b5a6a8a66ac8f64980f53ee6da4e1a53eccaa7a8d"
+  },
+  "pc2_fc04_evidence": {
+    "left": {
+      "device": "/dev/ttyHAND0",
+      "slave_id": 40,
+      "direction_code": 76,
+      "angles_raw": [254, 255, 254, 254, 254, 254],
+      "errors_raw": [0, 0, 0, 0, 0, 0]
+    },
+    "right": {
+      "device": "/dev/ttyHAND1",
+      "slave_id": 39,
+      "direction_code": 82,
+      "angles_raw": [254, 255, 254, 254, 254, 254],
+      "errors_raw": [0, 0, 0, 0, 0, 0]
+    },
+    "direct_frames_checked": 5,
+    "relay_observation": {
+      "window_s": 1.2,
+      "new_frames_seen": 34,
+      "last_state_age_ms": 1.091,
+      "pair_skew_ms": 2.0322,
+      "gate_status": "fresh_verified_open"
+    },
+    "binary_forbidden_symbols_present": false,
+    "forbidden_symbols": [
+      "writeRegisters",
+      "setControlState",
+      "buildWriteRegisters",
+      "ChannelPublisher"
+    ]
+  },
+  "combined_model_evidence": {
+    "raw_nq": 39,
+    "reduced_nq": 17,
+    "locked_o6_joints": 22,
+    "collision_geometry_count": 44,
+    "o6_and_adapter_collision_geometry_count": 26,
+    "collision_pair_count": 747,
+    "o6_collision_pair_count": 611,
+    "fresh_actual_pose_collision_free": true,
+    "known_self_collision_detected": true,
+    "o6_to_wrist_pitch_pairs_retained": true,
+    "cross_hand_collision_pair_retained": true
+  },
+  "live_shadow_chain": {
+    "robot_state": "fresh CRC-validated 35-axis rt/lowstate snapshot",
+    "arm_source": "synthetic zero-offset source with explicit disarm then two fresh frames",
+    "bridge_status": "dry_run_ok",
+    "candidate_axis_count": 14,
+    "collision_model": "r1_a7_linker_o6_open",
+    "o6_collision_pose": "fresh_verified_open",
+    "publisher_shadow_validation": "valid",
+    "physical_output": false
+  },
+  "disconnect_evidence": {
+    "action": "stop FC04 SSH relay",
+    "receiver_status": "stopped",
+    "bridge_status": "o6_receiver_stopped",
+    "decision": "fault",
+    "collision_model": "r1_a7_linker_o6_unverified",
+    "o6_collision_pose": "not_verified",
+    "candidate_arm_q": null
+  },
+  "tests": {
+    "host_command": "/home/hnh/unitree_r1_dev/.venv-xr/bin/python -m unittest discover -s tests -v",
+    "passed": 97,
+    "failed": 0
+  },
+  "not_covered": [
+    "Vision Pro live motion acceptance",
+    "physical arm command publication",
+    "O6 actuation",
+    "dynamic hand-pose collision checking outside the verified open range",
+    "independent safety certification"
+  ]
+}

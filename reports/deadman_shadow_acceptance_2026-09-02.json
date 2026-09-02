@@ -1,0 +1,58 @@
+{
+  "schema": "r1_a7_keyboard_deadman_shadow_acceptance_v1",
+  "recorded_at": "2026-09-02T09:59:26+08:00",
+  "configuration_id": "r1_a7_dual_linker_o6_v1",
+  "mode": "shadow-only",
+  "acceptance_scope": "keyboard evdev release, press-repeat hold, release, and final fail-closed state transitions only",
+  "evidence_kind": "live_terminal_status_observation",
+  "raw_per_frame_jsonl_preserved": false,
+  "result": "PASS",
+  "input_device": "/dev/input/by-id/usb-DWF8851_Lenovo_Traditional_USB_Keyboard-event-kbd",
+  "key_code": 57,
+  "operator_procedure": [
+    "tap and release Space once",
+    "hold Space for approximately three seconds",
+    "release Space"
+  ],
+  "observed_status_subsequence": [
+    "startup_requires_release",
+    "released",
+    "waiting_for_repeat",
+    "held",
+    "released",
+    "stopped"
+  ],
+  "final_state": {
+    "sequence": 613613986374,
+    "held": false,
+    "status": "stopped",
+    "updated_monotonic_ns": 673614675296
+  },
+  "checks": {
+    "evdev_open_succeeded": true,
+    "evdev_monotonic_clock_configured": true,
+    "release_transition_observed": true,
+    "hold_transition_observed": true,
+    "final_release_transition_observed": true,
+    "final_fail_closed_state_observed": true,
+    "robot_command_process_present_after_test": false
+  },
+  "test_environment_constraints": {
+    "physical_publishing_enabled": false,
+    "o6_actuation_enabled": false,
+    "deadman_source_sha256": "d5d30300ca5fb4f1f4df7d018e11d61e305a0c97522f3dc48797a19167c1cbb6",
+    "launcher_sha256": "c7f76b8897830acdd7bda43bb14d420b46a36d0c51d7adf1aea395f9555e642e",
+    "deadman_unit_tests_passed": 12
+  },
+  "not_measured": [
+    "state transition latency",
+    "sequence continuity and gaps",
+    "per-frame 50 Hz heartbeat rate and jitter",
+    "exact held duration",
+    "mid-run socket and process absence",
+    "device disconnect, loop stall, and SYN_DROPPED fault injection",
+    "shadow consumer and full control-chain behavior",
+    "hardware stuck-key discrimination",
+    "DDS or physical motion behavior"
+  ]
+}
