@@ -3,6 +3,7 @@ import argparse
 import fcntl
 import json
 import math
+import numpy as np
 from multiprocessing import Value, Array, Lock
 import threading
 from pathlib import Path
@@ -34,6 +35,7 @@ RECORD_RUNNING = False  # True if [Recording]
 RECORD_TOGGLE  = False  # Toggle recording state
 DRY_RUN_MODE = False
 ARM_REQUEST_GENERATION = 0
+R1_A7_DEFERRED_REAL_MODE = False
 #  -------        ---------                -----------                -----------            ---------
 #   state          [Ready]      ==>        [Recording]     ==>         [AutoSave]     -->     [Ready]
 #  -------        ---------      |         -----------      |         -----------      |     ---------
@@ -49,6 +51,9 @@ ARM_REQUEST_GENERATION = 0
 def on_press(key):
     global STOP, START, RECORD_TOGGLE, ARM_REQUEST_GENERATION
     if key == 'r':
+        if R1_A7_DEFERRED_REAL_MODE and not READY:
+            logger_mp.warning("[on_press] System is not ready; ignoring r.")
+            return
         ARM_REQUEST_GENERATION += 1
         if not DRY_RUN_MODE:
             START = True
@@ -69,6 +74,85 @@ def get_state() -> dict:
         "READY": READY,
         "RECORD_RUNNING": RECORD_RUNNING,
     }
+
+def is_fresh_motion_data(tele_data, timeout, now=None):
+    if not tele_data.motion_data_ready or tele_data.motion_data_timestamp <= 0.0:
+        return False
+    if now is None:
+        now = time.monotonic()
+    age = now - tele_data.motion_data_timestamp
+    return 0.0 <= age <= timeout
+
+def wait_for_new_fresh_motion_data(tv_wrapper, after_timestamp, timeout):
+    deadline = time.monotonic() + timeout
+    while True:
+        tele_data = tv_wrapper.get_tele_data()
+        now = time.monotonic()
+        if (
+            tele_data.motion_data_timestamp > after_timestamp
+            and is_fresh_motion_data(tele_data, timeout, now=now)
+        ):
+            return tele_data
+        if now >= deadline:
+            return None
+        time.sleep(min(0.005, deadline - now))
+
+def head_yaw_rotation(head_pose):
+    x_axis = head_pose[:3, 0].copy()
+    x_axis[2] = 0.0
+    x_norm = np.linalg.norm(x_axis)
+    if not np.isfinite(x_norm) or np.isclose(x_norm, 0.0, atol=1e-6):
+        return np.eye(3)
+    x_axis /= x_norm
+    y_axis = np.cross(np.array([0.0, 0.0, 1.0]), x_axis)
+    return np.column_stack((x_axis, y_axis, np.array([0.0, 0.0, 1.0])))
+
+def wrist_in_reference_head_yaw_frame(
+    wrist_pose,
+    current_head_pose,
+    reference_head_yaw,
+):
+    current_to_reference = reference_head_yaw.T @ head_yaw_rotation(current_head_pose)
+    waist_origin_offset = np.array([0.15, 0.0, 0.45])
+    pose = wrist_pose.copy()
+    pose[:3, :3] = current_to_reference @ wrist_pose[:3, :3]
+    pose[:3, 3] = (
+        current_to_reference @ (wrist_pose[:3, 3] - waist_origin_offset)
+        + waist_origin_offset
+    )
+    return pose
+
+def anchored_wrist_target(
+    current_pose,
+    vision_reference,
+    robot_reference,
+    waist_to_root,
+    translation_scale,
+):
+    target = robot_reference.copy()
+    target[:3, 3] += translation_scale * waist_to_root @ (
+        current_pose[:3, 3] - vision_reference[:3, 3]
+    )
+    relative_rotation = (
+        current_pose[:3, :3]
+        @ vision_reference[:3, :3].T
+    )
+    target[:3, :3] = (
+        waist_to_root
+        @ relative_rotation
+        @ waist_to_root.T
+        @ robot_reference[:3, :3]
+    )
+    return target
+
+def rotation_error_rad(actual_rotation, target_rotation):
+    cosine = (np.trace(actual_rotation.T @ target_rotation) - 1.0) / 2.0
+    return float(np.arccos(np.clip(cosine, -1.0, 1.0)))
+
+def write_json_line(file, payload, flush=False):
+    file.write(json.dumps(payload, separators=(",", ":")) + "\n")
+    if flush:
+        file.flush()
 
 def write_atomic_json(path: Path, payload: dict):
     temp_path = path.with_name(f".{path.name}.tmp")
@@ -113,6 +197,8 @@ if __name__ == '__main__':
     parser.add_argument('--linker-o6-urdf-root', type=str, default='/home/hnh/unitree_r1_dev/linkerhand-urdf/O6', help='Official Linker O6 URDF root')
     parser.add_argument('--linker-o6-calibration', type=str, default=None, help='Vision Pro input calibration for Linker O6 dry-run')
     parser.add_argument('--linker-o6-live-state', type=str, default=None, help='Atomic JSON target snapshot for isolated Linker O6 simulation')
+    parser.add_argument('--arm-translation-scale', type=float, default=1.0, help='R1_A7 Cartesian translation scale relative to Vision Pro motion')
+    parser.add_argument('--arm-diagnostic-dir', type=str, default=None, help='Directory for R1_A7 alignment JSONL diagnostics')
     # record mode and task info
     parser.add_argument('--record', action = 'store_true', help = 'Enable data recording mode')
     parser.add_argument('--task-dir', type = str, default = './utils/data/', help = 'path to save data')
@@ -142,10 +228,34 @@ if __name__ == '__main__':
         parser.error("--tracking-timeout must be positive.")
     if not (math.isfinite(args.frequency) and args.frequency > 0.0):
         parser.error("--frequency must be positive.")
+    if not (math.isfinite(args.arm_translation_scale) and args.arm_translation_scale > 0.0):
+        parser.error("--arm-translation-scale must be positive.")
 
     DRY_RUN_MODE = args.dry_run
+    r1_a7_deferred_real = (
+        args.arm == "R1_A7"
+        and not args.sim
+        and not args.hand_only
+        and not args.dry_run
+    )
+    R1_A7_DEFERRED_REAL_MODE = r1_a7_deferred_real
+    if args.arm_diagnostic_dir and not r1_a7_deferred_real:
+        parser.error("--arm-diagnostic-dir requires real R1_A7 arm control.")
 
     arm_ctrl = None
+    motion_switcher = None
+    r1_vision_left_reference = None
+    r1_vision_right_reference = None
+    r1_robot_left_reference = None
+    r1_robot_right_reference = None
+    r1_head_yaw_reference = None
+    r1_waist_to_root = None
+    r1_waist_yaw_reference = None
+    arm_diagnostic_file = None
+    arm_diagnostic_path = None
+    arm_diagnostic_sequence = 0
+    arm_diagnostic_next_time = 0.0
+    arm_control_previous_time = None
     dry_run_record_file = None
     img_client = None
     tv_wrapper = None
@@ -159,6 +269,16 @@ if __name__ == '__main__':
     exit_code = 0
 
     try:
+        if args.arm_diagnostic_dir:
+            diagnostic_dir = Path(args.arm_diagnostic_dir).expanduser()
+            diagnostic_dir.mkdir(parents=True, exist_ok=True)
+            arm_diagnostic_path = diagnostic_dir / (
+                f"r1_a7_alignment_{time.strftime('%Y%m%d_%H%M%S')}_{time.time_ns()}.jsonl"
+            )
+            arm_diagnostic_file = arm_diagnostic_path.open("x", encoding="utf-8")
+            arm_diagnostic_path.chmod(0o600)
+            logger_mp.info(f"R1_A7 alignment diagnostics: {arm_diagnostic_path}")
+
         # setup dds communication domains id
         if not args.dry_run:
             from unitree_sdk2py.core.channel import ChannelFactoryInitialize
@@ -415,7 +535,7 @@ if __name__ == '__main__':
             if args.motion:
                 if args.input_mode == "controller":
                     loco_wrapper = LocoClientWrapper()
-            else:
+            elif not r1_a7_deferred_real:
                 motion_switcher = MotionSwitcher()
                 status, result = motion_switcher.Enter_Debug_Mode()
                 logger_mp.info(f"Enter debug mode: {'Success' if status == 0 else 'Failed'}")
@@ -459,8 +579,16 @@ if __name__ == '__main__':
                 arm_ik = R1_A5_ArmIK()
                 arm_ctrl = R1_A5_ArmController(motion_mode=args.motion, simulation_mode=args.sim)
             elif args.arm == "R1_A7":
-                arm_ik = R1_A7_ArmIK()
-                arm_ctrl = R1_A7_ArmController(motion_mode=args.motion, simulation_mode=args.sim)
+                if r1_a7_deferred_real:
+                    arm_ctrl = R1_A7_ArmController(
+                        motion_mode=args.motion,
+                        simulation_mode=args.sim,
+                        deferred_activation=True,
+                    )
+                    arm_ik = None
+                else:
+                    arm_ik = R1_A7_ArmIK()
+                    arm_ctrl = R1_A7_ArmController(motion_mode=args.motion, simulation_mode=args.sim)
 
         # end-effector
         if args.ee in ("dex3", "inspire_ftp", "inspire_dfx") and args.input_mode == "controller":
@@ -549,13 +677,116 @@ if __name__ == '__main__':
             logger_mp.info("🔵  Recording is DISABLED (run with --record to enable).")
         logger_mp.info("🔴  Press [q] to stop and exit the program.")
         logger_mp.info("⚠️  IMPORTANT: Please keep your distance and stay safe.")
+        if r1_a7_deferred_real:
+            START = False
+        r1_arm_request_floor = ARM_REQUEST_GENERATION
         READY = True                  # now ready to (1) enter START state
-        while not START and not STOP: # wait for start or stop signal.
+        while (
+            not STOP
+            and (
+                not START
+                or (r1_a7_deferred_real and r1_vision_left_reference is None)
+            )
+        ):
             time.sleep(0.033)
             if camera_config['head_camera']['enable_zmq'] and xr_need_local_img:
                 head_img = img_client.get_head_frame()
                 if head_img.bgr is not None:
                     tv_wrapper.render_to_xr(head_img.bgr)
+
+            if (
+                r1_a7_deferred_real
+                and ARM_REQUEST_GENERATION > r1_arm_request_floor
+            ):
+                r1_arm_request_floor = ARM_REQUEST_GENERATION
+                START = False
+                reference_tele_data = tv_wrapper.get_tele_data()
+                if not is_fresh_motion_data(
+                    reference_tele_data,
+                    args.tracking_timeout,
+                ):
+                    logger_mp.warning(
+                        "R1_A7 activation rejected: Vision tracking is not fresh; press [r] again."
+                    )
+                    continue
+                motion_switcher = MotionSwitcher()
+                status, result = motion_switcher.Enter_Debug_Mode()
+                if status != 0:
+                    raise RuntimeError(
+                        f"R1_A7 failed to enter debug mode: status={status}, result={result}"
+                    )
+                arm_ctrl.activate()
+                if STOP:
+                    continue
+                post_recenter_tele_data = tv_wrapper.get_tele_data()
+                if not is_fresh_motion_data(
+                    post_recenter_tele_data,
+                    args.tracking_timeout,
+                ):
+                    raise RuntimeError(
+                        "R1_A7 Vision tracking became stale during automatic recentering."
+                    )
+                post_recenter_timestamp = post_recenter_tele_data.motion_data_timestamp
+
+                post_recenter_motor_q = arm_ctrl.get_current_motor_q()
+                r1_waist_yaw_reference = float(post_recenter_motor_q[13])
+                r1_waist_to_root = np.array([
+                    [math.cos(r1_waist_yaw_reference), -math.sin(r1_waist_yaw_reference), 0.0],
+                    [math.sin(r1_waist_yaw_reference), math.cos(r1_waist_yaw_reference), 0.0],
+                    [0.0, 0.0, 1.0],
+                ])
+                arm_ik = R1_A7_ArmIK(waist_yaw=r1_waist_yaw_reference)
+                if STOP:
+                    continue
+
+                reference_tele_data = wait_for_new_fresh_motion_data(
+                    tv_wrapper,
+                    post_recenter_timestamp,
+                    args.tracking_timeout,
+                )
+                if reference_tele_data is None:
+                    raise RuntimeError(
+                        "R1_A7 Vision tracking did not provide a fresh post-activation sample."
+                    )
+
+                activation_motor_q = arm_ctrl.get_current_motor_q()
+                if abs(float(activation_motor_q[13]) - r1_waist_yaw_reference) > 0.02:
+                    raise RuntimeError(
+                        "R1_A7 waist changed while IK was loading; command output has been stopped."
+                    )
+                current_lr_arm_q = arm_ctrl.get_current_dual_arm_q()
+                (
+                    r1_robot_left_reference,
+                    r1_robot_right_reference,
+                ) = arm_ik.forward_wrist_poses(current_lr_arm_q)
+                r1_vision_left_reference = reference_tele_data.left_wrist_pose.copy()
+                r1_vision_right_reference = reference_tele_data.right_wrist_pose.copy()
+                r1_head_yaw_reference = head_yaw_rotation(reference_tele_data.head_pose)
+                if arm_diagnostic_file is not None:
+                    write_json_line(arm_diagnostic_file, {
+                        "schema": "r1_a7_alignment_v1",
+                        "event": "activation",
+                        "wall_time_ns": time.time_ns(),
+                        "monotonic_time_ns": time.monotonic_ns(),
+                        "translation_scale": args.arm_translation_scale,
+                        "official_head_waist_recenter": True,
+                        "waist_yaw_rad": r1_waist_yaw_reference,
+                        "waist_to_root": r1_waist_to_root.tolist(),
+                        "head_pose_reference": reference_tele_data.head_pose.tolist(),
+                        "head_yaw_reference": r1_head_yaw_reference.tolist(),
+                        "vision_left_reference": r1_vision_left_reference.tolist(),
+                        "vision_right_reference": r1_vision_right_reference.tolist(),
+                        "robot_left_reference": r1_robot_left_reference.tolist(),
+                        "robot_right_reference": r1_robot_right_reference.tolist(),
+                        "motor_q_reference": activation_motor_q.tolist(),
+                    }, flush=True)
+                START = True
+                logger_mp.info(
+                    "R1_A7 activated from live posture; Vision heading and wrist references captured."
+                )
+
+        if STOP:
+            raise SystemExit(0)
 
         logger_mp.info("---------------------🚀start Tracking🚀-------------------------")
 
@@ -566,6 +797,13 @@ if __name__ == '__main__':
         # main loop. robot start to follow VR user's motion
         while not STOP:
             start_time = time.time()
+            loop_monotonic = time.monotonic()
+            loop_period_ms = (
+                None
+                if arm_control_previous_time is None
+                else 1000.0 * (loop_monotonic - arm_control_previous_time)
+            )
+            arm_control_previous_time = loop_monotonic
             # get image
             if camera_config['head_camera']['enable_zmq']:
                 if args.record or xr_need_local_img:
@@ -595,6 +833,13 @@ if __name__ == '__main__':
 
             # get xr's tele data
             tele_data = tv_wrapper.get_tele_data()
+            if r1_a7_deferred_real and not is_fresh_motion_data(
+                tele_data,
+                args.tracking_timeout,
+            ):
+                raise RuntimeError(
+                    "R1_A7 Vision tracking is stale; stopping arm command output."
+                )
             if args.ee in ("dex3", "inspire_ftp", "inspire_dfx", "brainco")  and args.input_mode == "hand":
                 with left_hand_pos_array.get_lock():
                     left_hand_pos_array[:] = tele_data.left_hand_pos.flatten()
@@ -644,10 +889,94 @@ if __name__ == '__main__':
 
             # solve ik using motor data and wrist pose, then use ik results to control arms.
             time_ik_start = time.time()
-            sol_q, sol_tauff  = arm_ik.solve_ik(tele_data.left_wrist_pose, tele_data.right_wrist_pose, current_lr_arm_q, current_lr_arm_dq)
+            left_wrist_target = tele_data.left_wrist_pose
+            right_wrist_target = tele_data.right_wrist_pose
+            if r1_a7_deferred_real:
+                left_wrist_pose = wrist_in_reference_head_yaw_frame(
+                    tele_data.left_wrist_pose,
+                    tele_data.head_pose,
+                    r1_head_yaw_reference,
+                )
+                right_wrist_pose = wrist_in_reference_head_yaw_frame(
+                    tele_data.right_wrist_pose,
+                    tele_data.head_pose,
+                    r1_head_yaw_reference,
+                )
+                left_wrist_target = anchored_wrist_target(
+                    left_wrist_pose,
+                    r1_vision_left_reference,
+                    r1_robot_left_reference,
+                    r1_waist_to_root,
+                    args.arm_translation_scale,
+                )
+                right_wrist_target = anchored_wrist_target(
+                    right_wrist_pose,
+                    r1_vision_right_reference,
+                    r1_robot_right_reference,
+                    r1_waist_to_root,
+                    args.arm_translation_scale,
+                )
+            if r1_a7_deferred_real:
+                sol_q, sol_tauff = arm_ik.solve_ik(
+                    left_wrist_target,
+                    right_wrist_target,
+                    current_lr_arm_q,
+                    current_lr_arm_dq,
+                    raise_on_failure=True,
+                )
+            else:
+                sol_q, sol_tauff = arm_ik.solve_ik(
+                    left_wrist_target,
+                    right_wrist_target,
+                    current_lr_arm_q,
+                    current_lr_arm_dq,
+                )
             time_ik_end = time.time()
             logger_mp.debug(f"ik:\t{round(time_ik_end - time_ik_start, 6)}")
             arm_ctrl.ctrl_dual_arm(sol_q, sol_tauff)
+            diagnostic_now = time.monotonic()
+            if (
+                arm_diagnostic_file is not None
+                and diagnostic_now >= arm_diagnostic_next_time
+            ):
+                actual_left_pose, actual_right_pose = arm_ik.forward_wrist_poses(current_lr_arm_q)
+                solved_left_pose, solved_right_pose = arm_ik.forward_wrist_poses(sol_q)
+                arm_diagnostic_sequence += 1
+                arm_diagnostic_next_time = diagnostic_now + 0.1
+                write_json_line(arm_diagnostic_file, {
+                    "schema": "r1_a7_alignment_v1",
+                    "event": "sample",
+                    "sequence": arm_diagnostic_sequence,
+                    "wall_time_ns": time.time_ns(),
+                    "monotonic_time_ns": time.monotonic_ns(),
+                    "source_monotonic_time": tele_data.motion_data_timestamp,
+                    "tracking_age_ms": 1000.0 * (diagnostic_now - tele_data.motion_data_timestamp),
+                    "loop_period_ms": loop_period_ms,
+                    "ik_duration_ms": 1000.0 * (time_ik_end - time_ik_start),
+                    "head_pose": tele_data.head_pose.tolist(),
+                    "vision_left_processed_dynamic_heading": tele_data.left_wrist_pose.tolist(),
+                    "vision_right_processed_dynamic_heading": tele_data.right_wrist_pose.tolist(),
+                    "vision_left_fixed_heading": left_wrist_pose.tolist(),
+                    "vision_right_fixed_heading": right_wrist_pose.tolist(),
+                    "left_target": left_wrist_target.tolist(),
+                    "right_target": right_wrist_target.tolist(),
+                    "q_actual": current_lr_arm_q.tolist(),
+                    "dq_actual": current_lr_arm_dq.tolist(),
+                    "q_ik_command": sol_q.tolist(),
+                    "actual_left_pose": actual_left_pose.tolist(),
+                    "actual_right_pose": actual_right_pose.tolist(),
+                    "solved_left_pose": solved_left_pose.tolist(),
+                    "solved_right_pose": solved_right_pose.tolist(),
+                    "left_actual_position_error_m": float(np.linalg.norm(actual_left_pose[:3, 3] - left_wrist_target[:3, 3])),
+                    "right_actual_position_error_m": float(np.linalg.norm(actual_right_pose[:3, 3] - right_wrist_target[:3, 3])),
+                    "left_solved_position_error_m": float(np.linalg.norm(solved_left_pose[:3, 3] - left_wrist_target[:3, 3])),
+                    "right_solved_position_error_m": float(np.linalg.norm(solved_right_pose[:3, 3] - right_wrist_target[:3, 3])),
+                    "left_actual_rotation_error_rad": rotation_error_rad(actual_left_pose[:3, :3], left_wrist_target[:3, :3]),
+                    "right_actual_rotation_error_rad": rotation_error_rad(actual_right_pose[:3, :3], right_wrist_target[:3, :3]),
+                    "left_solved_rotation_error_rad": rotation_error_rad(solved_left_pose[:3, :3], left_wrist_target[:3, :3]),
+                    "right_solved_rotation_error_rad": rotation_error_rad(solved_right_pose[:3, :3], right_wrist_target[:3, :3]),
+                    "joint_following_error_max_rad": float(np.max(np.abs(current_lr_arm_q - sol_q))),
+                })
 
             # record data
             if args.record:
@@ -817,10 +1146,13 @@ if __name__ == '__main__':
             exit_code = active_exception.code if isinstance(active_exception.code, int) else 1
         try:
             if arm_ctrl is not None:
-                arm_ctrl.ctrl_dual_arm_go_home()
+                if r1_a7_deferred_real:
+                    arm_ctrl.stop()
+                else:
+                    arm_ctrl.ctrl_dual_arm_go_home()
         except Exception as e:
             exit_code = 1
-            logger_mp.error(f"Failed to ctrl_dual_arm_go_home: {e}")
+            logger_mp.error(f"Failed to stop arm controller: {e}")
         
         try:
             if args.ipc:
@@ -875,6 +1207,20 @@ if __name__ == '__main__':
         except Exception as e:
             exit_code = 1
             logger_mp.error(f"Failed to close recorder: {e}")
+        try:
+            if arm_diagnostic_file is not None:
+                write_json_line(arm_diagnostic_file, {
+                    "schema": "r1_a7_alignment_v1",
+                    "event": "exit",
+                    "wall_time_ns": time.time_ns(),
+                    "monotonic_time_ns": time.monotonic_ns(),
+                    "exit_code": exit_code,
+                }, flush=True)
+                arm_diagnostic_file.close()
+                logger_mp.info(f"Saved R1_A7 alignment diagnostics: {arm_diagnostic_path}")
+        except Exception as e:
+            exit_code = 1
+            logger_mp.error(f"Failed to close R1_A7 alignment diagnostics: {e}")
         if live_writer_lock_file is not None:
             live_writer_lock_file.close()
         logger_mp.info("✅ Finally, exiting program.")

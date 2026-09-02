@@ -1751,11 +1751,16 @@ class R1_A5_ArmIK:
             return current_lr_arm_motor_q, np.zeros(self.reduced_robot.model.nv)
 
 class R1_A7_ArmIK:
-    def __init__(self, Unit_Test = False, Visualization = False):
+    def __init__(self, Unit_Test = False, Visualization = False, waist_yaw = None):
         np.set_printoptions(precision=5, suppress=True, linewidth=200)
 
         self.Unit_Test = Unit_Test
         self.Visualization = Visualization
+        if waist_yaw is not None:
+            waist_yaw = float(waist_yaw)
+            if not np.isfinite(waist_yaw):
+                raise ValueError("waist_yaw must be finite.")
+        self.waist_yaw = waist_yaw
 
         # fixed cache file path
         self.cache_path = "r1_a7_model_cache.pkl"
@@ -1768,7 +1773,8 @@ class R1_A7_ArmIK:
             self.model_dir = '../../assets/r1/'
 
         # Try loading cache first
-        if os.path.exists(self.cache_path) and (not self.Visualization):
+        cache_compatible = self.waist_yaw is None
+        if os.path.exists(self.cache_path) and cache_compatible and not self.Visualization:
             logger_mp.info(f"[R1_A7_ArmIK] >>> Loading cached robot model: {self.cache_path}")
             self.robot, self.reduced_robot = self.load_cache()
         else:
@@ -1781,9 +1787,16 @@ class R1_A7_ArmIK:
                                             "head_yaw_joint" ,
                                         ]
 
+            reference_configuration = np.zeros(self.robot.model.nq)
+            if self.waist_yaw is not None:
+                waist_joint_id = self.robot.model.getJointId("waist_yaw_joint")
+                reference_configuration[
+                    self.robot.model.joints[waist_joint_id].idx_q
+                ] = self.waist_yaw
+
             self.reduced_robot = self.robot.buildReducedRobot(
                 list_of_joints_to_lock=self.mixed_jointsToLockIDs,
-                reference_configuration=np.array([0.0] * self.robot.model.nq),
+                reference_configuration=reference_configuration,
             )
 
             self.reduced_robot.model.addFrame(
@@ -1802,9 +1815,11 @@ class R1_A7_ArmIK:
             )
 
             # Save cache (only after everything is built)
-            if not os.path.exists(self.cache_path):
+            if cache_compatible and not os.path.exists(self.cache_path):
                 self.save_cache()
                 logger_mp.info(f">>> Cache saved to {self.cache_path}")
+
+        self.reduced_robot.data = self.reduced_robot.model.createData()
 
         # Creating Casadi models and data for symbolic computing
         self.cmodel = cpin.Model(self.reduced_robot.model)
@@ -1849,7 +1864,7 @@ class R1_A7_ArmIK:
         self.param_tf_r = self.opti.parameter(4, 4)
         self.translational_cost = casadi.sumsqr(self.translational_error(self.var_q, self.param_tf_l, self.param_tf_r))
         self.rotation_cost = casadi.sumsqr(self.rotational_error(self.var_q, self.param_tf_l, self.param_tf_r))
-        self.regularization_cost = casadi.sumsqr(self.var_q)
+        self.regularization_cost = casadi.sumsqr(self.var_q - self.var_q_last)
         self.smooth_cost = casadi.sumsqr(self.var_q - self.var_q_last)
 
         # Setting optimization constraints and goals
@@ -1954,7 +1969,30 @@ class R1_A7_ArmIK:
         robot_right_pose[:3, 3] *= scale_factor
         return robot_left_pose, robot_right_pose
 
-    def solve_ik(self, left_wrist, right_wrist, current_lr_arm_motor_q = None, current_lr_arm_motor_dq = None):
+    def forward_wrist_poses(self, arm_q):
+        arm_q = np.asarray(arm_q, dtype=np.float64)
+        if arm_q.shape != (self.reduced_robot.model.nq,):
+            raise ValueError(
+                f"arm_q must have shape ({self.reduced_robot.model.nq},)."
+            )
+        pin.framesForwardKinematics(
+            self.reduced_robot.model,
+            self.reduced_robot.data,
+            arm_q,
+        )
+        return (
+            self.reduced_robot.data.oMf[self.L_hand_id].homogeneous.copy(),
+            self.reduced_robot.data.oMf[self.R_hand_id].homogeneous.copy(),
+        )
+
+    def solve_ik(
+        self,
+        left_wrist,
+        right_wrist,
+        current_lr_arm_motor_q = None,
+        current_lr_arm_motor_dq = None,
+        raise_on_failure = False,
+    ):
         if current_lr_arm_motor_q is not None:
             self.init_data = current_lr_arm_motor_q
         self.opti.set_initial(self.var_q, self.init_data)
@@ -1992,6 +2030,8 @@ class R1_A7_ArmIK:
 
         except Exception as e:
             logger_mp.error(f"ERROR in convergence, plotting debug info.{e}")
+            if raise_on_failure:
+                raise RuntimeError("R1_A7 IK failed to converge.") from e
 
             sol_q = self.opti.debug.value(self.var_q)
             self.smooth_filter.add_data(sol_q)

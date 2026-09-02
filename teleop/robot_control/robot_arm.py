@@ -59,8 +59,11 @@ class R1_A5_LowState:
         self.motor_state = [MotorState() for _ in range(R1_A5_Num_Motors)]
 
 class R1_A7_LowState:
-    def __init__(self):
+    def __init__(self, mode_machine=None, sequence=0, monotonic_timestamp=None):
         self.motor_state = [MotorState() for _ in range(R1_A7_Num_Motors)]
+        self.mode_machine = mode_machine
+        self.sequence = sequence
+        self.monotonic_timestamp = monotonic_timestamp
 
 
 class DataBuffer:
@@ -2040,13 +2043,14 @@ class R1_A5_JointIndex(IntEnum):
     kNotUsedJoint3 = 34
 
 class R1_A7_ArmController:
-    def __init__(self, motion_mode = False, simulation_mode = False):
+    def __init__(self, motion_mode = False, simulation_mode = False, deferred_activation = False):
         logger_mp.info("Initialize R1_A7_ArmController...")
         if motion_mode:
             raise ValueError("R1_A7_ArmController does not support motion mode.")
         self.q_target = np.zeros(14)
         self.tauff_target = np.zeros(14)
         self.simulation_mode = simulation_mode
+        self.deferred_activation = deferred_activation
         self.kp_high = 200.0
         self.kd_high = 3.0
         self.kp_low = 50.0
@@ -2062,12 +2066,17 @@ class R1_A7_ArmController:
         self.set_arm_velocity_limit()
         self.control_dt = 1.0 / 250.0
 
-        self.lowcmd_publisher = ChannelPublisher(kTopicLowCommand_Debug, hg_LowCmd)
-        self.lowcmd_publisher.Init()
+        self.ctrl_lock = threading.Lock()
+        self.lifecycle_lock = threading.Lock()
+        self.lowcmd_publisher = None
+        self.publish_thread = None
+        self.publish_running = False
+        self.subscribe_running = True
+        self.active = False
+        self.lowstate_sequence = 0
         self.lowstate_subscriber = ChannelSubscriber(kTopicLowState, hg_LowState)
         self.lowstate_subscriber.Init()
         self.lowstate_buffer = DataBuffer()
-        self.mode_machine = None
         self.lowstate_sub_ready = False
 
         # initialize subscribe thread
@@ -2077,72 +2086,107 @@ class R1_A7_ArmController:
 
         wait_for_dds(lambda: self.lowstate_sub_ready, "R1_A7_ArmController")
 
-        # initialize hg's lowcmd msg
-        self.crc = CRC()
-        self.msg = unitree_hg_msg_dds__LowCmd_()
-        self.msg.mode_pr = 0
-        self.msg.mode_machine = self.get_mode_machine()
+        if deferred_activation:
+            logger_mp.info("R1_A7_ArmController lowstate subscription ready; activation deferred.")
+        else:
+            self.activate()
 
-        self.all_motor_q = self.get_current_motor_q()
-        logger_mp.debug(f"Current all body motor state q:\n{self.all_motor_q} \n")
-        logger_mp.debug(f"Current two arms motor state q:\n{self.get_current_dual_arm_q()}\n")
-        logger_mp.info("Lock all joints except two arms and head...")
+    def activate(self):
+        with self.lifecycle_lock:
+            if self.active:
+                return
+            if not self.subscribe_running:
+                raise RuntimeError("R1_A7_ArmController has been stopped.")
 
-        arm_indices = set(member.value for member in R1_A7_JointArmIndex)
-        head_indices = set(member.value for member in R1_A7_JointHeadIndex)
-        waist_indices = {
-            R1_A7_JointIndex.kWaistRollNotUsed.value,
-            R1_A7_JointIndex.kWaistYaw.value,
-        }
-        for id in R1_A7_JointIndex:
-            self.msg.motor_cmd[id].mode = 1
-            if id.value in arm_indices:
-                if self._Is_wrist_motor(id):
-                    self.msg.motor_cmd[id].kp = self.kp_wrist
-                    self.msg.motor_cmd[id].kd = self.kd_wrist
-                elif self._Is_medium_arm_motor(id):
-                    self.msg.motor_cmd[id].kp = self.kp_medium
-                    self.msg.motor_cmd[id].kd = self.kd_medium
-                else:
-                    self.msg.motor_cmd[id].kp = self.kp_low
-                    self.msg.motor_cmd[id].kd = self.kd_low
-            elif id.value in head_indices:
-                self.msg.motor_cmd[id].kp = self.kp_head
-                self.msg.motor_cmd[id].kd = self.kd_head
-            elif id.value in waist_indices:
-                self.msg.motor_cmd[id].kp = self.kp_low
-                self.msg.motor_cmd[id].kd = self.kd_high
+            self.crc = CRC()
+            self.msg = unitree_hg_msg_dds__LowCmd_()
+            self.lowcmd_publisher = ChannelPublisher(kTopicLowCommand_Debug, hg_LowCmd)
+            self.lowcmd_publisher.Init()
+
+            request_sequence = self.lowstate_buffer.GetData().sequence
+            wait_for_dds(
+                lambda: self.lowstate_buffer.GetData() is not None
+                and self.lowstate_buffer.GetData().sequence > request_sequence,
+                "R1_A7_ArmController activation",
+            )
+            lowstate = self.lowstate_buffer.GetData()
+
+            self.msg.mode_pr = 0
+            self.msg.mode_machine = lowstate.mode_machine
+            self.all_motor_q = np.array(
+                [lowstate.motor_state[id].q for id in R1_A7_JointIndex]
+            )
+            if self.deferred_activation:
+                self.q_target = np.array(
+                    [lowstate.motor_state[id].q for id in R1_A7_JointArmIndex]
+                )
             else:
-                if self._Is_weak_motor(id):
+                self.q_target = np.zeros(14)
+            self.tauff_target = np.zeros(14)
+            logger_mp.debug(f"Current all body motor state q:\n{self.all_motor_q} \n")
+            logger_mp.debug(f"Current two arms motor state q:\n{self.q_target}\n")
+            logger_mp.info("Lock all joints except two arms and head...")
+
+            arm_indices = set(member.value for member in R1_A7_JointArmIndex)
+            head_indices = set(member.value for member in R1_A7_JointHeadIndex)
+            waist_indices = {
+                R1_A7_JointIndex.kWaistRollNotUsed.value,
+                R1_A7_JointIndex.kWaistYaw.value,
+            }
+            for id in R1_A7_JointIndex:
+                self.msg.motor_cmd[id].mode = 1
+                if id.value in arm_indices:
+                    if self._Is_wrist_motor(id):
+                        self.msg.motor_cmd[id].kp = self.kp_wrist
+                        self.msg.motor_cmd[id].kd = self.kd_wrist
+                    elif self._Is_medium_arm_motor(id):
+                        self.msg.motor_cmd[id].kp = self.kp_medium
+                        self.msg.motor_cmd[id].kd = self.kd_medium
+                    else:
+                        self.msg.motor_cmd[id].kp = self.kp_low
+                        self.msg.motor_cmd[id].kd = self.kd_low
+                elif id.value in head_indices:
+                    self.msg.motor_cmd[id].kp = self.kp_head
+                    self.msg.motor_cmd[id].kd = self.kd_head
+                elif id.value in waist_indices:
                     self.msg.motor_cmd[id].kp = self.kp_low
-                    self.msg.motor_cmd[id].kd = self.kd_low
-                else:
-                    self.msg.motor_cmd[id].kp = self.kp_high
                     self.msg.motor_cmd[id].kd = self.kd_high
-            self.msg.motor_cmd[id].q  = self.all_motor_q[id]
-        logger_mp.info("Lock OK!")
+                else:
+                    if self._Is_weak_motor(id):
+                        self.msg.motor_cmd[id].kp = self.kp_low
+                        self.msg.motor_cmd[id].kd = self.kd_low
+                    else:
+                        self.msg.motor_cmd[id].kp = self.kp_high
+                        self.msg.motor_cmd[id].kd = self.kd_high
+                self.msg.motor_cmd[id].q = self.all_motor_q[id]
+            self.msg.crc = self.crc.Crc(self.msg)
+            if not self.lowcmd_publisher.Write(self.msg):
+                raise RuntimeError("R1_A7 initial live-pose hold could not be published.")
+            self.ctrl_head_and_waist_go_home()
+            logger_mp.info("Lock OK!")
 
-        # Head and available waist joints gradually return to zero at startup.
-        self.ctrl_head_and_waist_go_home()
-
-        # initialize publish thread
-        self.publish_thread = threading.Thread(target=self._ctrl_motor_state)
-        self.ctrl_lock = threading.Lock()
-        self.publish_thread.daemon = True
-        self.publish_thread.start()
+            self.publish_running = True
+            self.active = True
+            self.publish_thread = threading.Thread(target=self._ctrl_motor_state)
+            self.publish_thread.daemon = True
+            self.publish_thread.start()
 
         logger_mp.info("Initialize R1_A7_ArmController OK!")
 
     def _subscribe_motor_state(self):
-        while True:
+        while self.subscribe_running:
             msg = self.lowstate_subscriber.Read()
             if msg is not None:
-                lowstate = R1_A7_LowState()
+                self.lowstate_sequence += 1
+                lowstate = R1_A7_LowState(
+                    mode_machine=msg.mode_machine,
+                    sequence=self.lowstate_sequence,
+                    monotonic_timestamp=time.monotonic(),
+                )
                 for id in range(R1_A7_Num_Motors):
                     lowstate.motor_state[id].q  = msg.motor_state[id].q
                     lowstate.motor_state[id].dq = msg.motor_state[id].dq
                 self.lowstate_buffer.SetData(lowstate)
-                self.mode_machine = msg.mode_machine
                 self.lowstate_sub_ready = True
             time.sleep(0.002)
 
@@ -2177,12 +2221,12 @@ class R1_A7_ArmController:
         logger_mp.info("[R1_A7_ArmController] head and waist return to zero OK!")
 
     def _ctrl_motor_state(self):
-        while True:
+        while self.publish_running:
             start_time = time.time()
 
             with self.ctrl_lock:
-                arm_q_target     = self.q_target
-                arm_tauff_target = self.tauff_target
+                arm_q_target     = self.q_target.copy()
+                arm_tauff_target = self.tauff_target.copy()
 
             if self.simulation_mode:
                 cliped_arm_q_target = arm_q_target
@@ -2210,25 +2254,50 @@ class R1_A7_ArmController:
 
     def get_mode_machine(self):
         '''Return current dds mode machine.'''
-        if self.mode_machine is None:
+        lowstate = self.lowstate_buffer.GetData()
+        if lowstate is None or lowstate.mode_machine is None:
             raise RuntimeError("R1-A7 low state is not ready.")
-        return self.mode_machine
+        return lowstate.mode_machine
 
     def get_current_motor_q(self):
         '''Return current state q of all body motors.'''
-        return np.array([self.lowstate_buffer.GetData().motor_state[id].q for id in R1_A7_JointIndex])
+        lowstate = self.lowstate_buffer.GetData()
+        return np.array([lowstate.motor_state[id].q for id in R1_A7_JointIndex])
 
     def get_current_dual_arm_q(self):
         '''Return current state q of the left and right arm motors.'''
-        return np.array([self.lowstate_buffer.GetData().motor_state[id].q for id in R1_A7_JointArmIndex])
+        lowstate = self.lowstate_buffer.GetData()
+        return np.array([lowstate.motor_state[id].q for id in R1_A7_JointArmIndex])
 
     def get_current_dual_arm_dq(self):
         '''Return current state dq of the left and right arm motors.'''
-        return np.array([self.lowstate_buffer.GetData().motor_state[id].dq for id in R1_A7_JointArmIndex])
+        lowstate = self.lowstate_buffer.GetData()
+        return np.array([lowstate.motor_state[id].dq for id in R1_A7_JointArmIndex])
 
     def get_current_head_q(self):
         '''Return current state q of the head pitch/yaw motors.'''
-        return np.array([self.lowstate_buffer.GetData().motor_state[id].q for id in R1_A7_JointHeadIndex])
+        lowstate = self.lowstate_buffer.GetData()
+        return np.array([lowstate.motor_state[id].q for id in R1_A7_JointHeadIndex])
+
+    def stop(self):
+        with self.lifecycle_lock:
+            self.publish_running = False
+            if self.publish_thread is not None:
+                self.publish_thread.join(timeout=1.0)
+                if self.publish_thread.is_alive():
+                    raise RuntimeError("R1_A7 lowcmd publisher thread did not stop.")
+            self.active = False
+            self.subscribe_running = False
+            if self.subscribe_thread.is_alive():
+                self.subscribe_thread.join(timeout=1.0)
+                if self.subscribe_thread.is_alive():
+                    raise RuntimeError("R1_A7 lowstate subscriber thread did not stop.")
+            if self.lowcmd_publisher is not None:
+                self.lowcmd_publisher.Close()
+                self.lowcmd_publisher = None
+            if self.lowstate_subscriber is not None:
+                self.lowstate_subscriber.Close()
+                self.lowstate_subscriber = None
 
     def ctrl_dual_arm_go_home(self):
         '''Move both the left and right arms of the robot to their home position by setting the target joint angles (q) and torques (tau) to zero.'''
