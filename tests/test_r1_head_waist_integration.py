@@ -19,6 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 MAIN_PATH = ROOT / "teleop" / "teleop_hand_and_arm.py"
 sys.path.insert(0, str(ROOT / "teleop" / "robot_control"))
 from r1_head_waist import compensate_wrist_for_waist
+from r1_hand_tracking import R1WristHold, hand_tracking_freshness
 
 
 def assigns(node, name):
@@ -96,6 +97,7 @@ class R1HeadWaistIntegrationTest(unittest.TestCase):
                 tracking_timeout=0.25, frequency=30.0, arm_translation_scale=1.0,
             ),
             "r1_a7_anchored": True, "r1_a7_deferred_real": True,
+            "r1_independent_hands": False,
             "r1_waist_yaw_reference": 0.17, "r1_head_pose_reference": np.eye(4),
             "r1_head_yaw_reference": np.eye(3), "r1_waist_to_root": np.eye(3),
             "r1_vision_left_reference": self.left, "r1_vision_right_reference": self.right,
@@ -162,6 +164,143 @@ class R1HeadWaistIntegrationTest(unittest.TestCase):
         execute(self.control_nodes, ns, loop=True)
         ns["waist_follower"].reset.assert_called_once_with(0.43, 1.0)
         self.assertFalse(ns["tracking_hold_active"])
+
+    def independent_context(self, left_time=0.99, right_time=0.99):
+        ns = self.context()
+        ns["r1_independent_hands"] = True
+        ns["wrist_holds"] = (R1WristHold(self.left), R1WristHold(self.right))
+        ns["hand_tracking_freshness"] = hand_tracking_freshness
+        ns["held_head_q_target"] = np.array([0.1, 0.2])
+        sample = ns["tv_wrapper"].get_tele_data.return_value
+        sample.left_hand_timestamp = left_time
+        sample.right_hand_timestamp = right_time
+        sample.left_hand_pos = np.ones((25, 3))
+        sample.right_hand_pos = np.ones((25, 3))
+        return ns, sample
+
+    def test_independent_mode_is_enabled_for_r1_hand_simulation_and_real_control(self):
+        names = {"r1_a7_deferred_real", "r1_a7_anchored", "r1_independent_hands"}
+        nodes = sorted(
+            (node for node in ast.walk(self.tree) if any(assigns(node, name) for name in names)),
+            key=lambda node: node.lineno,
+        )
+        for arm, sim, input_mode, expected in (
+            ("R1_A7", True, "hand", True),
+            ("R1_A7", False, "hand", True),
+            ("R1_A7", True, "controller", False),
+            ("R1_A7", False, "controller", False),
+            ("G1_29", True, "hand", False),
+        ):
+            with self.subTest(arm=arm, sim=sim, input_mode=input_mode):
+                ns = {"args": SimpleNamespace(
+                    arm=arm, sim=sim, input_mode=input_mode, waist_follow=False,
+                    hand_only=False, dry_run=False,
+                )}
+                execute(nodes, ns)
+                self.assertEqual(ns["r1_independent_hands"], expected)
+
+    def test_either_hand_can_follow_while_the_other_holds_in_root_frame(self):
+        for moving_side in (0, 1):
+            with self.subTest(moving_side=moving_side):
+                ns, sample = self.independent_context(
+                    0.99 if moving_side == 0 else 0.1,
+                    0.99 if moving_side == 1 else 0.1,
+                )
+                sample.left_wrist_pose = pose(1.0, [0.5, 0.25, 0.82])
+                sample.right_wrist_pose = pose(-1.0, [0.45, -0.3, 0.84])
+                execute(self.control_nodes, ns, loop=True)
+                self.assertTrue(ns["completed"])
+                targets = (sample.left_wrist_pose, self.right) if moving_side == 0 else (self.left, sample.right_wrist_pose)
+                for actual, target in zip(ns["arm_ik"].solve_ik.call_args.args[:2], targets):
+                    np.testing.assert_allclose(actual, compensate_wrist_for_waist(target, 0.43, 0.17))
+                ns["arm_ctrl"].hold_waist.assert_called_once_with()
+                ns["waist_follower"].update.assert_not_called()
+                sent = ns["arm_ctrl"].ctrl_dual_arm_and_head.call_args
+                self.assertIsNone(sent.kwargs["waist_yaw_target"])
+                np.testing.assert_allclose(sent.args[2], [0.1, 0.2])
+
+    def test_both_hands_lost_holds_without_solving_or_publishing(self):
+        ns, _ = self.independent_context(0.1, 0.1)
+        execute(self.control_nodes, ns, loop=True)
+        self.assertFalse(ns["completed"])
+        ns["arm_ik"].solve_ik.assert_not_called()
+        ns["arm_ctrl"].ctrl_dual_arm_and_head.assert_not_called()
+        ns["arm_ctrl"].hold_waist.assert_called_once_with()
+        self.assertFalse(ns["wrist_holds"][0].tracking)
+        self.assertFalse(ns["wrist_holds"][1].tracking)
+
+    def test_recovery_reclutches_only_the_previously_lost_arm(self):
+        ns, sample = self.independent_context(0.99, 0.1)
+        sample.left_wrist_pose = pose(0.7, [0.42, 0.2, 0.8])
+        sample.right_wrist_pose = pose(-1.2, [0.8, -0.6, 0.9])
+        execute(self.control_nodes, ns, loop=True)
+        sample.right_hand_timestamp = 0.99
+        sample.left_wrist_pose = pose(0.8, [0.44, 0.2, 0.8])
+        execute(self.control_nodes, ns, loop=True)
+        np.testing.assert_allclose(ns["left_wrist_target"], sample.left_wrist_pose)
+        np.testing.assert_allclose(ns["right_wrist_target"], self.right, atol=1e-12)
+        ns["waist_follower"].reset.assert_called_once_with(0.43, 1.0)
+        ns["waist_follower"].update.assert_called_once()
+
+    def test_single_hand_expiring_during_ik_discards_unpublished_targets(self):
+        ns, sample = self.independent_context(0.99, 0.1)
+        sample.left_wrist_pose = pose(0.8, [0.45, 0.2, 0.8])
+        def slow_ik(*args, **kwargs):
+            ns["time"].monotonic = lambda: 1.5
+            return np.zeros(14), np.zeros(14)
+        ns["arm_ik"].solve_ik.side_effect = slow_ik
+        execute(self.control_nodes, ns, loop=True)
+        ns["arm_ctrl"].ctrl_dual_arm_and_head.assert_not_called()
+        self.assertFalse(ns["completed"])
+        np.testing.assert_allclose(ns["wrist_holds"][0].target, self.left)
+        self.assertFalse(ns["wrist_holds"][0].tracking)
+
+    def test_independent_hands_work_without_waist_follow(self):
+        ns, sample = self.independent_context(0.99, 0.1)
+        ns["args"].waist_follow = False
+        sample.left_wrist_pose = pose(0.8, [0.45, 0.2, 0.8])
+        execute(self.control_nodes, ns, loop=True)
+        self.assertTrue(ns["completed"])
+        np.testing.assert_allclose(ns["arm_ik"].solve_ik.call_args.args[0], sample.left_wrist_pose)
+        np.testing.assert_allclose(ns["arm_ik"].solve_ik.call_args.args[1], self.right)
+        ns["arm_ctrl"].ctrl_dual_arm_and_head.assert_called_once()
+        ns["arm_ctrl"].hold_waist.assert_not_called()
+
+    def test_o6_missing_side_reuses_its_last_command(self):
+        ns, _ = self.independent_context(0.99, 0.1)
+        ns["args"].ee = "linker_o6"
+        ns["linker_o6_retargeter"] = Mock(retarget=Mock(return_value=(np.ones(6), np.ones(6))))
+        ns["linker_o6_calibration"] = Mock(apply=Mock(return_value=(np.ones(6), np.ones(6))))
+        ns["hand_ctrl"] = Mock()
+        ns["hand_ctrl"].get_action.return_value = (np.zeros(6), np.full(6, 0.3))
+        ns["hand_ctrl"].get_state.return_value = (np.zeros(6), np.zeros(6))
+        ns["dual_hand_data_lock"] = nullcontext()
+        ns["dual_hand_state_array"] = np.zeros(12)
+        ns["dual_hand_action_array"] = np.zeros(12)
+        execute(self.control_nodes, ns, loop=True)
+        left, right = ns["hand_ctrl"].update.call_args.args
+        np.testing.assert_allclose(left, 1.0)
+        np.testing.assert_allclose(right, 0.3)
+
+    def test_independent_diagnostics_report_each_side(self):
+        ns, _ = self.independent_context(0.99, 0.1)
+        ns["arm_diagnostic_file"] = object()
+        execute(self.control_nodes, ns, loop=True)
+        payload = ns["write_json_line"].call_args.args[1]
+        self.assertTrue(payload["hand_tracking"]["left"]["fresh"])
+        self.assertFalse(payload["hand_tracking"]["right"]["fresh"])
+        self.assertAlmostEqual(payload["hand_tracking"]["right"]["age_ms"], 900.0)
+
+    def test_recording_during_one_sided_hold_keeps_numeric_body_actions(self):
+        ns, _ = self.independent_context(0.99, 0.1)
+        execute(self.control_nodes, ns, loop=True)
+        body_record = next(
+            node for node in ast.walk(self.tree) if isinstance(node, ast.If)
+            and ast.unparse(node.test) == "args.waist_follow"
+            and any(assigns(child, "current_body_state") for child in node.body)
+        )
+        execute([body_record], ns)
+        np.testing.assert_allclose(ns["current_body_action"], [0.43, 0.1, 0.2])
 
     def test_diagnostics_convert_fixed_ik_fk_back_to_root_frame(self):
         ns = self.context()

@@ -20,6 +20,7 @@ sys.path.append(parent_dir)
 from teleimager.image_client import ImageClient
 from teleop.utils.ipc import IPC_Server
 from teleop.robot_control.r1_head_waist import R1HeadWaistFollower, compensate_wrist_for_waist
+from teleop.robot_control.r1_hand_tracking import R1WristHold, hand_tracking_freshness
 from sshkeyboard import listen_keyboard, stop_listening
 
 def publish_reset_category(category: int, publisher): # Scene Reset signal
@@ -207,7 +208,7 @@ if __name__ == '__main__':
     parser.add_argument('--ipc', action = 'store_true', help = 'Enable IPC server to handle input; otherwise enable sshkeyboard')
     parser.add_argument('--hand-only', action='store_true', help='Skip robot arm, IK, and lowcmd initialization')
     parser.add_argument('--dry-run', action='store_true', help='Compute Linker O6 targets without DDS command publishers')
-    parser.add_argument('--tracking-timeout', type=float, default=0.25, help='Seconds before stale XR tracking disarms dry-run output')
+    parser.add_argument('--tracking-timeout', type=float, default=0.25, help='XR timeout in seconds; R1_A7 hand tracking holds each stale side independently')
     parser.add_argument('--linker-o6-urdf-root', type=str, default='/home/hnh/unitree_r1_dev/linkerhand-urdf/O6', help='Official Linker O6 URDF root')
     parser.add_argument('--linker-o6-calibration', type=str, default=None, help='Vision Pro input calibration for Linker O6')
     parser.add_argument('--linker-o6-live-state', type=str, default=None, help='Atomic JSON target snapshot for isolated Linker O6 simulation')
@@ -258,10 +259,13 @@ if __name__ == '__main__':
         and not args.hand_only
         and not args.dry_run
     )
-    r1_a7_anchored = r1_a7_deferred_real or args.waist_follow
+    r1_a7_anchored = r1_a7_deferred_real or args.waist_follow or (
+        args.arm == "R1_A7" and args.sim and args.input_mode == "hand"
+    )
+    r1_independent_hands = r1_a7_anchored and args.input_mode == "hand"
     R1_A7_DEFERRED_REAL_MODE = r1_a7_anchored
     if args.arm_diagnostic_dir and not r1_a7_anchored:
-        parser.error("--arm-diagnostic-dir requires real R1_A7 or R1_A7 --sim --waist-follow.")
+        parser.error("--arm-diagnostic-dir requires real R1_A7, R1_A7 --sim --input-mode hand, or R1_A7 --sim --waist-follow.")
 
     arm_ctrl = None
     hand_ctrl = None
@@ -850,6 +854,9 @@ if __name__ == '__main__':
         right_wrist_img = None
         last_fresh_tele_data = reference_tele_data if r1_a7_anchored else None
         tracking_hold_active = False
+        if r1_independent_hands:
+            wrist_holds = (R1WristHold(r1_robot_left_reference), R1WristHold(r1_robot_right_reference))
+            held_head_q_target = arm_ctrl.get_current_head_q().copy()
 
         # main loop. robot start to follow VR user's motion
         while not STOP:
@@ -890,7 +897,23 @@ if __name__ == '__main__':
 
             # get xr's tele data
             tele_data = tv_wrapper.get_tele_data()
-            if r1_a7_anchored:
+            if r1_independent_hands:
+                hand_fresh = hand_tracking_freshness(tele_data, args.tracking_timeout, time.monotonic())
+                for side, hold, fresh in zip(("left", "right"), wrist_holds, hand_fresh):
+                    if fresh != hold.tracking:
+                        logger_mp.info(f"[R1 HAND TRACKING] {side}: {'resumed; re-clutching at held target' if fresh else 'stale; holding target'}")
+                    if not fresh:
+                        hold.hold()
+                if args.waist_follow:
+                    if not all(hand_fresh):
+                        arm_ctrl.hold_waist()
+                    elif tracking_hold_active:
+                        waist_follower.reset(arm_ctrl.get_current_waist_yaw(), time.monotonic())
+                tracking_hold_active = not all(hand_fresh)
+                if not any(hand_fresh):
+                    time.sleep(1.0 / args.frequency)
+                    continue
+            elif r1_a7_anchored:
                 if is_fresh_motion_data(tele_data, args.tracking_timeout):
                     last_fresh_tele_data = tele_data
                     if tracking_hold_active:
@@ -919,6 +942,12 @@ if __name__ == '__main__':
                     raw_left_target,
                     raw_right_target,
                 )
+                if r1_independent_hands:
+                    previous_left, previous_right = hand_ctrl.get_action()
+                    if not hand_fresh[0]:
+                        left_hand_target = previous_left
+                    if not hand_fresh[1]:
+                        right_hand_target = previous_right
             elif args.ee in ("dex3", "inspire_ftp", "inspire_dfx", "brainco")  and args.input_mode == "hand":
                 with left_hand_pos_array.get_lock():
                     left_hand_pos_array[:] = tele_data.left_hand_pos.flatten()
@@ -999,16 +1028,22 @@ if __name__ == '__main__':
                     r1_waist_to_root,
                     args.arm_translation_scale,
                 )
+            if r1_independent_hands:
+                left_wrist_target = wrist_holds[0].prepare(left_wrist_target, hand_fresh[0])
+                right_wrist_target = wrist_holds[1].prepare(right_wrist_target, hand_fresh[1])
+                if not all(hand_fresh):
+                    head_q_target = held_head_q_target.copy()
             left_ik_target = left_wrist_target
             right_ik_target = right_wrist_target
             waist_yaw_actual = None
             waist_yaw_target = None
             if args.waist_follow:
                 waist_yaw_actual = arm_ctrl.get_current_waist_yaw()
-                head_q_target, waist_yaw_target = waist_follower.update(
-                    tele_data.head_pose, r1_head_pose_reference,
-                    waist_yaw_actual, time.monotonic(),
-                )
+                if not r1_independent_hands or all(hand_fresh):
+                    head_q_target, waist_yaw_target = waist_follower.update(
+                        tele_data.head_pose, r1_head_pose_reference,
+                        waist_yaw_actual, time.monotonic(),
+                    )
                 left_ik_target = compensate_wrist_for_waist(
                     left_wrist_target, waist_yaw_actual, r1_waist_yaw_reference,
                 )
@@ -1034,7 +1069,18 @@ if __name__ == '__main__':
             logger_mp.debug(f"ik:\t{round(time_ik_end - time_ik_start, 6)}")
             if STOP:
                 break
-            if args.waist_follow and not is_fresh_motion_data(tele_data, args.tracking_timeout):
+            if r1_independent_hands:
+                fresh_after_ik = hand_tracking_freshness(tele_data, args.tracking_timeout, time.monotonic())
+                if any(before and not after for before, after in zip(hand_fresh, fresh_after_ik)):
+                    for hold, fresh in zip(wrist_holds, fresh_after_ik):
+                        if not fresh:
+                            hold.hold()
+                    if args.waist_follow:
+                        arm_ctrl.hold_waist()
+                    tracking_hold_active = True
+                    time.sleep(1.0 / args.frequency)
+                    continue
+            elif args.waist_follow and not is_fresh_motion_data(tele_data, args.tracking_timeout):
                 arm_ctrl.hold_waist()
                 tracking_hold_active = True
                 continue
@@ -1049,19 +1095,23 @@ if __name__ == '__main__':
                 arm_ctrl.ctrl_dual_arm_and_head(
                     sol_q, sol_tauff, head_q_target, waist_yaw_target=waist_yaw_target,
                 )
-            elif r1_a7_deferred_real:
+            elif r1_a7_anchored:
                 arm_ctrl.ctrl_dual_arm_and_head(sol_q, sol_tauff, head_q_target)
             else:
                 arm_ctrl.ctrl_dual_arm(sol_q, sol_tauff)
+            if r1_independent_hands:
+                wrist_holds[0].commit(left_wrist_target)
+                wrist_holds[1].commit(right_wrist_target)
+                held_head_q_target = head_q_target.copy()
             diagnostic_now = time.monotonic()
             if args.waist_follow and diagnostic_now >= waist_diagnostic_next_time:
                 waist_diagnostic_next_time = diagnostic_now + 1.0
                 logger_mp.info(
                     f"[R1 HEAD/WAIST] total_yaw={math.degrees(waist_follower.total_yaw):.1f} deg "
                     f"waist_actual={math.degrees(waist_yaw_actual):.1f} deg "
-                    f"waist_target={math.degrees(waist_yaw_target):.1f} deg "
+                    f"waist_target={math.degrees(waist_yaw_target if waist_yaw_target is not None else waist_yaw_actual):.1f} deg "
                     f"head_yaw={math.degrees(head_q_target[1]):.1f} deg "
-                    f"following={waist_follower.following}"
+                    f"following={waist_follower.following and not tracking_hold_active}"
                 )
             if (
                 arm_diagnostic_file is not None
@@ -1085,6 +1135,13 @@ if __name__ == '__main__':
                     "monotonic_time_ns": time.monotonic_ns(),
                     "source_monotonic_time": tele_data.motion_data_timestamp,
                     "tracking_age_ms": 1000.0 * (diagnostic_now - tele_data.motion_data_timestamp),
+                    "hand_tracking": {
+                        side: {"fresh": fresh, "age_ms": 1000.0 * (diagnostic_now - timestamp)}
+                        for side, fresh, timestamp in zip(
+                            ("left", "right"), hand_fresh,
+                            (tele_data.left_hand_timestamp, tele_data.right_hand_timestamp),
+                        )
+                    } if r1_independent_hands else None,
                     "loop_period_ms": loop_period_ms,
                     "ik_duration_ms": 1000.0 * (time_ik_end - time_ik_start),
                     "head_pose": tele_data.head_pose.tolist(),
@@ -1176,7 +1233,10 @@ if __name__ == '__main__':
                 if args.waist_follow:
                     # Body order: waist_yaw, head_pitch, head_yaw.
                     current_body_state = [waist_yaw_actual, *arm_ctrl.get_current_head_q().tolist()]
-                    current_body_action = [waist_yaw_target, *head_q_target.tolist()]
+                    current_body_action = [
+                        waist_yaw_target if waist_yaw_target is not None else waist_yaw_actual,
+                        *head_q_target.tolist(),
+                    ]
 
                 # arm state and action (split into left/right halves by the arm's own DOF, so it works for any variant: H1/G1_23/R1_A5 = 4/5 per arm, G1_29/R1_A7 = 7)
                 half = len(current_lr_arm_q) // 2

@@ -59,6 +59,8 @@ def bare_televuer():
     tele_vuer.right_hand_squeezeValue_shared = Value("d", 0.0, lock=True)
     tele_vuer.motion_data_ready_shared = Value("b", False, lock=True)
     tele_vuer.motion_data_timestamp_shared = Value("d", 0.0, lock=True)
+    tele_vuer.left_hand_timestamp_shared = Value("d", 0.0, lock=True)
+    tele_vuer.right_hand_timestamp_shared = Value("d", 0.0, lock=True)
     tele_vuer.motion_sample_seq_shared = Value("L", 0, lock=True)
     tele_vuer._last_left_hand_timestamp = 0.0
     tele_vuer._last_right_hand_timestamp = 0.0
@@ -196,6 +198,58 @@ class TeleVuerHandFreshnessTest(unittest.TestCase):
         sample = self.publish(100.0, "left", "right")
         self.assertTrue(self.is_fresh(sample, 0.25, now=100.25))
         self.assertFalse(self.is_fresh(sample, 0.25, now=100.251))
+
+    def test_individual_timestamps_survive_a_long_one_sided_outage(self):
+        self.publish(100.0, "left", "right")
+        sample = self.publish(102.0, "left")
+        self.assertEqual(sample.left_hand_timestamp, 102.0)
+        self.assertEqual(sample.right_hand_timestamp, 100.0)
+        self.assertEqual(sample.motion_data_timestamp, 100.0)
+        sample = self.publish(102.01, "right")
+        self.assertEqual(sample.left_hand_timestamp, 102.0)
+        self.assertEqual(sample.right_hand_timestamp, 102.01)
+
+    def test_invalid_right_pose_does_not_block_valid_left_updates(self):
+        self.publish(100.0, "left", "right")
+        invalid_nan = self.pose.copy()
+        invalid_nan[12] = float("nan")
+        for invalid in (None, [], [0.0] * 400, invalid_nan, "invalid"):
+            with self.subTest(invalid_type=type(invalid).__name__):
+                sample = self.publish(100.4, "left", right=invalid)
+                self.assertEqual(sample.left_hand_timestamp, 100.4)
+                self.assertEqual(sample.right_hand_timestamp, 100.0)
+
+    def test_wrapper_exports_both_timestamps_from_the_same_snapshot(self):
+        import sys
+        source_dir = TELEVUER_PATH.parent
+        package = types.ModuleType("televuer_freshness_test")
+        package.__path__ = [str(source_dir)]
+        module = types.ModuleType("televuer_freshness_test.televuer")
+        module.TeleVuer = object
+        name = "televuer_freshness_test.tv_wrapper"
+        with mock.patch.dict(sys.modules, {
+            "televuer_freshness_test": package,
+            "televuer_freshness_test.televuer": module,
+        }):
+            spec = importlib.util.spec_from_file_location(name, source_dir / "tv_wrapper.py")
+            wrapper_module = importlib.util.module_from_spec(spec)
+            with mock.patch.dict(sys.modules, {name: wrapper_module}):
+                spec.loader.exec_module(wrapper_module)
+            wrapper = wrapper_module.TeleVuerWrapper.__new__(wrapper_module.TeleVuerWrapper)
+            self.publish(100.0, "left", "right")
+            self.publish(100.4, "left")
+            wrapper.use_hand_tracking = True
+            wrapper.return_hand_rot_data = False
+            wrapper.arm_reference_mode = "head_yaw"
+            wrapper.tvuer = types.SimpleNamespace(
+                head_pose=np.eye(4),
+                get_hand_motion_snapshot=self.tele_vuer.get_hand_motion_snapshot,
+            )
+            wrapper._last_hand_motion_snapshot = {}
+            sample = wrapper.get_tele_data()
+            self.assertEqual(sample.left_hand_timestamp, 100.4)
+            self.assertEqual(sample.right_hand_timestamp, 100.0)
+            self.assertEqual(sample.motion_data_timestamp, 100.0)
 
 
 if __name__ == "__main__":
