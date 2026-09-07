@@ -2049,6 +2049,15 @@ class R1_A7_ArmController:
             raise ValueError("R1_A7_ArmController does not support motion mode.")
         self.q_target = np.zeros(14)
         self.tauff_target = np.zeros(14)
+        self.head_q_target = np.zeros(2)
+        self.waist_yaw_target = None
+        self.waist_target_updated_at = None
+        self.waist_target_sequence = 0
+        self.waist_yaw_limit = 2.618
+        self.waist_velocity_limit = 0.35
+        self.waist_tracking_error_limit = np.deg2rad(5.0)
+        self.waist_target_timeout = 0.25
+        self.waist_hold_requested = False
         self.simulation_mode = simulation_mode
         self.deferred_activation = deferred_activation
         self.kp_high = 200.0
@@ -2222,11 +2231,16 @@ class R1_A7_ArmController:
 
     def _ctrl_motor_state(self):
         while self.publish_running:
-            start_time = time.time()
+            start_time = time.monotonic()
 
             with self.ctrl_lock:
                 arm_q_target     = self.q_target.copy()
                 arm_tauff_target = self.tauff_target.copy()
+                head_q_target    = self.head_q_target.copy()
+                waist_yaw_target = self.waist_yaw_target
+                waist_updated_at = self.waist_target_updated_at
+                waist_target_sequence = self.waist_target_sequence
+                waist_hold_requested = self.waist_hold_requested
 
             if self.simulation_mode:
                 cliped_arm_q_target = arm_q_target
@@ -2238,10 +2252,51 @@ class R1_A7_ArmController:
                 self.msg.motor_cmd[id].dq = 0
                 self.msg.motor_cmd[id].tau = arm_tauff_target[idx]
 
+            for idx, id in enumerate(R1_A7_JointHeadIndex):
+                self.msg.motor_cmd[id].q = head_q_target[idx]
+
+            if waist_yaw_target is not None:
+                clear_waist_target = False
+                try:
+                    current_waist_yaw = self.get_current_waist_yaw()
+                except RuntimeError:
+                    waist_q = self.msg.motor_cmd[R1_A7_JointIndex.kWaistYaw].q
+                    clear_waist_target = True
+                else:
+                    if waist_hold_requested or time.monotonic() - waist_updated_at >= self.waist_target_timeout:
+                        waist_q = current_waist_yaw
+                        clear_waist_target = True
+                    else:
+                        max_step = self.waist_velocity_limit * self.control_dt
+                        previous_waist_q = self.msg.motor_cmd[R1_A7_JointIndex.kWaistYaw].q
+                        lower = max(
+                            previous_waist_q - max_step,
+                            current_waist_yaw - self.waist_tracking_error_limit,
+                            -self.waist_yaw_limit,
+                        )
+                        upper = min(
+                            previous_waist_q + max_step,
+                            current_waist_yaw + self.waist_tracking_error_limit,
+                            self.waist_yaw_limit,
+                        )
+                        if lower > upper:
+                            waist_q = current_waist_yaw
+                            clear_waist_target = True
+                        else:
+                            waist_q = float(np.clip(waist_yaw_target, lower, upper))
+                if clear_waist_target:
+                    with self.ctrl_lock:
+                        if self.waist_target_sequence == waist_target_sequence:
+                            self.waist_yaw_target = None
+                            self.waist_hold_requested = False
+                self.msg.motor_cmd[R1_A7_JointIndex.kWaistYaw].q = waist_q
+                self.msg.motor_cmd[R1_A7_JointIndex.kWaistYaw].dq = 0.0
+                self.msg.motor_cmd[R1_A7_JointIndex.kWaistYaw].tau = 0.0
+
             self.msg.crc = self.crc.Crc(self.msg)
             self.lowcmd_publisher.Write(self.msg)
 
-            current_time = time.time()
+            current_time = time.monotonic()
             all_t_elapsed = current_time - start_time
             sleep_time = max(0, (self.control_dt - all_t_elapsed))
             time.sleep(sleep_time)
@@ -2251,6 +2306,38 @@ class R1_A7_ArmController:
         with self.ctrl_lock:
             self.q_target = q_target
             self.tauff_target = tauff_target
+
+    def ctrl_dual_arm_and_head(self, q_target, tauff_target, head_q_target, waist_yaw_target=None):
+        '''Set arm, head, and optional waist targets from one tracking sample.'''
+        head_q_target = np.asarray(head_q_target, dtype=float)
+        if head_q_target.shape != (2,) or not np.isfinite(head_q_target).all():
+            raise ValueError("head_q_target must contain two finite values")
+        head_q_target = np.clip(
+            head_q_target,
+            [-0.62832, -2.0071],
+            [0.62832, 2.0071],
+        )
+        if waist_yaw_target is not None:
+            waist_yaw_target = float(waist_yaw_target)
+            if not np.isfinite(waist_yaw_target):
+                raise ValueError("waist_yaw_target must be finite")
+            waist_yaw_target = float(np.clip(
+                waist_yaw_target, -self.waist_yaw_limit, self.waist_yaw_limit
+            ))
+        with self.ctrl_lock:
+            self.q_target = q_target
+            self.tauff_target = tauff_target
+            self.head_q_target = head_q_target
+            if waist_yaw_target is not None:
+                self.waist_yaw_target = waist_yaw_target
+                self.waist_target_updated_at = time.monotonic()
+                self.waist_target_sequence += 1
+                self.waist_hold_requested = False
+
+    def hold_waist(self):
+        with self.ctrl_lock:
+            if self.waist_yaw_target is not None:
+                self.waist_hold_requested = True
 
     def get_mode_machine(self):
         '''Return current dds mode machine.'''
@@ -2278,6 +2365,20 @@ class R1_A7_ArmController:
         '''Return current state q of the head pitch/yaw motors.'''
         lowstate = self.lowstate_buffer.GetData()
         return np.array([lowstate.motor_state[id].q for id in R1_A7_JointHeadIndex])
+
+    def get_current_waist_yaw(self):
+        lowstate = self.lowstate_buffer.GetData()
+        if lowstate is None or lowstate.monotonic_timestamp is None:
+            raise RuntimeError("R1-A7 waist feedback is not ready.")
+        age = time.monotonic() - lowstate.monotonic_timestamp
+        if not np.isfinite(age) or age < 0.0 or age > self.waist_target_timeout:
+            raise RuntimeError("R1-A7 waist feedback is stale.")
+        waist_yaw = float(lowstate.motor_state[R1_A7_JointIndex.kWaistYaw].q)
+        if not np.isfinite(waist_yaw):
+            raise RuntimeError("R1-A7 waist feedback must be finite.")
+        if abs(waist_yaw) > self.waist_yaw_limit:
+            raise RuntimeError("R1-A7 waist feedback exceeds the URDF joint limit.")
+        return waist_yaw
 
     def stop(self):
         with self.lifecycle_lock:

@@ -160,12 +160,90 @@ class R1A7OfficialActivationTest(unittest.TestCase):
             [0.01 * index for index in arm_indices],
         )
 
+        arm_target = np.array([0.02 * index for index in range(14)])
+        controller.ctrl_dual_arm_and_head(
+            arm_target,
+            np.zeros(14),
+            [-0.2, 0.3],
+        )
+        deadline = time.monotonic() + 1.0
+        while (
+            not any(
+                write[29] == -0.2 and write[30] == 0.3
+                for write in FakePublisher.instances[0].writes
+            )
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.001)
+        commanded = FakePublisher.instances[0].writes[-1]
+        self.assertEqual(commanded[29], -0.2)
+        self.assertEqual(commanded[30], 0.3)
+        np.testing.assert_allclose(controller.q_target, arm_target)
+
+        with self.assertRaises(ValueError):
+            controller.ctrl_dual_arm_and_head(
+                np.ones(14),
+                np.ones(14),
+                [float("nan"), 0.0],
+            )
+        np.testing.assert_allclose(controller.q_target, arm_target)
+
+        controller.ctrl_dual_arm_and_head(
+            arm_target,
+            np.zeros(14),
+            [1.0, -3.0],
+        )
+        np.testing.assert_allclose(controller.head_q_target, [0.62832, -2.0071])
+
         controller.stop()
         write_count = len(FakePublisher.instances[0].writes)
         time.sleep(0.02)
         self.assertEqual(len(FakePublisher.instances[0].writes), write_count)
         self.assertFalse(controller.subscribe_thread.is_alive())
         self.assertFalse(controller.publish_thread.is_alive())
+
+    def test_relative_head_pitch_yaw_tracks_robot_joint_axes(self):
+        tree = ast.parse(MAIN_PATH.read_text(encoding="utf-8"))
+        function = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "relative_head_pitch_yaw"
+        )
+        namespace = {"math": math, "np": np}
+        exec(compile(ast.Module(body=[function], type_ignores=[]), str(MAIN_PATH), "exec"), namespace)
+
+        pitch = -0.2
+        yaw = 0.3
+        ry = np.array([
+            [math.cos(pitch), 0.0, math.sin(pitch)],
+            [0.0, 1.0, 0.0],
+            [-math.sin(pitch), 0.0, math.cos(pitch)],
+        ])
+        rz = np.array([
+            [math.cos(yaw), -math.sin(yaw), 0.0],
+            [math.sin(yaw), math.cos(yaw), 0.0],
+            [0.0, 0.0, 1.0],
+        ])
+        current = np.eye(4)
+        current[:3, :3] = ry @ rz
+        np.testing.assert_allclose(
+            namespace["relative_head_pitch_yaw"](current, np.eye(4)),
+            [pitch, yaw],
+            atol=1e-12,
+        )
+
+        roll = 0.4
+        current[:3, :3] = np.array([
+            [1.0, 0.0, 0.0],
+            [0.0, math.cos(roll), -math.sin(roll)],
+            [0.0, math.sin(roll), math.cos(roll)],
+        ])
+        np.testing.assert_allclose(
+            namespace["relative_head_pitch_yaw"](current, np.eye(4)),
+            [0.0, 0.0],
+            atol=1e-12,
+        )
 
     def test_zero_vision_delta_is_exactly_the_live_robot_wrist_pose(self):
         tree = ast.parse(MAIN_PATH.read_text(encoding="utf-8"))
@@ -390,7 +468,7 @@ class R1A7OfficialActivationTest(unittest.TestCase):
 
     def test_r1_ready_state_cannot_swallow_the_first_r_request(self):
         source = MAIN_PATH.read_text(encoding="utf-8")
-        ready_block = source[source.index("if r1_a7_deferred_real:\n            START = False") :]
+        ready_block = source[source.index("if r1_a7_anchored:\n            START = False") :]
         self.assertLess(
             ready_block.index("r1_arm_request_floor = ARM_REQUEST_GENERATION"),
             ready_block.index("READY = True"),
@@ -419,6 +497,52 @@ class R1A7OfficialActivationTest(unittest.TestCase):
             "R1_A7_ArmIK(waist_yaw=r1_waist_yaw_reference)",
             activation,
         )
+
+    def test_o6_waits_before_arm_activation_and_enables_after_reference_capture(self):
+        source = MAIN_PATH.read_text(encoding="utf-8")
+        activation = source[source.index("r1_arm_request_floor = ARM_REQUEST_GENERATION") :]
+        self.assertLess(
+            activation.index("hand_ctrl.wait_until_ready(timeout=3.0)"),
+            activation.index("motion_switcher.Enter_Debug_Mode()"),
+        )
+        self.assertLess(
+            activation.index("r1_head_yaw_reference ="),
+            activation.index("hand_ctrl.activate()"),
+        )
+        self.assertLess(
+            activation.index("hand_ctrl.activate()"),
+            activation.index("START = True"),
+        )
+
+    def test_o6_command_is_not_published_before_arm_ik_and_command(self):
+        source = MAIN_PATH.read_text(encoding="utf-8")
+        tracking = source[source.index("# main loop. robot start to follow VR user's motion") :]
+        solve = tracking.index("arm_ik.solve_ik(")
+        hand_update = tracking.index("hand_ctrl.update(left_hand_target, right_hand_target)")
+        arm_update = tracking.index("arm_ctrl.ctrl_dual_arm_and_head(sol_q, sol_tauff, head_q_target)")
+        self.assertLess(
+            solve,
+            hand_update,
+        )
+        self.assertLess(
+            hand_update,
+            arm_update,
+        )
+        self.assertIn("if STOP:", tracking[solve:hand_update])
+        self.assertIn("if STOP:", tracking[hand_update:arm_update])
+        stale = tracking[tracking.index("if r1_a7_anchored:") :]
+        stale_guard = stale[:stale.index('if args.ee == "linker_o6":')]
+        self.assertIn("tele_data = last_fresh_tele_data", stale_guard)
+        self.assertNotIn("hand_ctrl.stop()", stale_guard)
+        self.assertNotIn("raise RuntimeError", stale_guard)
+
+    def test_o6_is_stopped_before_arm_in_separate_cleanup_blocks(self):
+        source = MAIN_PATH.read_text(encoding="utf-8")
+        cleanup = source[source.index("finally:", source.index("if __name__ == '__main__':")) :]
+        hand_stop = cleanup.index("hand_ctrl.stop()")
+        arm_stop = cleanup.index("arm_ctrl.stop()")
+        self.assertLess(hand_stop, arm_stop)
+        self.assertIn("except Exception as e:", cleanup[hand_stop:arm_stop])
 
     def test_post_activation_wait_retries_cached_snapshot_until_new_fresh_sample(self):
         tree = ast.parse(MAIN_PATH.read_text(encoding="utf-8"))

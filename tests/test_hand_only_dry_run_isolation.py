@@ -44,7 +44,12 @@ class HandOnlyDryRunIsolationTest(unittest.TestCase):
         attach_parents(cls.main_tree)
 
     def test_no_hardware_or_dds_import_runs_at_module_import_time(self):
-        forbidden = ("unitree_sdk2py", "robot_arm", "robot_arm_ik")
+        forbidden = (
+            "unitree_sdk2py",
+            "robot_arm",
+            "robot_arm_ik",
+            "robot_hand_linker_o6",
+        )
         module_imports = [
             node
             for node in self.main_tree.body
@@ -83,9 +88,11 @@ class HandOnlyDryRunIsolationTest(unittest.TestCase):
         self.assertIn("--hand-only", self.main_source)
         self.assertIn("--dry-run", self.main_source)
         self.assertIn('args.ee == "linker_o6" and not args.dry_run', self.main_source)
+        self.assertIn('args.arm != "R1_A7" or args.input_mode != "hand" or args.sim or args.motion', self.main_source)
         self.assertIn('args.dry_run and not (args.hand_only and args.ee == "linker_o6"', self.main_source)
         self.assertIn("--linker-o6-calibration", self.main_source)
-        self.assertIn("args.linker_o6_calibration and not args.dry_run", self.main_source)
+        self.assertIn('args.linker_o6_calibration and args.ee != "linker_o6"', self.main_source)
+        self.assertIn("Real Linker O6 control requires --linker-o6-calibration.", self.main_source)
         self.assertIn("--linker-o6-live-state", self.main_source)
         self.assertIn("args.linker_o6_live_state and not args.dry_run", self.main_source)
         self.assertIn("temp_path.replace(path)", self.main_source)
@@ -270,6 +277,7 @@ class HandOnlyDryRunIsolationTest(unittest.TestCase):
             "unitree_sdk2py",
             "teleop.robot_control.robot_arm",
             "teleop.robot_control.robot_arm_ik",
+            "teleop.robot_control.robot_hand_linker_o6",
             "teleop.utils.motion_switcher",
             "teleop.utils.episode_writer",
         )

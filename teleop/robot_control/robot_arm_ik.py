@@ -288,7 +288,6 @@ class G1_29_ArmIK:
         
         except Exception as e:
             logger_mp.error(f"ERROR in convergence, plotting debug info.{e}")
-
             sol_q = self.opti.debug.value(self.var_q)
             self.smooth_filter.add_data(sol_q)
             sol_q = self.smooth_filter.filtered_data

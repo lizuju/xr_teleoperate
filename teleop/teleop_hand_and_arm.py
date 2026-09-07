@@ -19,6 +19,7 @@ sys.path.append(parent_dir)
 
 from teleimager.image_client import ImageClient
 from teleop.utils.ipc import IPC_Server
+from teleop.robot_control.r1_head_waist import R1HeadWaistFollower, compensate_wrist_for_waist
 from sshkeyboard import listen_keyboard, stop_listening
 
 def publish_reset_category(category: int, publisher): # Scene Reset signal
@@ -106,6 +107,19 @@ def head_yaw_rotation(head_pose):
     x_axis /= x_norm
     y_axis = np.cross(np.array([0.0, 0.0, 1.0]), x_axis)
     return np.column_stack((x_axis, y_axis, np.array([0.0, 0.0, 1.0])))
+
+def relative_head_pitch_yaw(current_head_pose, reference_head_pose):
+    current = np.asarray(current_head_pose, dtype=float)
+    reference = np.asarray(reference_head_pose, dtype=float)
+    if current.shape != (4, 4) or reference.shape != (4, 4):
+        raise ValueError("head poses must be 4x4 matrices")
+    if not np.isfinite(current).all() or not np.isfinite(reference).all():
+        raise ValueError("head poses must be finite")
+    relative_rotation = reference[:3, :3].T @ current[:3, :3]
+    forward = relative_rotation[:, 0]
+    pitch = math.atan2(-forward[2], forward[0])
+    yaw = math.atan2(forward[1], math.hypot(forward[0], forward[2]))
+    return np.array([pitch, yaw])
 
 def wrist_in_reference_head_yaw_frame(
     wrist_pose,
@@ -195,10 +209,11 @@ if __name__ == '__main__':
     parser.add_argument('--dry-run', action='store_true', help='Compute Linker O6 targets without DDS command publishers')
     parser.add_argument('--tracking-timeout', type=float, default=0.25, help='Seconds before stale XR tracking disarms dry-run output')
     parser.add_argument('--linker-o6-urdf-root', type=str, default='/home/hnh/unitree_r1_dev/linkerhand-urdf/O6', help='Official Linker O6 URDF root')
-    parser.add_argument('--linker-o6-calibration', type=str, default=None, help='Vision Pro input calibration for Linker O6 dry-run')
+    parser.add_argument('--linker-o6-calibration', type=str, default=None, help='Vision Pro input calibration for Linker O6')
     parser.add_argument('--linker-o6-live-state', type=str, default=None, help='Atomic JSON target snapshot for isolated Linker O6 simulation')
     parser.add_argument('--arm-translation-scale', type=float, default=1.0, help='R1_A7 Cartesian translation scale relative to Vision Pro motion')
     parser.add_argument('--arm-diagnostic-dir', type=str, default=None, help='Directory for R1_A7 alignment JSONL diagnostics')
+    parser.add_argument('--waist-follow', action='store_true', help='R1_A7: sustained head turns drive waist yaw with feedback-based head and arm compensation')
     # record mode and task info
     parser.add_argument('--record', action = 'store_true', help = 'Enable data recording mode')
     parser.add_argument('--task-dir', type = str, default = './utils/data/', help = 'path to save data')
@@ -216,20 +231,25 @@ if __name__ == '__main__':
         parser.error("--dry-run requires --hand-only --ee linker_o6 --input-mode hand.")
     if args.hand_only and not args.dry_run:
         parser.error("The first-stage --hand-only path requires --dry-run.")
-    if args.ee == "linker_o6" and not args.dry_run:
-        parser.error("The first-stage --ee linker_o6 path requires --hand-only --dry-run.")
     if args.dry_run and (args.sim or args.motion):
         parser.error("--dry-run cannot be combined with --sim or --motion.")
-    if args.linker_o6_calibration and not args.dry_run:
-        parser.error("--linker-o6-calibration requires --dry-run.")
+    if args.linker_o6_calibration and args.ee != "linker_o6":
+        parser.error("--linker-o6-calibration requires --ee linker_o6.")
     if args.linker_o6_live_state and not args.dry_run:
         parser.error("--linker-o6-live-state requires --dry-run.")
+    if args.ee == "linker_o6" and not args.dry_run:
+        if args.arm != "R1_A7" or args.input_mode != "hand" or args.sim or args.motion:
+            parser.error("Real Linker O6 control requires --arm R1_A7 --input-mode hand without --sim or --motion.")
+        if not args.linker_o6_calibration:
+            parser.error("Real Linker O6 control requires --linker-o6-calibration.")
     if not (math.isfinite(args.tracking_timeout) and args.tracking_timeout > 0.0):
         parser.error("--tracking-timeout must be positive.")
     if not (math.isfinite(args.frequency) and args.frequency > 0.0):
         parser.error("--frequency must be positive.")
     if not (math.isfinite(args.arm_translation_scale) and args.arm_translation_scale > 0.0):
         parser.error("--arm-translation-scale must be positive.")
+    if args.waist_follow and (args.arm != "R1_A7" or args.hand_only or args.dry_run or args.motion):
+        parser.error("--waist-follow requires R1_A7 full arm control without --motion.")
 
     DRY_RUN_MODE = args.dry_run
     r1_a7_deferred_real = (
@@ -238,25 +258,32 @@ if __name__ == '__main__':
         and not args.hand_only
         and not args.dry_run
     )
-    R1_A7_DEFERRED_REAL_MODE = r1_a7_deferred_real
-    if args.arm_diagnostic_dir and not r1_a7_deferred_real:
-        parser.error("--arm-diagnostic-dir requires real R1_A7 arm control.")
+    r1_a7_anchored = r1_a7_deferred_real or args.waist_follow
+    R1_A7_DEFERRED_REAL_MODE = r1_a7_anchored
+    if args.arm_diagnostic_dir and not r1_a7_anchored:
+        parser.error("--arm-diagnostic-dir requires real R1_A7 or R1_A7 --sim --waist-follow.")
 
     arm_ctrl = None
+    hand_ctrl = None
     motion_switcher = None
     r1_vision_left_reference = None
     r1_vision_right_reference = None
     r1_robot_left_reference = None
     r1_robot_right_reference = None
     r1_head_yaw_reference = None
+    r1_head_pose_reference = None
     r1_waist_to_root = None
     r1_waist_yaw_reference = None
+    waist_follower = None
+    waist_diagnostic_next_time = 0.0
     arm_diagnostic_file = None
     arm_diagnostic_path = None
     arm_diagnostic_sequence = 0
     arm_diagnostic_next_time = 0.0
     arm_control_previous_time = None
     dry_run_record_file = None
+    linker_o6_retargeter = None
+    linker_o6_calibration = None
     img_client = None
     tv_wrapper = None
     recorder = None
@@ -332,11 +359,10 @@ if __name__ == '__main__':
                                      arm_reference_mode="head_yaw"
                                      )
 
-        if args.dry_run:
+        if args.ee == "linker_o6":
             from teleop.robot_control.linker_o6_retargeting import (
                 DualLinkerO6Retargeter,
                 LinkerO6Calibration,
-                is_tracking_fresh,
             )
 
             linker_o6_retargeter = DualLinkerO6Retargeter(args.linker_o6_urdf_root)
@@ -347,6 +373,10 @@ if __name__ == '__main__':
             )
             mapping_name = linker_o6_calibration.name if linker_o6_calibration else "candidate_unvalidated"
             visionpro_input_calibrated = linker_o6_calibration is not None
+
+        if args.dry_run:
+            from teleop.robot_control.linker_o6_retargeting import is_tracking_fresh
+
             if args.linker_o6_live_state:
                 live_state_path = Path(args.linker_o6_live_state).expanduser()
                 live_state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -535,7 +565,7 @@ if __name__ == '__main__':
             if args.motion:
                 if args.input_mode == "controller":
                     loco_wrapper = LocoClientWrapper()
-            elif not r1_a7_deferred_real:
+            elif not r1_a7_anchored:
                 motion_switcher = MotionSwitcher()
                 status, result = motion_switcher.Enter_Debug_Mode()
                 logger_mp.info(f"Enter debug mode: {'Success' if status == 0 else 'Failed'}")
@@ -579,7 +609,7 @@ if __name__ == '__main__':
                 arm_ik = R1_A5_ArmIK()
                 arm_ctrl = R1_A5_ArmController(motion_mode=args.motion, simulation_mode=args.sim)
             elif args.arm == "R1_A7":
-                if r1_a7_deferred_real:
+                if r1_a7_anchored:
                     arm_ctrl = R1_A7_ArmController(
                         motion_mode=args.motion,
                         simulation_mode=args.sim,
@@ -647,6 +677,10 @@ if __name__ == '__main__':
             dual_hand_action_array = Array('d', 12, lock = False)  # [output] current left, right hand action(12) data.
             hand_ctrl = Brainco_Controller_ctrl(left_gripper_trigger_in, left_gripper_squeeze_in, right_gripper_trigger_in, right_gripper_squeeze_in,
                                                 dual_hand_data_lock, dual_hand_state_array, dual_hand_action_array, simulation_mode=args.sim, xr_motion_data_ready_in=xr_motion_data_ready)
+        elif args.ee == "linker_o6":
+            dual_hand_data_lock = Lock()
+            dual_hand_state_array = Array('d', 12, lock=False)
+            dual_hand_action_array = Array('d', 12, lock=False)
         else:
             pass
         
@@ -677,7 +711,7 @@ if __name__ == '__main__':
             logger_mp.info("🔵  Recording is DISABLED (run with --record to enable).")
         logger_mp.info("🔴  Press [q] to stop and exit the program.")
         logger_mp.info("⚠️  IMPORTANT: Please keep your distance and stay safe.")
-        if r1_a7_deferred_real:
+        if r1_a7_anchored:
             START = False
         r1_arm_request_floor = ARM_REQUEST_GENERATION
         READY = True                  # now ready to (1) enter START state
@@ -685,7 +719,7 @@ if __name__ == '__main__':
             not STOP
             and (
                 not START
-                or (r1_a7_deferred_real and r1_vision_left_reference is None)
+                or (r1_a7_anchored and r1_vision_left_reference is None)
             )
         ):
             time.sleep(0.033)
@@ -695,7 +729,7 @@ if __name__ == '__main__':
                     tv_wrapper.render_to_xr(head_img.bgr)
 
             if (
-                r1_a7_deferred_real
+                r1_a7_anchored
                 and ARM_REQUEST_GENERATION > r1_arm_request_floor
             ):
                 r1_arm_request_floor = ARM_REQUEST_GENERATION
@@ -709,12 +743,19 @@ if __name__ == '__main__':
                         "R1_A7 activation rejected: Vision tracking is not fresh; press [r] again."
                     )
                     continue
-                motion_switcher = MotionSwitcher()
-                status, result = motion_switcher.Enter_Debug_Mode()
-                if status != 0:
-                    raise RuntimeError(
-                        f"R1_A7 failed to enter debug mode: status={status}, result={result}"
-                    )
+                if args.ee == "linker_o6":
+                    from teleop.robot_control.robot_hand_linker_o6 import LinkerO6Controller
+                    hand_ctrl = LinkerO6Controller()
+                    hand_ctrl.wait_until_ready(timeout=3.0)
+                    if STOP:
+                        continue
+                if r1_a7_deferred_real:
+                    motion_switcher = MotionSwitcher()
+                    status, result = motion_switcher.Enter_Debug_Mode()
+                    if status != 0:
+                        raise RuntimeError(
+                            f"R1_A7 failed to enter debug mode: status={status}, result={result}"
+                        )
                 arm_ctrl.activate()
                 if STOP:
                     continue
@@ -762,6 +803,19 @@ if __name__ == '__main__':
                 r1_vision_left_reference = reference_tele_data.left_wrist_pose.copy()
                 r1_vision_right_reference = reference_tele_data.right_wrist_pose.copy()
                 r1_head_yaw_reference = head_yaw_rotation(reference_tele_data.head_pose)
+                r1_head_pose_reference = reference_tele_data.head_pose.copy()
+                if args.waist_follow:
+                    waist_follower = R1HeadWaistFollower(
+                        r1_waist_yaw_reference, time.monotonic(), args.tracking_timeout,
+                    )
+                    logger_mp.info(
+                        "R1_A7 head/waist following enabled: 20 deg for 0.4 s to engage, "
+                        "0.35 rad/s waist speed, URDF waist range +/-2.618 rad."
+                    )
+                if STOP:
+                    continue
+                if args.ee == "linker_o6":
+                    hand_ctrl.activate()
                 if arm_diagnostic_file is not None:
                     write_json_line(arm_diagnostic_file, {
                         "schema": "r1_a7_alignment_v1",
@@ -770,6 +824,7 @@ if __name__ == '__main__':
                         "monotonic_time_ns": time.monotonic_ns(),
                         "translation_scale": args.arm_translation_scale,
                         "official_head_waist_recenter": True,
+                        "waist_follow": args.waist_follow,
                         "waist_yaw_rad": r1_waist_yaw_reference,
                         "waist_to_root": r1_waist_to_root.tolist(),
                         "head_pose_reference": reference_tele_data.head_pose.tolist(),
@@ -793,6 +848,8 @@ if __name__ == '__main__':
         head_img = None
         left_wrist_img = None
         right_wrist_img = None
+        last_fresh_tele_data = reference_tele_data if r1_a7_anchored else None
+        tracking_hold_active = False
 
         # main loop. robot start to follow VR user's motion
         while not STOP:
@@ -833,14 +890,36 @@ if __name__ == '__main__':
 
             # get xr's tele data
             tele_data = tv_wrapper.get_tele_data()
-            if r1_a7_deferred_real and not is_fresh_motion_data(
-                tele_data,
-                args.tracking_timeout,
-            ):
-                raise RuntimeError(
-                    "R1_A7 Vision tracking is stale; stopping arm command output."
+            if r1_a7_anchored:
+                if is_fresh_motion_data(tele_data, args.tracking_timeout):
+                    last_fresh_tele_data = tele_data
+                    if tracking_hold_active:
+                        if args.waist_follow:
+                            waist_follower.reset(arm_ctrl.get_current_waist_yaw(), time.monotonic())
+                        logger_mp.info("R1_A7 Vision tracking resumed.")
+                    tracking_hold_active = False
+                else:
+                    tele_data = last_fresh_tele_data
+                    if not tracking_hold_active:
+                        logger_mp.warning(
+                            "R1_A7 Vision tracking is stale; holding the last tracked pose until tracking resumes."
+                        )
+                    tracking_hold_active = True
+                if args.waist_follow and tracking_hold_active:
+                    # Do not refresh the waist watchdog with a cached XR sample.
+                    arm_ctrl.hold_waist()
+                    time.sleep(1.0 / args.frequency)
+                    continue
+            if args.ee == "linker_o6":
+                raw_left_target, raw_right_target = linker_o6_retargeter.retarget(
+                    tele_data.left_hand_pos,
+                    tele_data.right_hand_pos,
                 )
-            if args.ee in ("dex3", "inspire_ftp", "inspire_dfx", "brainco")  and args.input_mode == "hand":
+                left_hand_target, right_hand_target = linker_o6_calibration.apply(
+                    raw_left_target,
+                    raw_right_target,
+                )
+            elif args.ee in ("dex3", "inspire_ftp", "inspire_dfx", "brainco")  and args.input_mode == "hand":
                 with left_hand_pos_array.get_lock():
                     left_hand_pos_array[:] = tele_data.left_hand_pos.flatten()
                 with right_hand_pos_array.get_lock():
@@ -891,7 +970,11 @@ if __name__ == '__main__':
             time_ik_start = time.time()
             left_wrist_target = tele_data.left_wrist_pose
             right_wrist_target = tele_data.right_wrist_pose
-            if r1_a7_deferred_real:
+            if r1_a7_anchored:
+                head_q_target = relative_head_pitch_yaw(
+                    tele_data.head_pose,
+                    r1_head_pose_reference,
+                )
                 left_wrist_pose = wrist_in_reference_head_yaw_frame(
                     tele_data.left_wrist_pose,
                     tele_data.head_pose,
@@ -916,10 +999,26 @@ if __name__ == '__main__':
                     r1_waist_to_root,
                     args.arm_translation_scale,
                 )
-            if r1_a7_deferred_real:
+            left_ik_target = left_wrist_target
+            right_ik_target = right_wrist_target
+            waist_yaw_actual = None
+            waist_yaw_target = None
+            if args.waist_follow:
+                waist_yaw_actual = arm_ctrl.get_current_waist_yaw()
+                head_q_target, waist_yaw_target = waist_follower.update(
+                    tele_data.head_pose, r1_head_pose_reference,
+                    waist_yaw_actual, time.monotonic(),
+                )
+                left_ik_target = compensate_wrist_for_waist(
+                    left_wrist_target, waist_yaw_actual, r1_waist_yaw_reference,
+                )
+                right_ik_target = compensate_wrist_for_waist(
+                    right_wrist_target, waist_yaw_actual, r1_waist_yaw_reference,
+                )
+            if r1_a7_anchored:
                 sol_q, sol_tauff = arm_ik.solve_ik(
-                    left_wrist_target,
-                    right_wrist_target,
+                    left_ik_target,
+                    right_ik_target,
                     current_lr_arm_q,
                     current_lr_arm_dq,
                     raise_on_failure=True,
@@ -933,14 +1032,49 @@ if __name__ == '__main__':
                 )
             time_ik_end = time.time()
             logger_mp.debug(f"ik:\t{round(time_ik_end - time_ik_start, 6)}")
-            arm_ctrl.ctrl_dual_arm(sol_q, sol_tauff)
+            if STOP:
+                break
+            if args.waist_follow and not is_fresh_motion_data(tele_data, args.tracking_timeout):
+                arm_ctrl.hold_waist()
+                tracking_hold_active = True
+                continue
+            if args.ee == "linker_o6":
+                hand_ctrl.update(left_hand_target, right_hand_target)
+                with dual_hand_data_lock:
+                    dual_hand_state_array[:] = np.concatenate(hand_ctrl.get_state())
+                    dual_hand_action_array[:] = np.concatenate(hand_ctrl.get_action())
+            if STOP:
+                break
+            if args.waist_follow:
+                arm_ctrl.ctrl_dual_arm_and_head(
+                    sol_q, sol_tauff, head_q_target, waist_yaw_target=waist_yaw_target,
+                )
+            elif r1_a7_deferred_real:
+                arm_ctrl.ctrl_dual_arm_and_head(sol_q, sol_tauff, head_q_target)
+            else:
+                arm_ctrl.ctrl_dual_arm(sol_q, sol_tauff)
             diagnostic_now = time.monotonic()
+            if args.waist_follow and diagnostic_now >= waist_diagnostic_next_time:
+                waist_diagnostic_next_time = diagnostic_now + 1.0
+                logger_mp.info(
+                    f"[R1 HEAD/WAIST] total_yaw={math.degrees(waist_follower.total_yaw):.1f} deg "
+                    f"waist_actual={math.degrees(waist_yaw_actual):.1f} deg "
+                    f"waist_target={math.degrees(waist_yaw_target):.1f} deg "
+                    f"head_yaw={math.degrees(head_q_target[1]):.1f} deg "
+                    f"following={waist_follower.following}"
+                )
             if (
                 arm_diagnostic_file is not None
                 and diagnostic_now >= arm_diagnostic_next_time
             ):
                 actual_left_pose, actual_right_pose = arm_ik.forward_wrist_poses(current_lr_arm_q)
                 solved_left_pose, solved_right_pose = arm_ik.forward_wrist_poses(sol_q)
+                if args.waist_follow:
+                    # Fixed-waist IK FK must be returned to the actual robot root frame.
+                    actual_left_pose, actual_right_pose, solved_left_pose, solved_right_pose = (
+                        compensate_wrist_for_waist(pose, r1_waist_yaw_reference, waist_yaw_actual)
+                        for pose in (actual_left_pose, actual_right_pose, solved_left_pose, solved_right_pose)
+                    )
                 arm_diagnostic_sequence += 1
                 arm_diagnostic_next_time = diagnostic_now + 0.1
                 write_json_line(arm_diagnostic_file, {
@@ -960,6 +1094,11 @@ if __name__ == '__main__':
                     "vision_right_fixed_heading": right_wrist_pose.tolist(),
                     "left_target": left_wrist_target.tolist(),
                     "right_target": right_wrist_target.tolist(),
+                    "left_ik_target": left_ik_target.tolist(),
+                    "right_ik_target": right_ik_target.tolist(),
+                    "waist_yaw_actual_rad": waist_yaw_actual,
+                    "waist_yaw_target_rad": waist_yaw_target,
+                    "head_q_target": head_q_target.tolist(),
                     "q_actual": current_lr_arm_q.tolist(),
                     "dq_actual": current_lr_arm_dq.tolist(),
                     "q_ik_command": sol_q.tolist(),
@@ -1008,7 +1147,7 @@ if __name__ == '__main__':
                         current_body_action = [-tele_data.left_ctrl_thumbstickValue[1]  * 0.3,
                                                -tele_data.left_ctrl_thumbstickValue[0]  * 0.3,
                                                -tele_data.right_ctrl_thumbstickValue[0] * 0.3]
-                elif (args.ee == "inspire_dfx" or args.ee == "inspire_ftp" or args.ee == "brainco") and args.input_mode == "hand":
+                elif args.ee in ("inspire_dfx", "inspire_ftp", "brainco", "linker_o6") and args.input_mode == "hand":
                     with dual_hand_data_lock:
                         left_ee_state = dual_hand_state_array[:6]
                         right_ee_state = dual_hand_state_array[-6:]
@@ -1033,6 +1172,11 @@ if __name__ == '__main__':
                     right_hand_action = []
                     current_body_state = []
                     current_body_action = []
+
+                if args.waist_follow:
+                    # Body order: waist_yaw, head_pitch, head_yaw.
+                    current_body_state = [waist_yaw_actual, *arm_ctrl.get_current_head_q().tolist()]
+                    current_body_action = [waist_yaw_target, *head_q_target.tolist()]
 
                 # arm state and action (split into left/right halves by the arm's own DOF, so it works for any variant: H1/G1_23/R1_A5 = 4/5 per arm, G1_29/R1_A7 = 7)
                 half = len(current_lr_arm_q) // 2
@@ -1145,8 +1289,15 @@ if __name__ == '__main__':
         if isinstance(active_exception, SystemExit) and active_exception.code not in (None, 0):
             exit_code = active_exception.code if isinstance(active_exception.code, int) else 1
         try:
+            if args.ee == "linker_o6" and hand_ctrl is not None:
+                hand_ctrl.stop()
+        except Exception as e:
+            exit_code = 1
+            logger_mp.error(f"Failed to stop Linker O6 controller: {e}")
+
+        try:
             if arm_ctrl is not None:
-                if r1_a7_deferred_real:
+                if r1_a7_anchored:
                     arm_ctrl.stop()
                 else:
                     arm_ctrl.ctrl_dual_arm_go_home()
