@@ -2,6 +2,7 @@ import ast
 import asyncio
 import importlib.util
 from multiprocessing import Array, Value
+from msgpack import ExtType, unpackb
 from pathlib import Path
 import sys
 import threading
@@ -62,8 +63,10 @@ def bare_televuer():
     tele_vuer.left_hand_timestamp_shared = Value("d", 0.0, lock=True)
     tele_vuer.right_hand_timestamp_shared = Value("d", 0.0, lock=True)
     tele_vuer.motion_sample_seq_shared = Value("L", 0, lock=True)
-    tele_vuer._last_left_hand_timestamp = 0.0
-    tele_vuer._last_right_hand_timestamp = 0.0
+    tele_vuer.tracking_event_counts_shared = Array("L", 9, lock=True)
+    tele_vuer.tracking_hand_status_shared = Array("i", 2, lock=True)
+    guard_type = tele_vuer.on_hand_move.__func__.__globals__["HandPoseGuard"]
+    tele_vuer.hand_pose_guards = (guard_type(), guard_type())
     return tele_vuer
 
 
@@ -126,12 +129,9 @@ class TeleVuerMotionSnapshotTest(unittest.TestCase):
 class TeleVuerHandFreshnessTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        # Exercise the real consumer guard without importing robot controllers.
         source = (STAGE_ROOT / "teleop" / "teleop_hand_and_arm.py").read_text()
-        guard = next(
-            node for node in ast.parse(source).body
-            if isinstance(node, ast.FunctionDef) and node.name == "is_fresh_motion_data"
-        )
+        guard = next(node for node in ast.parse(source).body
+                     if isinstance(node, ast.FunctionDef) and node.name == "is_fresh_motion_data")
         namespace = {}
         exec(compile(ast.Module(body=[guard], type_ignores=[]), "<tracking-guard>", "exec"), namespace)
         cls.is_fresh = staticmethod(namespace["is_fresh_motion_data"])
@@ -142,82 +142,148 @@ class TeleVuerHandFreshnessTest(unittest.TestCase):
 
     def publish(self, timestamp, *hands, **payload):
         event = types.SimpleNamespace(value={hand: self.pose for hand in hands} | payload)
-        with mock.patch.dict(
-            self.tele_vuer.on_hand_move.__func__.__globals__,
-            {"time": types.SimpleNamespace(monotonic=lambda: timestamp)},
-        ):
+        with mock.patch.dict(self.tele_vuer.on_hand_move.__func__.__globals__,
+                             {"time": types.SimpleNamespace(monotonic=lambda: timestamp)}):
             asyncio.run(self.tele_vuer.on_hand_move(event, None))
         snapshot = self.tele_vuer.get_hand_motion_snapshot()
         self.assertIsNotNone(snapshot)
+        self.assertEqual(snapshot["motion_sample_seq"] % 2, 0)
         return types.SimpleNamespace(**snapshot)
 
-    def test_both_hands_are_fresh(self):
-        sample = self.publish(100.0, "left", "right")
-        self.assertEqual(sample.motion_data_timestamp, 100.0)
+    def settle(self, timestamp, **payload):
+        for step in range(13):
+            sample = self.publish(timestamp - 0.4 + step / 30, "left", "right", **payload)
+        return sample
+
+    def test_valid_both_hands_are_available_without_input_stability_delay(self):
+        sample = self.publish(99.6, "left", "right")
+        self.assertTrue(sample.motion_data_ready)
+        self.assertTrue(self.is_fresh(sample, 0.25, now=99.6))
+        sample = self.settle(100.0)
         self.assertTrue(self.is_fresh(sample, 0.25, now=100.0))
+        self.assertEqual(sample.left_hand_timestamp, 100.0)
+        self.assertEqual(sample.right_hand_timestamp, 100.0)
 
-    def test_either_hand_stopping_cannot_be_hidden_by_the_other(self):
-        for moving_hand in ("left", "right"):
-            with self.subTest(moving_hand=moving_hand):
-                self.tele_vuer = bare_televuer()
-                self.publish(100.0, "left", "right")
-                for age in (0.125, 0.25, 0.251, 0.4, 0.6, 1.0):
-                    with self.subTest(age=age):
-                        sample = self.publish(100.0 + age, moving_hand)
-                        self.assertEqual(sample.motion_data_timestamp, 100.0)
-                        self.assertEqual(
-                            self.is_fresh(sample, 0.25, now=100.0 + age),
-                            age <= 0.25,
-                        )
+    def test_missing_either_hand_invalidates_it_immediately(self):
+        for moving in ("left", "right"):
+            self.tele_vuer = bare_televuer()
+            self.settle(100.0)
+            sample = self.publish(100.01, moving)
+            missing = "right" if moving == "left" else "left"
+            self.assertEqual(getattr(sample, missing + "_hand_timestamp"), 0.0)
+            self.assertEqual(getattr(sample, moving + "_hand_timestamp"), 100.01)
+            self.assertFalse(self.is_fresh(sample, 0.25, now=100.01))
+            self.assertTrue(sample.motion_data_ready)
 
-    def test_startup_requires_both_hands_to_have_recent_data(self):
-        sample = self.publish(100.0, "left")
-        self.assertFalse(self.is_fresh(sample, 0.25, now=100.0))
-        sample = self.publish(100.4, "right")
-        self.assertFalse(sample.motion_data_ready)
-        self.assertFalse(self.is_fresh(sample, 0.25, now=100.4))
-        sample = self.publish(100.45, "left")
-        self.assertEqual(sample.motion_data_timestamp, 100.4)
-        self.assertTrue(self.is_fresh(sample, 0.25, now=100.45))
+    def test_msgpackr_undefined_is_missing_not_malformed(self):
+        self.settle(100.0)
+        undefined = unpackb(bytes.fromhex("d40000"), raw=False)
+        self.assertIsInstance(undefined, ExtType)
+        sample = self.publish(100.01, left=undefined, right=undefined)
+        self.assertEqual((sample.left_hand_timestamp, sample.right_hand_timestamp), (0.0, 0.0))
+        counts = self.tele_vuer.tracking_event_counts_shared[:]
+        self.assertEqual(counts[4], 0)
+        self.assertEqual(counts[5:7], [1, 1])
 
-    def test_recovery_uses_the_older_of_the_two_updated_hands(self):
-        self.publish(100.0, "left", "right")
-        sample = self.publish(100.4, "left")
-        self.assertFalse(self.is_fresh(sample, 0.25, now=100.4))
-        sample = self.publish(100.41, "right")
-        self.assertEqual(sample.motion_data_timestamp, 100.4)
-        self.assertTrue(self.is_fresh(sample, 0.25, now=100.41))
+    def test_unknown_extension_is_reported_and_does_not_block_other_hand(self):
+        self.settle(100.0)
+        with mock.patch("builtins.print") as output:
+            sample = self.publish(100.01, "right", left=ExtType(116, b"bad"))
+        self.assertEqual(sample.left_hand_timestamp, 0.0)
+        self.assertEqual(sample.right_hand_timestamp, 100.01)
+        self.assertIn("code=116", output.call_args.args[0])
+        self.assertEqual(self.tele_vuer.tracking_event_counts_shared[4], 1)
 
-    def test_short_pose_does_not_refresh_the_missing_hand(self):
-        self.publish(100.0, "left", "right")
-        sample = self.publish(100.4, "left", right=[])
-        self.assertEqual(sample.motion_data_timestamp, 100.0)
-        self.assertFalse(self.is_fresh(sample, 0.25, now=100.4))
+    def test_bad_joint_transforms_and_gestures_hold_only_bad_side(self):
+        self.settle(100.0)
+        nan = self.pose.copy(); nan[12] = float("nan")
+        reflection = self.pose.copy(); reflection[0] = -1
+        skew = self.pose.copy(); skew[16 + 1] = 0.2
+        distant = self.pose.copy(); distant[16 + 12] = 1.0
+        for invalid in ([0.] * 400, nan, reflection, skew, distant, "invalid"):
+            sample = self.publish(100.01, "right", left=invalid)
+            self.assertEqual(sample.left_hand_timestamp, 0.0)
+            self.assertEqual(sample.right_hand_timestamp, 100.01)
+        sample = self.settle(100.5)
+        sample = self.publish(100.51, "left", "right", leftState={"pinchValue": float("nan")})
+        self.assertEqual(sample.left_hand_timestamp, 0.0)
+        self.assertEqual(sample.right_hand_timestamp, 100.51)
 
-    def test_no_new_events_expires_the_last_sample(self):
-        sample = self.publish(100.0, "left", "right")
+    def test_large_valid_movement_updates_both_wrist_and_fingers(self):
+        self.settle(100.0)
+        before = self.tele_vuer.get_hand_motion_snapshot(include_orientations=True)
+        jumped = np.asarray(self.pose).reshape(25, 16).copy()
+        jumped[:, 12] += 0.3
+        sample = self.publish(100.03, "right", left=jumped.flatten().tolist())
+        self.assertEqual(sample.left_hand_timestamp, 100.03)
+        self.assertEqual(sample.right_hand_timestamp, 100.03)
+        expected_pose = before["left_arm_pose"].copy()
+        expected_pose[0, 3] += 0.3
+        np.testing.assert_allclose(sample.left_arm_pose, expected_pose)
+        np.testing.assert_allclose(sample.left_hand_positions, before["left_hand_positions"] + [0.3, 0, 0])
+        diagnostics = self.tele_vuer.get_tracking_diagnostics()
+        self.assertEqual(diagnostics["left_state"], "tracking")
+        self.assertEqual(diagnostics["left_suspect"], 0)
+
+    def test_column_major_joint_pose_mapping_is_preserved(self):
+        matrices = np.tile(np.eye(4), (25, 1, 1))
+        matrices[:, :3, :3] = [[0, -1, 0], [1, 0, 0], [0, 0, 1]]
+        matrices[:, :3, 3] = np.column_stack((np.linspace(0.1, 0.25, 25),
+                                              np.full(25, 0.2), np.full(25, 0.3)))
+        encoded = matrices.transpose(0, 2, 1).flatten().tolist()
+        self.settle(100.0, left=encoded, right=encoded)
+        sample = self.tele_vuer.get_hand_motion_snapshot(include_orientations=True)
+        np.testing.assert_array_equal(sample["left_arm_pose"], matrices[0])
+        np.testing.assert_array_equal(sample["left_hand_positions"], matrices[:, :3, 3])
+        np.testing.assert_array_equal(sample["right_hand_orientations"], matrices[:, :3, :3])
+
+    def test_moving_reappearance_resumes_wrist_and_fingers_without_activation(self):
+        self.settle(100.0)
+        self.publish(100.01, "right")
+        for step in range(120):
+            timestamp = 100.04 + step / 30
+            moving = np.asarray(self.pose).reshape(25, 16).copy()
+            x = 0.15 + 0.2 * step / 30
+            moving[:, 12] = x
+            sample = self.publish(timestamp, "right", left=moving.flatten().tolist())
+            self.assertEqual(sample.left_hand_timestamp, timestamp)
+            self.assertEqual(sample.right_hand_timestamp, timestamp)
+            self.assertAlmostEqual(sample.left_arm_pose[0, 3], x)
+            np.testing.assert_allclose(sample.left_hand_positions[:, 0], x)
+            self.assertTrue(self.is_fresh(sample, 0.25, now=timestamp))
+
+    def test_isolated_new_frames_do_not_disable_the_no_events_timeout(self):
+        for timestamp in (100.0, 100.4, 101.0, 102.0):
+            sample = self.publish(timestamp, "left", "right")
+            self.assertTrue(self.is_fresh(sample, 0.25, now=timestamp))
+            self.assertFalse(self.is_fresh(sample, 0.25, now=timestamp + 0.251))
+
+    def test_invalid_then_valid_frame_recovers_only_valid_side_immediately(self):
+        self.settle(100.0)
+        invalid = self.pose.copy()
+        invalid[12] = float("nan")
+        with mock.patch("builtins.print"):
+            sample = self.publish(100.01, left=invalid, right=invalid)
+        self.assertEqual((sample.left_hand_timestamp, sample.right_hand_timestamp), (0.0, 0.0))
+        sample = self.publish(100.02, "left")
+        self.assertEqual((sample.left_hand_timestamp, sample.right_hand_timestamp), (100.02, 0.0))
+        self.assertEqual(self.tele_vuer.get_tracking_diagnostics()["left_state"], "tracking")
+
+    def test_no_new_events_expires_last_sample(self):
+        sample = self.settle(100.0)
         self.assertTrue(self.is_fresh(sample, 0.25, now=100.25))
         self.assertFalse(self.is_fresh(sample, 0.25, now=100.251))
 
-    def test_individual_timestamps_survive_a_long_one_sided_outage(self):
-        self.publish(100.0, "left", "right")
-        sample = self.publish(102.0, "left")
-        self.assertEqual(sample.left_hand_timestamp, 102.0)
-        self.assertEqual(sample.right_hand_timestamp, 100.0)
-        self.assertEqual(sample.motion_data_timestamp, 100.0)
-        sample = self.publish(102.01, "right")
-        self.assertEqual(sample.left_hand_timestamp, 102.0)
-        self.assertEqual(sample.right_hand_timestamp, 102.01)
-
-    def test_invalid_right_pose_does_not_block_valid_left_updates(self):
-        self.publish(100.0, "left", "right")
-        invalid_nan = self.pose.copy()
-        invalid_nan[12] = float("nan")
-        for invalid in (None, [], [0.0] * 400, invalid_nan, "invalid"):
-            with self.subTest(invalid_type=type(invalid).__name__):
-                sample = self.publish(100.4, "left", right=invalid)
-                self.assertEqual(sample.left_hand_timestamp, 100.4)
-                self.assertEqual(sample.right_hand_timestamp, 100.0)
+    def test_both_missing_still_commits_readable_snapshot_and_clear_diagnostics(self):
+        self.settle(100.0)
+        self.publish(100.01)
+        result = self.tele_vuer.get_tracking_diagnostics()
+        self.assertEqual(result["left_state"], "missing")
+        self.assertEqual(result["right_state"], "missing")
+        self.assertFalse(result["left_fresh"])
+        self.assertFalse(result["right_fresh"])
+        self.assertIsNone(result["pair_age_ms"])
+        self.assertTrue(result["ready"])
 
     def test_wrapper_exports_both_timestamps_from_the_same_snapshot(self):
         import sys
@@ -236,8 +302,8 @@ class TeleVuerHandFreshnessTest(unittest.TestCase):
             with mock.patch.dict(sys.modules, {name: wrapper_module}):
                 spec.loader.exec_module(wrapper_module)
             wrapper = wrapper_module.TeleVuerWrapper.__new__(wrapper_module.TeleVuerWrapper)
-            self.publish(100.0, "left", "right")
-            self.publish(100.4, "left")
+            self.settle(100.0)
+            self.publish(100.03, "left")
             wrapper.use_hand_tracking = True
             wrapper.return_hand_rot_data = False
             wrapper.arm_reference_mode = "head_yaw"
@@ -246,10 +312,25 @@ class TeleVuerHandFreshnessTest(unittest.TestCase):
                 get_hand_motion_snapshot=self.tele_vuer.get_hand_motion_snapshot,
             )
             wrapper._last_hand_motion_snapshot = {}
+            wrapper._tele_data_lock = wrapper_module.threading.Lock()
             sample = wrapper.get_tele_data()
-            self.assertEqual(sample.left_hand_timestamp, 100.4)
-            self.assertEqual(sample.right_hand_timestamp, 100.0)
-            self.assertEqual(sample.motion_data_timestamp, 100.0)
+            self.assertEqual(sample.left_hand_timestamp, 100.03)
+            self.assertEqual(sample.right_hand_timestamp, 0.0)
+            self.assertEqual(sample.motion_data_timestamp, 0.0)
+
+    def test_runtime_diagnostics_precede_tracking_hold_early_continue(self):
+        source = (STAGE_ROOT / "teleop" / "teleop_hand_and_arm.py").read_text()
+        tree = ast.parse(source)
+        loop = next(node for node in ast.walk(tree) if isinstance(node, ast.While)
+                    and any(isinstance(child, ast.Assign) and any(
+                        isinstance(target, ast.Name) and target.id == "loop_monotonic"
+                        for target in child.targets) for child in node.body))
+        diagnostic = next(index for index, node in enumerate(loop.body)
+                          if "get_tracking_diagnostics" in ast.unparse(node))
+        first_continue = next(index for index, node in enumerate(loop.body)
+                              if any(isinstance(child, ast.Continue) for child in ast.walk(node)))
+        self.assertLess(diagnostic, first_continue)
+        self.assertIn("+ 2.0", ast.unparse(loop.body[diagnostic]))
 
 
 if __name__ == "__main__":

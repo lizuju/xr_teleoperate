@@ -85,20 +85,6 @@ def is_fresh_motion_data(tele_data, timeout, now=None):
     age = now - tele_data.motion_data_timestamp
     return 0.0 <= age <= timeout
 
-def wait_for_new_fresh_motion_data(tv_wrapper, after_timestamp, timeout):
-    deadline = time.monotonic() + timeout
-    while True:
-        tele_data = tv_wrapper.get_tele_data()
-        now = time.monotonic()
-        if (
-            tele_data.motion_data_timestamp > after_timestamp
-            and is_fresh_motion_data(tele_data, timeout, now=now)
-        ):
-            return tele_data
-        if now >= deadline:
-            return None
-        time.sleep(min(0.005, deadline - now))
-
 def head_yaw_rotation(head_pose):
     x_axis = head_pose[:3, 0].copy()
     x_axis[2] = 0.0
@@ -126,6 +112,7 @@ def wrist_in_reference_head_yaw_frame(
     wrist_pose,
     current_head_pose,
     reference_head_yaw,
+    reference_head_position,
 ):
     current_to_reference = reference_head_yaw.T @ head_yaw_rotation(current_head_pose)
     waist_origin_offset = np.array([0.15, 0.0, 0.45])
@@ -134,6 +121,8 @@ def wrist_in_reference_head_yaw_frame(
     pose[:3, 3] = (
         current_to_reference @ (wrist_pose[:3, 3] - waist_origin_offset)
         + waist_origin_offset
+        # Undo the wrapper's current-head translation and anchor at activation.
+        + reference_head_yaw.T @ (current_head_pose[:3, 3] - reference_head_position)
     )
     return pose
 
@@ -210,7 +199,7 @@ if __name__ == '__main__':
     parser.add_argument('--dry-run', action='store_true', help='Compute Linker O6 targets without DDS command publishers')
     parser.add_argument('--tracking-timeout', type=float, default=0.25, help='XR timeout in seconds; R1_A7 hand tracking holds each stale side independently')
     parser.add_argument('--linker-o6-urdf-root', type=str, default='/home/hnh/unitree_r1_dev/linkerhand-urdf/O6', help='Official Linker O6 URDF root')
-    parser.add_argument('--linker-o6-calibration', type=str, default=None, help='Vision Pro input calibration for Linker O6')
+    parser.add_argument('--linker-o6-method', choices=['vector', 'position', 'dexpilot'], default='vector', help='dex-retargeting optimizer for Linker O6')
     parser.add_argument('--linker-o6-live-state', type=str, default=None, help='Atomic JSON target snapshot for isolated Linker O6 simulation')
     parser.add_argument('--arm-translation-scale', type=float, default=1.0, help='R1_A7 Cartesian translation scale relative to Vision Pro motion')
     parser.add_argument('--arm-diagnostic-dir', type=str, default=None, help='Directory for R1_A7 alignment JSONL diagnostics')
@@ -234,15 +223,11 @@ if __name__ == '__main__':
         parser.error("The first-stage --hand-only path requires --dry-run.")
     if args.dry_run and (args.sim or args.motion):
         parser.error("--dry-run cannot be combined with --sim or --motion.")
-    if args.linker_o6_calibration and args.ee != "linker_o6":
-        parser.error("--linker-o6-calibration requires --ee linker_o6.")
     if args.linker_o6_live_state and not args.dry_run:
         parser.error("--linker-o6-live-state requires --dry-run.")
     if args.ee == "linker_o6" and not args.dry_run:
         if args.arm != "R1_A7" or args.input_mode != "hand" or args.sim or args.motion:
             parser.error("Real Linker O6 control requires --arm R1_A7 --input-mode hand without --sim or --motion.")
-        if not args.linker_o6_calibration:
-            parser.error("Real Linker O6 control requires --linker-o6-calibration.")
     if not (math.isfinite(args.tracking_timeout) and args.tracking_timeout > 0.0):
         parser.error("--tracking-timeout must be positive.")
     if not (math.isfinite(args.frequency) and args.frequency > 0.0):
@@ -269,6 +254,7 @@ if __name__ == '__main__':
 
     arm_ctrl = None
     hand_ctrl = None
+    linker_o6_loop = None
     motion_switcher = None
     r1_vision_left_reference = None
     r1_vision_right_reference = None
@@ -287,7 +273,6 @@ if __name__ == '__main__':
     arm_control_previous_time = None
     dry_run_record_file = None
     linker_o6_retargeter = None
-    linker_o6_calibration = None
     img_client = None
     tv_wrapper = None
     recorder = None
@@ -364,19 +349,13 @@ if __name__ == '__main__':
                                      )
 
         if args.ee == "linker_o6":
-            from teleop.robot_control.linker_o6_retargeting import (
-                DualLinkerO6Retargeter,
-                LinkerO6Calibration,
-            )
+            from teleop.robot_control.linker_o6_retargeting import DualLinkerO6Retargeter
 
-            linker_o6_retargeter = DualLinkerO6Retargeter(args.linker_o6_urdf_root)
-            linker_o6_calibration = (
-                LinkerO6Calibration(args.linker_o6_calibration)
-                if args.linker_o6_calibration
-                else None
+            linker_o6_retargeter = DualLinkerO6Retargeter(
+                args.linker_o6_urdf_root, method=args.linker_o6_method
             )
-            mapping_name = linker_o6_calibration.name if linker_o6_calibration else "candidate_unvalidated"
-            visionpro_input_calibrated = linker_o6_calibration is not None
+            mapping_name = linker_o6_retargeter.mapping_name
+            logger_mp.info(f"Linker O6 dex-retargeting: method={linker_o6_retargeter.method} mapping={mapping_name}")
 
         if args.dry_run:
             from teleop.robot_control.linker_o6_retargeting import is_tracking_fresh
@@ -391,10 +370,7 @@ if __name__ == '__main__':
             rearm_required = True
             fresh_seen_after_stale = False
             arm_request_floor = ARM_REQUEST_GENERATION
-            if linker_o6_calibration:
-                logger_mp.warning(f"Loaded Vision Pro input calibration: {linker_o6_calibration.name}. Linker O6 hardware direction is still unvalidated and no DDS command publisher exists in this path.")
-            else:
-                logger_mp.warning("Linker O6 dry-run uses an uncalibrated candidate geometric mapping; left/right thumb-yaw direction is not hardware-calibrated and no DDS command publisher exists in this path.")
+            logger_mp.warning("Linker O6 dry-run uses dex-retargeting without the previous gesture calibration; no DDS command publisher exists in this path.")
             logger_mp.info("Linker O6 hardware axis order: thumb pitch, thumb yaw, index, middle, ring, pinky.")
             logger_mp.info("Press [r] to arm target output, [s] to toggle JSONL recording, or [q] to exit.")
             READY = True
@@ -441,14 +417,13 @@ if __name__ == '__main__':
                     fresh_seen_after_stale = False
                     arm_request_floor = ARM_REQUEST_GENERATION
                     if dry_run_status != "tracking_stale":
+                        linker_o6_retargeter.reset()
                         status_payload = {
                             "schema": "linker_o6_target_v1",
                             "armed": False,
                             "reason": "tracking_stale",
                             "mapping": mapping_name,
-                            "visionpro_input_calibrated": visionpro_input_calibrated,
-                            "thumb_yaw_calibrated": False,
-                            "thumb_yaw_hardware_direction_validated": False,
+                            "retargeting_method": linker_o6_retargeter.method,
                             "tracking_age_s": tracking_age_s,
                         }
                         status_line = json.dumps(status_payload, separators=(",", ":"))
@@ -482,9 +457,7 @@ if __name__ == '__main__':
                                 "armed": False,
                                 "reason": "awaiting_r_key",
                                 "mapping": mapping_name,
-                                "visionpro_input_calibrated": visionpro_input_calibrated,
-                                "thumb_yaw_calibrated": False,
-                                "thumb_yaw_hardware_direction_validated": False,
+                                "retargeting_method": linker_o6_retargeter.method,
                                 "tracking_age_s": tracking_age_s,
                             }
                             status_line = json.dumps(status_payload, separators=(",", ":"))
@@ -506,25 +479,15 @@ if __name__ == '__main__':
                     targets_allowed = True
 
                 if targets_allowed:
-                    raw_left_target, raw_right_target = linker_o6_retargeter.retarget(
+                    left_target, right_target = linker_o6_retargeter.retarget(
                         tele_data.left_hand_pos,
                         tele_data.right_hand_pos,
                     )
-                    if linker_o6_calibration:
-                        left_target, right_target = linker_o6_calibration.apply(
-                            raw_left_target, raw_right_target
-                        )
-                    else:
-                        left_target, right_target = raw_left_target, raw_right_target
                     payload = {
                         "schema": "linker_o6_target_v1",
                         "armed": True,
                         "mapping": mapping_name,
-                        "visionpro_input_calibrated": visionpro_input_calibrated,
-                        "thumb_yaw_calibrated": False,
-                        "thumb_yaw_hardware_direction_validated": False,
-                        "calibration_file": str(linker_o6_calibration.path) if linker_o6_calibration else None,
-                        "raw_target_units": "normalized_0_1_geometric",
+                        "retargeting_method": linker_o6_retargeter.method,
                         "target_units": "normalized_0_1",
                         "monotonic_timestamp": tele_data.motion_data_timestamp,
                         "tracking_age_s": tracking_age_s,
@@ -537,9 +500,9 @@ if __name__ == '__main__':
                             "pinky",
                         ],
                         "target_hand_order": ["left", "right"],
-                        "raw_left_target": raw_left_target.tolist(),
-                        "raw_right_target": raw_right_target.tolist(),
-                        "raw_target_12": raw_left_target.tolist() + raw_right_target.tolist(),
+                        "hand_points_frame": "televuer_unitree_hand_wrist_local_meters",
+                        "left_hand_points": tele_data.left_hand_pos.tolist(),
+                        "right_hand_points": tele_data.right_hand_pos.tolist(),
                         "left_target": left_target.tolist(),
                         "right_target": right_target.tolist(),
                         "target_12": left_target.tolist() + right_target.tolist(),
@@ -708,7 +671,10 @@ if __name__ == '__main__':
                                      rerun_log = not args.headless)
 
         logger_mp.info("----------------------------------------------------------------")
-        logger_mp.info("🟢  Press [r] to start syncing the robot with your movements.")
+        if r1_a7_anchored:
+            logger_mp.info("🟢  Press [r] once to prepare R1_A7; following starts automatically when both hands are stable.")
+        else:
+            logger_mp.info("🟢  Press [r] to start syncing the robot with your movements.")
         if args.record:
             logger_mp.info("🟡  Press [s] to START or SAVE recording (toggle cycle).")
         else:
@@ -718,6 +684,14 @@ if __name__ == '__main__':
         if r1_a7_anchored:
             START = False
         r1_arm_request_floor = ARM_REQUEST_GENERATION
+        r1_start_requested = False
+        r1_activation_prepared = False
+        r1_startup_sample_floor = 0.0
+        r1_startup_fresh_since = None
+        r1_startup_last_timestamp = 0.0
+        r1_startup_fresh_samples = 0
+        r1_startup_tracking_ready = False
+        tracking_diagnostic_next_time = 0.0
         READY = True                  # now ready to (1) enter START state
         while (
             not STOP
@@ -727,14 +701,58 @@ if __name__ == '__main__':
             )
         ):
             time.sleep(0.033)
+            if STOP:
+                break
+            if r1_a7_deferred_real and time.monotonic() >= tracking_diagnostic_next_time:
+                tracking_diagnostic_next_time = time.monotonic() + 2.0
+                logger_mp.info(
+                    "[XR TRACKING] " + json.dumps(tv_wrapper.tvuer.get_tracking_diagnostics())
+                )
             if camera_config['head_camera']['enable_zmq'] and xr_need_local_img:
                 head_img = img_client.get_head_frame()
                 if head_img.bgr is not None:
                     tv_wrapper.render_to_xr(head_img.bgr)
 
+            if r1_a7_anchored and ARM_REQUEST_GENERATION > r1_arm_request_floor:
+                r1_arm_request_floor = ARM_REQUEST_GENERATION
+                r1_start_requested = True
+                START = False
+                if not r1_activation_prepared:
+                    logger_mp.info("[R1 STARTUP] Start requested; waiting for fresh hands before recentering. [q] cancels.")
+
+            if r1_activation_prepared:
+                # Waiting for XR is allowed; stale robot feedback is not.
+                arm_ctrl.get_current_waist_yaw()
+                startup_tele_data = tv_wrapper.get_tele_data()
+                startup_now = time.monotonic()
+                startup_timestamp = startup_tele_data.motion_data_timestamp
+                if (
+                    not is_fresh_motion_data(startup_tele_data, args.tracking_timeout, now=startup_now)
+                    or startup_timestamp <= r1_startup_sample_floor
+                ):
+                    if r1_startup_tracking_ready:
+                        logger_mp.warning("[R1 STARTUP] Tracking lost; holding posture and waiting for both hands. No recentering.")
+                    r1_startup_fresh_since = None
+                    r1_startup_last_timestamp = 0.0
+                    r1_startup_fresh_samples = 0
+                    r1_startup_tracking_ready = False
+                    START = False
+                else:
+                    if startup_timestamp > r1_startup_last_timestamp:
+                        if r1_startup_fresh_since is None:
+                            r1_startup_fresh_since = startup_now
+                        r1_startup_last_timestamp = startup_timestamp
+                        r1_startup_fresh_samples += 1
+                    if not r1_startup_tracking_ready:
+                        START = False
+                        if startup_now - r1_startup_fresh_since >= 0.35 and r1_startup_fresh_samples >= 5:
+                            r1_startup_tracking_ready = True
+                            logger_mp.info("[R1 STARTUP] Both hands stable; automatically starting following. No additional key or recentering.")
+
             if (
                 r1_a7_anchored
-                and ARM_REQUEST_GENERATION > r1_arm_request_floor
+                and r1_start_requested
+                and (not r1_activation_prepared or r1_startup_tracking_ready)
             ):
                 r1_arm_request_floor = ARM_REQUEST_GENERATION
                 START = False
@@ -743,57 +761,46 @@ if __name__ == '__main__':
                     reference_tele_data,
                     args.tracking_timeout,
                 ):
-                    logger_mp.warning(
-                        "R1_A7 activation rejected: Vision tracking is not fresh; press [r] again."
-                    )
+                    r1_startup_fresh_since = None
+                    r1_startup_last_timestamp = 0.0
+                    r1_startup_fresh_samples = 0
+                    r1_startup_tracking_ready = False
                     continue
-                if args.ee == "linker_o6":
-                    from teleop.robot_control.robot_hand_linker_o6 import LinkerO6Controller
-                    hand_ctrl = LinkerO6Controller()
-                    hand_ctrl.wait_until_ready(timeout=3.0)
+                if not r1_activation_prepared:
+                    if args.ee == "linker_o6":
+                        from teleop.robot_control.robot_hand_linker_o6 import LinkerO6Controller
+                        hand_ctrl = LinkerO6Controller()
+                        hand_ctrl.wait_until_ready(timeout=3.0)
+                        if STOP:
+                            continue
+                    if r1_a7_deferred_real:
+                        motion_switcher = MotionSwitcher()
+                        status, result = motion_switcher.Enter_Debug_Mode()
+                        if status != 0:
+                            raise RuntimeError(
+                                f"R1_A7 failed to enter debug mode: status={status}, result={result}"
+                            )
+                    arm_ctrl.activate()
                     if STOP:
                         continue
-                if r1_a7_deferred_real:
-                    motion_switcher = MotionSwitcher()
-                    status, result = motion_switcher.Enter_Debug_Mode()
-                    if status != 0:
-                        raise RuntimeError(
-                            f"R1_A7 failed to enter debug mode: status={status}, result={result}"
-                        )
-                arm_ctrl.activate()
-                if STOP:
-                    continue
-                post_recenter_tele_data = tv_wrapper.get_tele_data()
-                if not is_fresh_motion_data(
-                    post_recenter_tele_data,
-                    args.tracking_timeout,
-                ):
-                    raise RuntimeError(
-                        "R1_A7 Vision tracking became stale during automatic recentering."
+                    post_recenter_motor_q = arm_ctrl.get_current_motor_q()
+                    r1_waist_yaw_reference = float(post_recenter_motor_q[13])
+                    r1_waist_to_root = np.array([
+                        [math.cos(r1_waist_yaw_reference), -math.sin(r1_waist_yaw_reference), 0.0],
+                        [math.sin(r1_waist_yaw_reference), math.cos(r1_waist_yaw_reference), 0.0],
+                        [0.0, 0.0, 1.0],
+                    ])
+                    arm_ik = R1_A7_ArmIK(waist_yaw=r1_waist_yaw_reference)
+                    if STOP:
+                        continue
+                    r1_activation_prepared = True
+                    r1_startup_sample_floor = time.monotonic()
+                    r1_arm_request_floor = ARM_REQUEST_GENERATION
+                    logger_mp.info(
+                        "[R1 STARTUP] Recenter and IK ready. Holding posture; waiting for both hands, "
+                        "following will start automatically once tracking is stable. [q] exits."
                     )
-                post_recenter_timestamp = post_recenter_tele_data.motion_data_timestamp
-
-                post_recenter_motor_q = arm_ctrl.get_current_motor_q()
-                r1_waist_yaw_reference = float(post_recenter_motor_q[13])
-                r1_waist_to_root = np.array([
-                    [math.cos(r1_waist_yaw_reference), -math.sin(r1_waist_yaw_reference), 0.0],
-                    [math.sin(r1_waist_yaw_reference), math.cos(r1_waist_yaw_reference), 0.0],
-                    [0.0, 0.0, 1.0],
-                ])
-                arm_ik = R1_A7_ArmIK(waist_yaw=r1_waist_yaw_reference)
-                if STOP:
                     continue
-
-                reference_tele_data = wait_for_new_fresh_motion_data(
-                    tv_wrapper,
-                    post_recenter_timestamp,
-                    args.tracking_timeout,
-                )
-                if reference_tele_data is None:
-                    raise RuntimeError(
-                        "R1_A7 Vision tracking did not provide a fresh post-activation sample."
-                    )
-
                 activation_motor_q = arm_ctrl.get_current_motor_q()
                 if abs(float(activation_motor_q[13]) - r1_waist_yaw_reference) > 0.02:
                     raise RuntimeError(
@@ -858,8 +865,30 @@ if __name__ == '__main__':
             wrist_holds = (R1WristHold(r1_robot_left_reference), R1WristHold(r1_robot_right_reference))
             held_head_q_target = arm_ctrl.get_current_head_q().copy()
 
+        if args.ee == "linker_o6":
+            from teleop.robot_control.linker_o6_control_loop import LinkerO6ControlLoop
+
+            def save_hand_sample(states, actions):
+                with dual_hand_data_lock:
+                    dual_hand_state_array[:] = np.concatenate(states)
+                    dual_hand_action_array[:] = np.concatenate(actions)
+
+            save_hand_sample(hand_ctrl.get_state(), hand_ctrl.get_action())
+            linker_o6_loop = LinkerO6ControlLoop(
+                tv_wrapper.get_tele_data, linker_o6_retargeter, hand_ctrl,
+                args.frequency, args.tracking_timeout, lambda: STOP, save_hand_sample,
+            )
+            linker_o6_loop.start()
+
         # main loop. robot start to follow VR user's motion
         while not STOP:
+            if linker_o6_loop is not None:
+                linker_o6_loop.raise_if_failed()
+            if r1_a7_deferred_real and time.monotonic() >= tracking_diagnostic_next_time:
+                tracking_diagnostic_next_time = time.monotonic() + 2.0
+                logger_mp.info(
+                    "[XR TRACKING] " + json.dumps(tv_wrapper.tvuer.get_tracking_diagnostics())
+                )
             start_time = time.time()
             loop_monotonic = time.monotonic()
             loop_period_ms = (
@@ -901,7 +930,8 @@ if __name__ == '__main__':
                 hand_fresh = hand_tracking_freshness(tele_data, args.tracking_timeout, time.monotonic())
                 for side, hold, fresh in zip(("left", "right"), wrist_holds, hand_fresh):
                     if fresh != hold.tracking:
-                        logger_mp.info(f"[R1 HAND TRACKING] {side}: {'resumed; re-clutching at held target' if fresh else 'stale; holding target'}")
+                        arm_ik.reset_smoothing(0 if side == "left" else 1)
+                        logger_mp.info(f"[R1 HAND TRACKING] {side}: {'resumed; position follows fixed reference via IK filter' if fresh else 'stale; holding target'}")
                     if not fresh:
                         hold.hold()
                 if args.waist_follow:
@@ -917,6 +947,7 @@ if __name__ == '__main__':
                 if is_fresh_motion_data(tele_data, args.tracking_timeout):
                     last_fresh_tele_data = tele_data
                     if tracking_hold_active:
+                        arm_ik.reset_smoothing()
                         if args.waist_follow:
                             waist_follower.reset(arm_ctrl.get_current_waist_yaw(), time.monotonic())
                         logger_mp.info("R1_A7 Vision tracking resumed.")
@@ -924,6 +955,7 @@ if __name__ == '__main__':
                 else:
                     tele_data = last_fresh_tele_data
                     if not tracking_hold_active:
+                        arm_ik.reset_smoothing()
                         logger_mp.warning(
                             "R1_A7 Vision tracking is stale; holding the last tracked pose until tracking resumes."
                         )
@@ -933,22 +965,7 @@ if __name__ == '__main__':
                     arm_ctrl.hold_waist()
                     time.sleep(1.0 / args.frequency)
                     continue
-            if args.ee == "linker_o6":
-                raw_left_target, raw_right_target = linker_o6_retargeter.retarget(
-                    tele_data.left_hand_pos,
-                    tele_data.right_hand_pos,
-                )
-                left_hand_target, right_hand_target = linker_o6_calibration.apply(
-                    raw_left_target,
-                    raw_right_target,
-                )
-                if r1_independent_hands:
-                    previous_left, previous_right = hand_ctrl.get_action()
-                    if not hand_fresh[0]:
-                        left_hand_target = previous_left
-                    if not hand_fresh[1]:
-                        right_hand_target = previous_right
-            elif args.ee in ("dex3", "inspire_ftp", "inspire_dfx", "brainco")  and args.input_mode == "hand":
+            if args.ee in ("dex3", "inspire_ftp", "inspire_dfx", "brainco")  and args.input_mode == "hand":
                 with left_hand_pos_array.get_lock():
                     left_hand_pos_array[:] = tele_data.left_hand_pos.flatten()
                 with right_hand_pos_array.get_lock():
@@ -1008,11 +1025,13 @@ if __name__ == '__main__':
                     tele_data.left_wrist_pose,
                     tele_data.head_pose,
                     r1_head_yaw_reference,
+                    r1_head_pose_reference[:3, 3],
                 )
                 right_wrist_pose = wrist_in_reference_head_yaw_frame(
                     tele_data.right_wrist_pose,
                     tele_data.head_pose,
                     r1_head_yaw_reference,
+                    r1_head_pose_reference[:3, 3],
                 )
                 left_wrist_target = anchored_wrist_target(
                     left_wrist_pose,
@@ -1072,6 +1091,7 @@ if __name__ == '__main__':
             if r1_independent_hands:
                 fresh_after_ik = hand_tracking_freshness(tele_data, args.tracking_timeout, time.monotonic())
                 if any(before and not after for before, after in zip(hand_fresh, fresh_after_ik)):
+                    arm_ik.reset_smoothing()
                     for hold, fresh in zip(wrist_holds, fresh_after_ik):
                         if not fresh:
                             hold.hold()
@@ -1081,14 +1101,12 @@ if __name__ == '__main__':
                     time.sleep(1.0 / args.frequency)
                     continue
             elif args.waist_follow and not is_fresh_motion_data(tele_data, args.tracking_timeout):
+                arm_ik.reset_smoothing()
                 arm_ctrl.hold_waist()
                 tracking_hold_active = True
                 continue
-            if args.ee == "linker_o6":
-                hand_ctrl.update(left_hand_target, right_hand_target)
-                with dual_hand_data_lock:
-                    dual_hand_state_array[:] = np.concatenate(hand_ctrl.get_state())
-                    dual_hand_action_array[:] = np.concatenate(hand_ctrl.get_action())
+            if linker_o6_loop is not None:
+                linker_o6_loop.raise_if_failed()
             if STOP:
                 break
             if args.waist_follow:
@@ -1349,7 +1367,9 @@ if __name__ == '__main__':
         if isinstance(active_exception, SystemExit) and active_exception.code not in (None, 0):
             exit_code = active_exception.code if isinstance(active_exception.code, int) else 1
         try:
-            if args.ee == "linker_o6" and hand_ctrl is not None:
+            if linker_o6_loop is not None:
+                linker_o6_loop.stop()
+            elif args.ee == "linker_o6" and hand_ctrl is not None:
                 hand_ctrl.stop()
         except Exception as e:
             exit_code = 1

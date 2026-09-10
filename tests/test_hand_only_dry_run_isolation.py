@@ -90,18 +90,19 @@ class HandOnlyDryRunIsolationTest(unittest.TestCase):
         self.assertIn('args.ee == "linker_o6" and not args.dry_run', self.main_source)
         self.assertIn('args.arm != "R1_A7" or args.input_mode != "hand" or args.sim or args.motion', self.main_source)
         self.assertIn('args.dry_run and not (args.hand_only and args.ee == "linker_o6"', self.main_source)
-        self.assertIn("--linker-o6-calibration", self.main_source)
-        self.assertIn('args.linker_o6_calibration and args.ee != "linker_o6"', self.main_source)
-        self.assertIn("Real Linker O6 control requires --linker-o6-calibration.", self.main_source)
+        self.assertIn("--linker-o6-method", self.main_source)
+        self.assertNotIn("--linker-o6-calibration", self.main_source)
+        self.assertNotIn("LinkerO6Calibration", self.main_source)
         self.assertIn("--linker-o6-live-state", self.main_source)
         self.assertIn("args.linker_o6_live_state and not args.dry_run", self.main_source)
         self.assertIn("temp_path.replace(path)", self.main_source)
         self.assertIn('"published_monotonic_ns": time.monotonic_ns()', self.main_source)
-        self.assertIn('mapping_name = linker_o6_calibration.name', self.main_source)
+        self.assertIn('mapping_name = linker_o6_retargeter.mapping_name', self.main_source)
         self.assertIn('"reason": "tracking_stale"', self.main_source)
         self.assertIn('"tracking_age_s": tracking_age_s', self.main_source)
-        self.assertIn('"raw_target_12":', self.main_source)
-        self.assertIn('"visionpro_input_calibrated":', self.main_source)
+        self.assertNotIn('"raw_target_12":', self.main_source)
+        self.assertNotIn('"visionpro_input_calibrated":', self.main_source)
+        self.assertIn('"retargeting_method": linker_o6_retargeter.method', self.main_source)
         self.assertIn('parser.error("--frequency must be positive.")', self.main_source)
         self.assertIn("math.isfinite(args.frequency)", self.main_source)
         self.assertIn("math.isfinite(args.tracking_timeout)", self.main_source)
@@ -113,6 +114,8 @@ class HandOnlyDryRunIsolationTest(unittest.TestCase):
         publisher_calls = []
         image_client_calls = []
         log_messages = []
+        retargeter_initializations = []
+        retargeter_resets = []
         keyboard_ready = threading.Event()
         keyboard_callback = [None]
         original_import = builtins.__import__
@@ -205,6 +208,25 @@ class HandOnlyDryRunIsolationTest(unittest.TestCase):
         televuer_module = types.ModuleType("televuer")
         televuer_module.TeleVuerWrapper = FakeTeleVuerWrapper
 
+        class FakeDualRetargeter:
+            def __init__(self, urdf_root, method):
+                retargeter_initializations.append((urdf_root, method))
+                if str(urdf_root).startswith("/definitely/missing/"):
+                    raise FileNotFoundError(urdf_root)
+                self.method = method
+                self.mapping_name = f"linker_o6_dex_{method}_v1"
+
+            def retarget(self, left, right):
+                return np.full(6, 0.2), np.full(6, 0.3)
+
+            def reset(self):
+                retargeter_resets.append(True)
+
+        from teleop.robot_control.linker_o6_retargeting import is_tracking_fresh
+        retarget_module = types.ModuleType("teleop.robot_control.linker_o6_retargeting")
+        retarget_module.DualLinkerO6Retargeter = FakeDualRetargeter
+        retarget_module.is_tracking_fresh = is_tracking_fresh
+
         class FakePublisher:
             def __init__(self, *args, **kwargs):
                 publisher_calls.append((args, kwargs))
@@ -221,6 +243,7 @@ class HandOnlyDryRunIsolationTest(unittest.TestCase):
             "teleop.utils.ipc": ipc_module,
             "sshkeyboard": keyboard_module,
             "televuer": televuer_module,
+            "teleop.robot_control.linker_o6_retargeting": retarget_module,
             "unitree_sdk2py": types.ModuleType("unitree_sdk2py"),
             "unitree_sdk2py.core": types.ModuleType("unitree_sdk2py.core"),
             "unitree_sdk2py.core.channel": channel_module,
@@ -284,7 +307,30 @@ class HandOnlyDryRunIsolationTest(unittest.TestCase):
         for forbidden in forbidden_imports:
             self.assertFalse(any(name.startswith(forbidden) for name in import_names))
         self.assertEqual(publisher_calls, [])
+
+        for method in ("position", "dexpilot"):
+            with self.subTest(method=method):
+                FakeTeleVuerWrapper.calls = 0
+                keyboard_ready.clear()
+                method_argv = [
+                    str(MAIN_PATH), "--hand-only", "--dry-run", "--ee", "linker_o6",
+                    "--frequency", "1000", "--linker-o6-urdf-root", str(urdf_root),
+                    "--linker-o6-method", method,
+                ]
+                with mock.patch.dict(sys.modules, fake_modules), mock.patch.object(
+                    sys, "argv", method_argv
+                ), mock.patch.object(builtins, "__import__", side_effect=recording_import):
+                    with self.assertRaises(SystemExit) as method_exit:
+                        runpy.run_path(str(MAIN_PATH), run_name="__main__")
+                self.assertEqual(method_exit.exception.code, 0)
+                self.assertEqual(retargeter_initializations[-1], (str(urdf_root), method))
+                self.assertTrue(any(f'"mapping":"linker_o6_dex_{method}_v1"' in line for line in log_messages))
+        self.assertEqual(publisher_calls, [])
+        for forbidden in forbidden_imports:
+            self.assertFalse(any(name.startswith(forbidden) for name in import_names))
         self.assertEqual(image_client_calls, [])
+        self.assertEqual(retargeter_initializations, [(str(urdf_root), method) for method in ("vector", "position", "dexpilot")])
+        self.assertEqual(retargeter_resets, [True, True, True])
         self.assertTrue(any('"target_12"' in message for message in log_messages))
         self.assertEqual(
             [event.get("reason") for event in events],
@@ -294,9 +340,17 @@ class HandOnlyDryRunIsolationTest(unittest.TestCase):
         self.assertEqual(len(events[0]["left_target"]), 6)
         self.assertEqual(len(events[0]["right_target"]), 6)
         self.assertEqual(len(events[0]["target_12"]), 12)
-        self.assertEqual(len(events[0]["raw_target_12"]), 12)
-        np.testing.assert_allclose(events[0]["raw_target_12"], events[0]["target_12"])
-        self.assertFalse(events[0]["visionpro_input_calibrated"])
+        self.assertTrue(all(event["mapping"] == "linker_o6_dex_vector_v1" for event in events))
+        self.assertTrue(all(event["retargeting_method"] == "vector" for event in events))
+        self.assertNotIn("raw_target_12", events[0])
+        self.assertNotIn("visionpro_input_calibrated", events[0])
+        self.assertNotIn("calibration_file", events[0])
+        np.testing.assert_allclose(events[0]["left_target"], 0.2)
+        np.testing.assert_allclose(events[0]["right_target"], 0.3)
+        for event in (events[0], events[3], live_event):
+            self.assertEqual(event["hand_points_frame"], "televuer_unitree_hand_wrist_local_meters")
+            np.testing.assert_array_equal(event["left_hand_points"], np.zeros((25, 3)))
+            np.testing.assert_array_equal(event["right_hand_points"], np.zeros((25, 3)))
         self.assertNotIn("target_12", events[1])
         self.assertNotIn("target_12", events[2])
         self.assertEqual(len(events[3]["target_12"]), 12)
@@ -340,6 +394,43 @@ class HandOnlyDryRunIsolationTest(unittest.TestCase):
         for forbidden in forbidden_imports:
             self.assertFalse(any(name.startswith(forbidden) for name in import_names))
         self.assertEqual(publisher_calls, [])
+
+    def test_both_entrypoints_select_only_dex_retargeting_methods(self):
+        for path in (MAIN_PATH, STAGE_ROOT / "teleop" / "visionpro_r1_a7_o6_sim.py"):
+            with self.subTest(path=path.name):
+                source = path.read_text(encoding="utf-8")
+                tree = ast.parse(source)
+                option = next(
+                    node for node in ast.walk(tree) if isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute) and node.func.attr == "add_argument"
+                    and node.args and isinstance(node.args[0], ast.Constant)
+                    and node.args[0].value == "--linker-o6-method"
+                )
+                keywords = {keyword.arg: ast.literal_eval(keyword.value) for keyword in option.keywords}
+                self.assertEqual(set(keywords["choices"]), {"vector", "position", "dexpilot"})
+                self.assertEqual(keywords["default"], "vector")
+                self.assertIn("method=args.linker_o6_method", source)
+                self.assertNotIn("LinkerO6Calibration", source)
+                self.assertNotIn("--linker-o6-calibration", source)
+
+    def test_simulation_disarmed_snapshot_uses_new_mapping(self):
+        source = (STAGE_ROOT / "teleop" / "visionpro_r1_a7_o6_sim.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        function = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "disarmed_payloads")
+        namespace = {
+            "time": time, "HAND_SCHEMA": "linker_o6_target_v1",
+            "ARM_SCHEMA": "r1_a7_arm_ik_target_v1", "ARM_MAPPING": "r1_a7_visionpro_cartesian_v1",
+        }
+        exec(compile(ast.Module(body=[function], type_ignores=[]), str(MAIN_PATH), "exec"), namespace)
+        for method in ("vector", "position", "dexpilot"):
+            with self.subTest(method=method):
+                retargeter = types.SimpleNamespace(method=method, mapping_name=f"linker_o6_dex_{method}_v1")
+                hand, arm = namespace["disarmed_payloads"](1, retargeter, "stale")
+                self.assertEqual(hand["mapping"], retargeter.mapping_name)
+                self.assertEqual(hand["retargeting_method"], method)
+                self.assertFalse(hand["armed"])
+                self.assertNotIn("target_12", hand)
+                self.assertEqual(arm["mapping"], "r1_a7_visionpro_cartesian_v1")
 
 
 if __name__ == "__main__":

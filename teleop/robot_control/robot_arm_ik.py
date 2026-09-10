@@ -14,6 +14,7 @@ parent2_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__
 sys.path.append(parent2_dir)
 
 from teleop.utils.weighted_moving_filter import WeightedMovingFilter
+from teleop.utils.one_euro_filter import OneEuroFilter
 
 class G1_29_ArmIK:
     def __init__(self, Unit_Test = False, Visualization = False):
@@ -1895,7 +1896,7 @@ class R1_A7_ArmIK:
         self.opti.solver("ipopt", opts)
 
         self.init_data = np.zeros(self.reduced_robot.model.nq)
-        self.smooth_filter = WeightedMovingFilter(np.array([0.4, 0.3, 0.2, 0.1]), 14)
+        self.smooth_filters = [OneEuroFilter(), OneEuroFilter()]
         self.vis = None
 
         if self.Visualization:
@@ -1984,6 +1985,11 @@ class R1_A7_ArmIK:
             self.reduced_robot.data.oMf[self.R_hand_id].homogeneous.copy(),
         )
 
+    def reset_smoothing(self, side=None):
+        filters = self.smooth_filters if side is None else [self.smooth_filters[side]]
+        for smoothing in filters:
+            smoothing.reset()
+
     def solve_ik(
         self,
         left_wrist,
@@ -2010,8 +2016,12 @@ class R1_A7_ArmIK:
             # sol = self.opti.solve_limited()
 
             sol_q = self.opti.value(self.var_q)
-            self.smooth_filter.add_data(sol_q)
-            sol_q = self.smooth_filter.filtered_data
+            timestamp = time.monotonic()
+            for side, smoothing in enumerate(self.smooth_filters):
+                arm_slice = slice(side * 7, (side + 1) * 7)
+                sol_q[arm_slice] = smoothing.filter(
+                    sol_q[arm_slice], timestamp, self.init_data[arm_slice],
+                )
 
             if current_lr_arm_motor_dq is not None:
                 v = current_lr_arm_motor_dq * 0.0
@@ -2028,20 +2038,17 @@ class R1_A7_ArmIK:
             return sol_q, sol_tauff
 
         except Exception as e:
+            self.reset_smoothing()
             logger_mp.error(f"ERROR in convergence, plotting debug info.{e}")
             if raise_on_failure:
                 raise RuntimeError("R1_A7 IK failed to converge.") from e
 
             sol_q = self.opti.debug.value(self.var_q)
-            self.smooth_filter.add_data(sol_q)
-            sol_q = self.smooth_filter.filtered_data
 
             if current_lr_arm_motor_dq is not None:
                 v = current_lr_arm_motor_dq * 0.0
             else:
                 v = (sol_q - self.init_data) * 0.0
-
-            self.init_data = sol_q
 
             sol_tauff = pin.rnea(self.reduced_robot.model, self.reduced_robot.data, sol_q, v, np.zeros(self.reduced_robot.model.nv))
 

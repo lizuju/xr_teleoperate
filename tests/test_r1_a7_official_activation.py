@@ -44,10 +44,18 @@ class FakeLowCmd:
 
 class FakeSubscriber:
     def __init__(self, *args):
-        pass
+        self.running = False
+        self.thread = None
 
-    def Init(self):
-        pass
+    def Init(self, handler, queue_len):
+        assert queue_len == 1
+        self.running = True
+        def deliver():
+            while self.running:
+                handler(self.Read())
+                time.sleep(0.002)
+        self.thread = threading.Thread(target=deliver, daemon=True)
+        self.thread.start()
 
     def Read(self):
         return types.SimpleNamespace(
@@ -59,7 +67,9 @@ class FakeSubscriber:
         )
 
     def Close(self):
-        pass
+        self.running = False
+        if self.thread is not None:
+            self.thread.join(timeout=1.0)
 
 
 class FakePublisher:
@@ -195,11 +205,13 @@ class R1A7OfficialActivationTest(unittest.TestCase):
         )
         np.testing.assert_allclose(controller.head_q_target, [0.62832, -2.0071])
 
+        callback_subscriber = controller.lowstate_subscriber
         controller.stop()
         write_count = len(FakePublisher.instances[0].writes)
         time.sleep(0.02)
         self.assertEqual(len(FakePublisher.instances[0].writes), write_count)
-        self.assertFalse(controller.subscribe_thread.is_alive())
+        self.assertFalse(callback_subscriber.thread.is_alive())
+        self.assertIsNone(controller.lowstate_subscriber)
         self.assertFalse(controller.publish_thread.is_alive())
 
     def test_relative_head_pitch_yaw_tracks_robot_joint_axes(self):
@@ -359,6 +371,7 @@ class R1A7OfficialActivationTest(unittest.TestCase):
             dynamic_wrist,
             current_head,
             np.eye(3),
+            np.zeros(3),
         )
         np.testing.assert_allclose(fixed[:3, :3], world_wrist[:3, :3], atol=1e-12)
         np.testing.assert_allclose(
@@ -367,7 +380,7 @@ class R1A7OfficialActivationTest(unittest.TestCase):
             atol=1e-12,
         )
 
-    def test_fixed_world_wrist_is_independent_of_current_head_yaw(self):
+    def test_fixed_world_wrist_uses_activation_heading_and_position(self):
         tree = ast.parse(MAIN_PATH.read_text(encoding="utf-8"))
         functions = [
             node
@@ -386,6 +399,7 @@ class R1A7OfficialActivationTest(unittest.TestCase):
             ])
 
         reference_head_yaw = yaw(0.4)
+        reference_head_position = np.array([0.1, -0.1, 1.5])
         current_head = np.eye(4)
         current_head[:3, :3] = yaw(-0.7)
         current_head[:3, 3] = [0.3, -0.2, 1.6]
@@ -405,10 +419,11 @@ class R1A7OfficialActivationTest(unittest.TestCase):
             dynamic_wrist,
             current_head,
             reference_head_yaw,
+            reference_head_position,
         )
         expected_rotation = reference_head_yaw.T @ world_wrist[:3, :3]
         expected_position = (
-            reference_head_yaw.T @ (world_wrist[:3, 3] - current_head[:3, 3])
+            reference_head_yaw.T @ (world_wrist[:3, 3] - reference_head_position)
             + waist_origin_offset
         )
         np.testing.assert_allclose(fixed[:3, :3], expected_rotation, atol=1e-12)
@@ -483,15 +498,17 @@ class R1A7OfficialActivationTest(unittest.TestCase):
         post_recenter_index = activation.index("post_recenter_motor_q =")
         waist_index = activation.index("r1_waist_yaw_reference =")
         ik_index = activation.index("arm_ik = R1_A7_ArmIK")
-        fresh_index = activation.index("reference_tele_data = wait_for_new_fresh_motion_data")
+        prepared_index = activation.index("r1_activation_prepared = True")
+        sample_floor_index = activation.index("r1_startup_sample_floor = time.monotonic()")
         robot_reference_index = activation.index("r1_robot_left_reference,")
         vision_reference_index = activation.index("r1_vision_left_reference =")
         self.assertLess(debug_index, activate_index)
         self.assertLess(activate_index, post_recenter_index)
         self.assertLess(post_recenter_index, waist_index)
         self.assertLess(waist_index, ik_index)
-        self.assertLess(ik_index, fresh_index)
-        self.assertLess(fresh_index, robot_reference_index)
+        self.assertLess(ik_index, prepared_index)
+        self.assertLess(prepared_index, sample_floor_index)
+        self.assertLess(sample_floor_index, robot_reference_index)
         self.assertLess(robot_reference_index, vision_reference_index)
         self.assertIn(
             "R1_A7_ArmIK(waist_yaw=r1_waist_yaw_reference)",
@@ -514,24 +531,21 @@ class R1A7OfficialActivationTest(unittest.TestCase):
             activation.index("START = True"),
         )
 
-    def test_o6_command_is_not_published_before_arm_ik_and_command(self):
+    def test_o6_worker_starts_after_activation_but_does_not_wait_for_each_ik(self):
         source = MAIN_PATH.read_text(encoding="utf-8")
         tracking = source[source.index("# main loop. robot start to follow VR user's motion") :]
         solve = tracking.index("arm_ik.solve_ik(")
-        hand_update = tracking.index("hand_ctrl.update(left_hand_target, right_hand_target)")
+        worker_check = tracking.index("linker_o6_loop.raise_if_failed()", solve)
         arm_update = tracking.index("arm_ctrl.ctrl_dual_arm_and_head(sol_q, sol_tauff, head_q_target)")
-        self.assertLess(
-            solve,
-            hand_update,
-        )
-        self.assertLess(
-            hand_update,
-            arm_update,
-        )
-        self.assertIn("if STOP:", tracking[solve:hand_update])
-        self.assertIn("if STOP:", tracking[hand_update:arm_update])
+        self.assertLess(source.index("hand_ctrl.activate()"), source.index("linker_o6_loop.start()"))
+        self.assertLess(source.index("r1_head_yaw_reference = head_yaw_rotation"), source.index("linker_o6_loop.start()"))
+        self.assertLess(solve, worker_check)
+        self.assertLess(worker_check, arm_update)
+        self.assertIn("if STOP:", tracking[solve:worker_check])
+        self.assertIn("if STOP:", tracking[worker_check:arm_update])
+        self.assertNotIn("hand_ctrl.update(", tracking)
         stale = tracking[tracking.index("if r1_a7_anchored:") :]
-        stale_guard = stale[:stale.index('if args.ee == "linker_o6":')]
+        stale_guard = stale[:stale.index('# get current robot state data.')]
         self.assertIn("tele_data = last_fresh_tele_data", stale_guard)
         self.assertNotIn("hand_ctrl.stop()", stale_guard)
         self.assertNotIn("raise RuntimeError", stale_guard)
@@ -541,62 +555,36 @@ class R1A7OfficialActivationTest(unittest.TestCase):
         cleanup = source[source.index("finally:", source.index("if __name__ == '__main__':")) :]
         hand_stop = cleanup.index("hand_ctrl.stop()")
         arm_stop = cleanup.index("arm_ctrl.stop()")
+        self.assertLess(cleanup.index("linker_o6_loop.stop()"), hand_stop)
         self.assertLess(hand_stop, arm_stop)
         self.assertIn("except Exception as e:", cleanup[hand_stop:arm_stop])
 
-    def test_post_activation_wait_retries_cached_snapshot_until_new_fresh_sample(self):
+    def test_startup_wait_preserves_tracking_timeout_and_requires_stable_new_samples(self):
+        source = MAIN_PATH.read_text(encoding="utf-8")
+        self.assertNotIn("def wait_for_new_fresh_motion_data", source)
+        self.assertNotIn("Vision tracking became stale during automatic recentering", source)
+        self.assertIn("not is_fresh_motion_data(startup_tele_data, args.tracking_timeout, now=startup_now)", source)
+        self.assertIn("startup_timestamp <= r1_startup_sample_floor", source)
+        self.assertIn("startup_timestamp > r1_startup_last_timestamp", source)
+        self.assertIn("startup_now - r1_startup_fresh_since >= 0.35", source)
+        self.assertIn("r1_startup_fresh_samples >= 5", source)
+        self.assertIn("and (not r1_activation_prepared or r1_startup_tracking_ready)", source)
+
+    def test_motion_freshness_still_rejects_missing_and_expired_samples(self):
         tree = ast.parse(MAIN_PATH.read_text(encoding="utf-8"))
-        functions = [
-            node
-            for node in tree.body
-            if isinstance(node, ast.FunctionDef)
-            and node.name in {"is_fresh_motion_data", "wait_for_new_fresh_motion_data"}
-        ]
-        namespace = {"time": time}
-        exec(compile(ast.Module(body=functions, type_ignores=[]), str(MAIN_PATH), "exec"), namespace)
-
-        floor = time.monotonic() - 0.01
-        cached = types.SimpleNamespace(motion_data_ready=True, motion_data_timestamp=floor)
-        fresh = types.SimpleNamespace(motion_data_ready=True, motion_data_timestamp=time.monotonic())
-
-        class FakeWrapper:
-            def __init__(self):
-                self.samples = iter((cached, cached, fresh))
-
-            def get_tele_data(self):
-                return next(self.samples)
-
-        result = namespace["wait_for_new_fresh_motion_data"](
-            FakeWrapper(),
-            floor,
-            0.05,
-        )
-        self.assertIs(result, fresh)
-
-    def test_post_activation_wait_rejects_duplicate_sample(self):
-        tree = ast.parse(MAIN_PATH.read_text(encoding="utf-8"))
-        functions = [
-            node
-            for node in tree.body
-            if isinstance(node, ast.FunctionDef)
-            and node.name in {"is_fresh_motion_data", "wait_for_new_fresh_motion_data"}
-        ]
-        namespace = {"time": time}
-        exec(compile(ast.Module(body=functions, type_ignores=[]), str(MAIN_PATH), "exec"), namespace)
-
-        floor = time.monotonic()
-        duplicate = types.SimpleNamespace(motion_data_ready=True, motion_data_timestamp=floor)
-
-        class FakeWrapper:
-            def get_tele_data(self):
-                return duplicate
-
-        result = namespace["wait_for_new_fresh_motion_data"](
-            FakeWrapper(),
-            floor,
-            0.01,
-        )
-        self.assertIsNone(result)
+        function = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                        and node.name == "is_fresh_motion_data")
+        namespace = {}
+        exec(compile(ast.Module(body=[function], type_ignores=[]), str(MAIN_PATH), "exec"), namespace)
+        fresh = namespace["is_fresh_motion_data"]
+        for ready, timestamp, expected in (
+            (False, 10.0, False), (True, 0.0, False), (True, 9.74, False),
+            (True, 9.75, True), (True, 9.9, True), (True, 10.1, False),
+        ):
+            with self.subTest(ready=ready, timestamp=timestamp):
+                self.assertEqual(fresh(types.SimpleNamespace(
+                    motion_data_ready=ready, motion_data_timestamp=timestamp,
+                ), 0.25, now=10.0), expected)
 
 
 if __name__ == "__main__":

@@ -57,7 +57,7 @@ class R1A7WorkspaceTest(unittest.TestCase):
         self.assertNotIn("constrain_dual_offset", source)
         self.assertNotIn("workspace_limited", source)
         self.assertNotIn("raw_position_offset_m", source)
-        self.assertIn('sequence, calibration.name, "tracking_jump"', source)
+        self.assertIn('sequence, retargeter, "tracking_jump"', source)
         self.assertIn("tracking jump; disarmed, press r again", source)
         self.assertNotIn("ChannelFactoryInitialize", source)
         self.assertNotIn("MotionSwitcher", source)

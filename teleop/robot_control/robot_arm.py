@@ -2083,15 +2083,10 @@ class R1_A7_ArmController:
         self.subscribe_running = True
         self.active = False
         self.lowstate_sequence = 0
-        self.lowstate_subscriber = ChannelSubscriber(kTopicLowState, hg_LowState)
-        self.lowstate_subscriber.Init()
         self.lowstate_buffer = DataBuffer()
         self.lowstate_sub_ready = False
-
-        # initialize subscribe thread
-        self.subscribe_thread = threading.Thread(target=self._subscribe_motor_state)
-        self.subscribe_thread.daemon = True
-        self.subscribe_thread.start()
+        self.lowstate_subscriber = ChannelSubscriber(kTopicLowState, hg_LowState)
+        self.lowstate_subscriber.Init(self._subscribe_motor_state, 1)
 
         wait_for_dds(lambda: self.lowstate_sub_ready, "R1_A7_ArmController")
 
@@ -2182,22 +2177,20 @@ class R1_A7_ArmController:
 
         logger_mp.info("Initialize R1_A7_ArmController OK!")
 
-    def _subscribe_motor_state(self):
-        while self.subscribe_running:
-            msg = self.lowstate_subscriber.Read()
-            if msg is not None:
-                self.lowstate_sequence += 1
-                lowstate = R1_A7_LowState(
-                    mode_machine=msg.mode_machine,
-                    sequence=self.lowstate_sequence,
-                    monotonic_timestamp=time.monotonic(),
-                )
-                for id in range(R1_A7_Num_Motors):
-                    lowstate.motor_state[id].q  = msg.motor_state[id].q
-                    lowstate.motor_state[id].dq = msg.motor_state[id].dq
-                self.lowstate_buffer.SetData(lowstate)
-                self.lowstate_sub_ready = True
-            time.sleep(0.002)
+    def _subscribe_motor_state(self, msg):
+        if not self.subscribe_running:
+            return
+        self.lowstate_sequence += 1
+        lowstate = R1_A7_LowState(
+            mode_machine=msg.mode_machine,
+            sequence=self.lowstate_sequence,
+            monotonic_timestamp=time.monotonic(),
+        )
+        for id in range(R1_A7_Num_Motors):
+            lowstate.motor_state[id].q = msg.motor_state[id].q
+            lowstate.motor_state[id].dq = msg.motor_state[id].dq
+        self.lowstate_buffer.SetData(lowstate)
+        self.lowstate_sub_ready = True
 
     def clip_arm_q_target(self, target_q, velocity_limit):
         current_q = self.get_current_dual_arm_q()
@@ -2383,22 +2376,27 @@ class R1_A7_ArmController:
     def stop(self):
         with self.lifecycle_lock:
             self.publish_running = False
-            if self.publish_thread is not None:
-                self.publish_thread.join(timeout=1.0)
-                if self.publish_thread.is_alive():
-                    raise RuntimeError("R1_A7 lowcmd publisher thread did not stop.")
-            self.active = False
             self.subscribe_running = False
-            if self.subscribe_thread.is_alive():
-                self.subscribe_thread.join(timeout=1.0)
-                if self.subscribe_thread.is_alive():
-                    raise RuntimeError("R1_A7 lowstate subscriber thread did not stop.")
-            if self.lowcmd_publisher is not None:
-                self.lowcmd_publisher.Close()
-                self.lowcmd_publisher = None
-            if self.lowstate_subscriber is not None:
-                self.lowstate_subscriber.Close()
-                self.lowstate_subscriber = None
+            self.active = False
+            errors = []
+            if self.publish_thread is not None:
+                try:
+                    self.publish_thread.join(timeout=1.0)
+                    if self.publish_thread.is_alive():
+                        errors.append("R1_A7 lowcmd publisher thread did not stop.")
+                except Exception as error:
+                    errors.append(f"R1_A7 lowcmd publisher shutdown failed: {error}")
+            for name in ("lowcmd_publisher", "lowstate_subscriber"):
+                endpoint = getattr(self, name)
+                if endpoint is not None:
+                    try:
+                        endpoint.Close()
+                    except Exception as error:
+                        errors.append(f"R1_A7 {name} close failed: {error}")
+                    else:
+                        setattr(self, name, None)
+            if errors:
+                raise RuntimeError("; ".join(errors))
 
     def ctrl_dual_arm_go_home(self):
         '''Move both the left and right arms of the robot to their home position by setting the target joint angles (q) and torques (tau) to zero.'''

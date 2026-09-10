@@ -19,10 +19,8 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from teleop.robot_control.linker_o6_retargeting import (
     DualLinkerO6Retargeter,
-    LinkerO6Calibration,
     is_tracking_fresh,
 )
-from televuer import TeleVuerWrapper
 
 
 HAND_SCHEMA = "linker_o6_target_v1"
@@ -41,7 +39,7 @@ def parse_args():
     parser.add_argument("--hand-live-state", default="/run/user/1000/unitree-o6-live/target.json")
     parser.add_argument("--arm-live-state", default="/run/user/1000/unitree-r1-arm-live/target.json")
     parser.add_argument("--linker-o6-urdf-root", required=True)
-    parser.add_argument("--linker-o6-calibration", required=True)
+    parser.add_argument("--linker-o6-method", choices=("vector", "position", "dexpilot"), default="vector")
     parser.add_argument("--frequency", type=float, default=30.0)
     parser.add_argument("--tracking-timeout", type=float, default=0.25)
     return parser.parse_args()
@@ -93,7 +91,7 @@ def radial_deadband(offset):
     return result
 
 
-def disarmed_payloads(sequence, mapping, reason):
+def disarmed_payloads(sequence, retargeter, reason):
     timestamp_ns = time.monotonic_ns()
     common = {
         "armed": False,
@@ -103,13 +101,15 @@ def disarmed_payloads(sequence, mapping, reason):
         "published_monotonic_ns": timestamp_ns,
     }
     return (
-        {"schema": HAND_SCHEMA, "mapping": mapping, **common},
+        {"schema": HAND_SCHEMA, "mapping": retargeter.mapping_name, "retargeting_method": retargeter.method, **common},
         {"schema": ARM_SCHEMA, "mapping": ARM_MAPPING, **common},
     )
 
 
 def main():
     args = parse_args()
+    from televuer import TeleVuerWrapper
+
     if not math.isfinite(args.frequency) or args.frequency <= 0.0:
         raise ValueError("--frequency must be positive and finite")
     if not math.isfinite(args.tracking_timeout) or args.tracking_timeout <= 0.0:
@@ -124,8 +124,7 @@ def main():
         hand_lock.close()
         raise
 
-    calibration = LinkerO6Calibration(args.linker_o6_calibration)
-    retargeter = DualLinkerO6Retargeter(args.linker_o6_urdf_root)
+    retargeter = DualLinkerO6Retargeter(args.linker_o6_urdf_root, method=args.linker_o6_method)
     wrapper = TeleVuerWrapper(
         use_hand_tracking=True,
         binocular=False,
@@ -151,6 +150,7 @@ def main():
     print("[VISIONPRO SIM] pass-through server ready on https://HOST:8012", flush=True)
     print("[VISIONPRO SIM] put both wrists at the neutral pose, then press r; q stops", flush=True)
     print("[VISIONPRO SIM] simulation snapshots only; DDS/network robot control/serial are not used", flush=True)
+    print(f"[VISIONPRO SIM] hand method={retargeter.method} mapping={retargeter.mapping_name}", flush=True)
 
     try:
         while running:
@@ -159,6 +159,7 @@ def main():
                     running = False
                     break
                 if key == "r":
+                    retargeter.reset()
                     rearm_requested = True
                     baseline = None
                     previous_wrist_position = None
@@ -183,12 +184,13 @@ def main():
             sequence += 1
 
             if not fresh:
+                retargeter.reset()
                 baseline = None
                 previous_wrist_position = None
                 previous_motion_timestamp = None
                 fresh_frames = 0
                 rearm_requested = False
-                hand_payload, arm_payload = disarmed_payloads(sequence, calibration.name, "stale")
+                hand_payload, arm_payload = disarmed_payloads(sequence, retargeter, "stale")
             else:
                 fresh_frames += 1
                 wrist_position = np.concatenate(
@@ -217,11 +219,12 @@ def main():
                 previous_motion_timestamp = tele_data.motion_data_timestamp
 
                 if tracking_jump:
+                    retargeter.reset()
                     baseline = None
                     fresh_frames = 0
                     rearm_requested = False
                     hand_payload, arm_payload = disarmed_payloads(
-                        sequence, calibration.name, "tracking_jump"
+                        sequence, retargeter, "tracking_jump"
                     )
                     print("[VISIONPRO SIM] tracking jump; disarmed, press r again", flush=True)
                 else:
@@ -233,13 +236,12 @@ def main():
                 if tracking_jump or baseline is None:
                     if not tracking_jump:
                         hand_payload, arm_payload = disarmed_payloads(
-                            sequence, calibration.name, "disarmed"
+                            sequence, retargeter, "disarmed"
                         )
                 else:
-                    raw_left, raw_right = retargeter.retarget(
+                    left_target, right_target = retargeter.retarget(
                         tele_data.left_hand_pos, tele_data.right_hand_pos
                     )
-                    left_target, right_target = calibration.apply(raw_left, raw_right)
                     arm_offset = radial_deadband((wrist_position - baseline).tolist())
                     timestamp_ns = time.monotonic_ns()
                     common = {
@@ -250,10 +252,8 @@ def main():
                     }
                     hand_payload = {
                         "schema": HAND_SCHEMA,
-                        "mapping": calibration.name,
-                        "visionpro_input_calibrated": True,
-                        "thumb_yaw_calibrated": False,
-                        "thumb_yaw_hardware_direction_validated": False,
+                        "mapping": retargeter.mapping_name,
+                        "retargeting_method": retargeter.method,
                         "target_units": "normalized_0_1",
                         "hardware_axis_order": HAND_AXIS_ORDER,
                         "target_hand_order": HAND_ORDER,
@@ -283,7 +283,7 @@ def main():
                 next_status = now + 2.0
     finally:
         sequence += 1
-        hand_payload, arm_payload = disarmed_payloads(sequence, calibration.name, "disarmed")
+        hand_payload, arm_payload = disarmed_payloads(sequence, retargeter, "disarmed")
         atomic_write_json(hand_path, hand_payload)
         atomic_write_json(arm_path, arm_payload)
         if old_terminal is not None:
