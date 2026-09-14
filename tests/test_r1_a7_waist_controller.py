@@ -33,6 +33,12 @@ class R1A7WaistControllerTest(unittest.TestCase):
         controller.waist_tracking_error_limit = np.deg2rad(5.0)
         controller.waist_target_timeout = 0.25
         controller.waist_hold_requested = False
+        controller.feedback_timeout = 0.25
+        controller.target_timeout = 0.5
+        controller.target_updated_at = None
+        controller.publish_error = None
+        controller.published_sequence = 0
+        controller.published_command = None
         controller.control_dt = 0.004
         controller.simulation_mode = True
         controller.msg = FakeLowCmd()
@@ -41,6 +47,7 @@ class R1A7WaistControllerTest(unittest.TestCase):
         self.lowstate = types.SimpleNamespace(
             motor_state=[types.SimpleNamespace(q=0.0, dq=0.0) for _ in range(35)],
             monotonic_timestamp=self.now,
+            sequence=1,
         )
         controller.lowstate_buffer = types.SimpleNamespace(GetData=lambda: self.lowstate)
         self.commands = []
@@ -151,8 +158,11 @@ class R1A7WaistControllerTest(unittest.TestCase):
         self.now += 0.25
         self.assertAlmostEqual(self.tick(), 0.1)
         self.assertIsNone(self.controller.waist_yaw_target)
-        self.now += 1.0
-        self.assertAlmostEqual(self.tick(), 0.1)
+        for _ in range(5):
+            self.now += 0.2
+            self.lowstate.monotonic_timestamp = self.now
+            self.controller.hold_targets()
+            self.assertAlmostEqual(self.tick(), 0.1)
         self.lowstate.monotonic_timestamp = self.now
         self.submit(-0.3)
         self.assertAlmostEqual(self.tick(), 0.0986)
@@ -174,13 +184,18 @@ class R1A7WaistControllerTest(unittest.TestCase):
         self.assertAlmostEqual(self.tick(), 0.07)
         self.assertIsNone(self.controller.waist_yaw_target)
 
-    def test_stale_feedback_holds_last_command_and_clears_target(self):
+    def test_stale_feedback_stops_all_motor_output(self):
         self.controller.msg.motor_cmd[13].q = 0.07
         self.now += 0.251
         self.submit(0.3)
         with self.assertRaises(RuntimeError):
             self.controller.get_current_waist_yaw()
-        self.assertAlmostEqual(self.tick(), 0.07)
+        self.controller.publish_running = True
+        self.controller._ctrl_motor_state()
+        self.assertEqual(self.commands, [])
+        self.assertFalse(self.controller.publish_running)
+        with self.assertRaisesRegex(RuntimeError, "feedback is stale"):
+            self.controller.raise_if_failed()
         self.assertIsNone(self.controller.waist_yaw_target)
 
     def test_out_of_model_feedback_cannot_push_command_outside_mechanical_limit(self):

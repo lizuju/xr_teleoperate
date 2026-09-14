@@ -181,6 +181,50 @@ class LinkerO6ControllerTest(unittest.TestCase):
         controller.stop()
         self.assertEqual([publisher.writes for publisher in FakePublisher.instances], [[], []])
 
+    def test_paused_loop_preserves_held_targets_without_bypassing_gate_or_feedback(self):
+        from teleop.robot_control.linker_o6_control_loop import LinkerO6ControlLoop
+
+        self.queue_pair([0.1] * 6, [0.2] * 6)
+        controller = self.module.LinkerO6Controller()
+        controller.wait_until_ready(timeout=0.1)
+        self.activate_after_release(
+            controller, [0.1] * 6, [0.2] * 6, [0.12] * 6, [0.22] * 6,
+        )
+        held = controller.get_action()
+        sample = types.SimpleNamespace(
+            motion_data_ready=True, left_hand_timestamp=time.monotonic(),
+            right_hand_timestamp=time.monotonic(), left_hand_pos=np.zeros((25, 3)),
+            right_hand_pos=np.zeros((25, 3)),
+        )
+        loop = LinkerO6ControlLoop(
+            lambda: sample,
+            types.SimpleNamespace(
+                left=mock.Mock(retarget=mock.Mock(return_value=held[0])),
+                right=mock.Mock(retarget=mock.Mock(return_value=held[1])),
+            ),
+            controller, 30.0, 0.25, lambda: False, mock.Mock(),
+        )
+        try:
+            loop._step()
+            loop.should_pause = lambda: True
+            loop.get_tele_data = mock.Mock(side_effect=AssertionError("paused XR read"))
+            for _ in range(3):
+                loop._step()
+            for actual, expected in zip(controller.get_action(), held):
+                np.testing.assert_array_equal(actual, expected)
+            self.assertEqual([publisher.writes[-1].cmds[0].mode for publisher in FakePublisher.instances], [1, 1])
+            self.queue_pair([0.12] * 6, [0.22] * 6, modes=(0, 2))
+            loop._step()
+            self.assertEqual([publisher.writes[-1].cmds[0].mode for publisher in FakePublisher.instances], [0, 1])
+            with controller.state_lock:
+                controller.left_state_time = time.monotonic() - 1.0
+                controller.right_state_time = time.monotonic() - 1.0
+            with self.assertRaises(TimeoutError):
+                loop._step()
+            self.assertEqual([publisher.writes[-1].cmds[0].mode for publisher in FakePublisher.instances], [0, 0])
+        finally:
+            controller.stop()
+
     def test_activate_release_update_and_idempotent_stop(self):
         self.queue_pair([0.1] * 6, [0.2] * 6)
         controller = self.module.LinkerO6Controller()
@@ -418,13 +462,28 @@ class LinkerO6ControllerTest(unittest.TestCase):
                 controller.update([target] * 6, [target] * 6)
                 if step > 30:
                     filtered.append(controller.get_action()[0][0])
-            self.assertLess(np.std(filtered), 0.01)
+            # The 30 ms response intentionally trades a small amount of stationary
+            # noise for lower fast-motion lag; keep the noise bound explicit.
+            self.assertLess(np.std(filtered), 0.011)
             for step in range(121, 151):
                 clock.return_value = started + step / 30
                 self.queue_pair([0.5] * 6, [0.5] * 6, modes=(2, 2))
                 controller.update([1.0] * 6, [0.0] * 6)
             np.testing.assert_allclose(controller.get_action(), [[1.0] * 6, [0.0] * 6], atol=1e-9)
             controller.stop()
+
+    def test_30ms_smoothing_advances_a_fast_step_on_the_first_frame(self):
+        self.queue_pair([0.0] * 6, [0.0] * 6)
+        controller = self.module.LinkerO6Controller()
+        controller.wait_until_ready(timeout=0.1)
+        self.activate_after_release(controller, [0.0] * 6, [0.0] * 6, [0.0] * 6, [0.0] * 6)
+        started = controller.action_time
+        with mock.patch.object(self.module.time, "monotonic", return_value=started + 1 / 30):
+            self.queue_pair([0.0] * 6, [0.0] * 6)
+            controller.update([1.0] * 6, [1.0] * 6)
+        self.assertGreater(controller.get_action()[0][0], 0.6)
+        self.assertLess(controller.get_action()[0][0], 1.0)
+        controller.stop()
 
     def test_recovery_smoothing_starts_from_measured_state_not_old_action(self):
         self.queue_pair([0.1] * 6, [0.2] * 6)

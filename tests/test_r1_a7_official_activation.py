@@ -152,7 +152,7 @@ class R1A7OfficialActivationTest(unittest.TestCase):
         self.assertFalse(controller.active)
 
         original_recenter = controller.ctrl_head_and_waist_go_home
-        controller.ctrl_head_and_waist_go_home = lambda: original_recenter(duration=0.0)
+        controller.ctrl_head_and_waist_go_home = lambda **kwargs: original_recenter(duration=0.0, **kwargs)
         controller.activate()
         deadline = time.monotonic() + 1.0
         while not FakePublisher.instances[0].writes and time.monotonic() < deadline:
@@ -494,7 +494,7 @@ class R1A7OfficialActivationTest(unittest.TestCase):
         source = MAIN_PATH.read_text(encoding="utf-8")
         activation = source[source.index("r1_arm_request_floor = ARM_REQUEST_GENERATION") :]
         debug_index = activation.index("motion_switcher.Enter_Debug_Mode()")
-        activate_index = activation.index("arm_ctrl.activate()")
+        activate_index = activation.index("arm_ctrl.activate(cancel_requested=lambda: STOP)")
         post_recenter_index = activation.index("post_recenter_motor_q =")
         waist_index = activation.index("r1_waist_yaw_reference =")
         ik_index = activation.index("arm_ik = R1_A7_ArmIK")
@@ -510,10 +510,7 @@ class R1A7OfficialActivationTest(unittest.TestCase):
         self.assertLess(prepared_index, sample_floor_index)
         self.assertLess(sample_floor_index, robot_reference_index)
         self.assertLess(robot_reference_index, vision_reference_index)
-        self.assertIn(
-            "R1_A7_ArmIK(waist_yaw=r1_waist_yaw_reference)",
-            activation,
-        )
+        self.assertIn("arm_ik = R1_A7_ArmIK(waist_yaw=r1_waist_yaw_reference)", activation)
 
     def test_o6_waits_before_arm_activation_and_enables_after_reference_capture(self):
         source = MAIN_PATH.read_text(encoding="utf-8")

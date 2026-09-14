@@ -5,7 +5,7 @@ from pathlib import Path
 import sys
 from types import ModuleType, SimpleNamespace
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import ANY, Mock, patch
 
 import numpy as np
 
@@ -27,7 +27,8 @@ def invokes(node, name):
 
 
 class R1StartupTrackingWaitTest(unittest.TestCase):
-    def run_startup(self, events, *, stale_during_ik=False, early_r_during_ik=False, feedback_error=False):
+    def run_startup(self, events, *, stale_during_ik=False, early_r_during_ik=False, feedback_error=False,
+                    cancel_during_activation=False):
         tree = ast.parse(MAIN_PATH.read_text(encoding="utf-8"))
         main = next(node for node in tree.body if isinstance(node, ast.If)
                     and ast.unparse(node.test) == "__name__ == '__main__'")
@@ -108,7 +109,11 @@ class R1StartupTrackingWaitTest(unittest.TestCase):
             elif event.get("key") == "q":
                 ns["STOP"], ns["START"] = True, False
 
-        def activate():
+        def activate(cancel_requested):
+            if cancel_during_activation:
+                ns["STOP"] = True
+                self.assertTrue(cancel_requested())
+                raise InterruptedError("startup cancelled")
             clock[0] += 3.0
             sample[0] = make_sample(0.0, 0.0)
 
@@ -148,7 +153,7 @@ class R1StartupTrackingWaitTest(unittest.TestCase):
 
     def test_q_at_stability_threshold_does_not_enable_following(self):
         result = self.run_startup([{"key": "r"}] + [{}] * 4 + [{"key": "q"}])
-        result.arm.activate.assert_called_once_with()
+        result.arm.activate.assert_called_once_with(cancel_requested=ANY)
         result.hand.activate.assert_not_called()
         self.assertFalse(result.ns["START"])
         self.assertIsNone(result.ns["r1_vision_left_reference"])
@@ -158,7 +163,7 @@ class R1StartupTrackingWaitTest(unittest.TestCase):
             [{"key": "r"}] + [{"sample": "missing"}] * 12 + [{"key": "q", "sample": "missing"}],
             stale_during_ik=True,
         )
-        result.arm.activate.assert_called_once_with()
+        result.arm.activate.assert_called_once_with(cancel_requested=ANY)
         result.ik_factory.assert_called_once_with(waist_yaw=0.17)
         result.hand.wait_until_ready.assert_called_once_with(timeout=3.0)
         result.hand.activate.assert_not_called()
@@ -177,7 +182,7 @@ class R1StartupTrackingWaitTest(unittest.TestCase):
         result = self.run_startup([{"key": "r", "sample": "missing"}] + [{"sample": "missing"}] * 4 + [{}] * 8)
         self.assertTrue(result.ns["START"])
         self.assertEqual(result.ns["ARM_REQUEST_GENERATION"], 1)
-        result.arm.activate.assert_called_once_with()
+        result.arm.activate.assert_called_once_with(cancel_requested=ANY)
         result.hand.activate.assert_called_once_with()
 
     def test_early_r_during_ik_and_recovery_is_consumed(self):
@@ -188,12 +193,12 @@ class R1StartupTrackingWaitTest(unittest.TestCase):
         )
         self.assertFalse(any(tick["r1_startup_tracking_ready"] for tick in result.ticks))
         result.hand.activate.assert_not_called()
-        result.arm.activate.assert_called_once_with()
+        result.arm.activate.assert_called_once_with(cancel_requested=ANY)
 
     def test_auto_start_captures_latest_pose_without_reinitializing(self):
         result = self.run_startup([{"key": "r"}] + [{}] * 4 + [{"marker": 0.42}])
         self.assertTrue(result.ns["START"])
-        result.arm.activate.assert_called_once_with()
+        result.arm.activate.assert_called_once_with(cancel_requested=ANY)
         result.hand.activate.assert_called_once_with()
         result.switcher.Enter_Debug_Mode.assert_called_once_with()
         np.testing.assert_array_equal(result.ns["r1_vision_left_reference"], result.sample.left_wrist_pose)
@@ -222,7 +227,7 @@ class R1StartupTrackingWaitTest(unittest.TestCase):
         self.assertTrue(result.ns["START"])
         self.assertGreaterEqual(len(result.ticks), 10)
         result.hand.activate.assert_called_once_with()
-        result.arm.activate.assert_called_once_with()
+        result.arm.activate.assert_called_once_with(cancel_requested=ANY)
 
     def test_old_tracking_is_not_accepted_as_recovered(self):
         result = self.run_startup([{"key": "r"}] + [{"sample": "old", "key": "r"}] * 8)
@@ -237,6 +242,13 @@ class R1StartupTrackingWaitTest(unittest.TestCase):
     def test_stale_robot_feedback_remains_fatal_while_waiting_for_hands(self):
         with self.assertRaisesRegex(RuntimeError, "robot feedback stale"):
             self.run_startup([{"key": "r"}, {"sample": "missing"}], feedback_error=True)
+
+    def test_q_during_recenter_skips_ik_and_hand_activation(self):
+        result = self.run_startup([{"key": "r"}], cancel_during_activation=True)
+        self.assertTrue(result.ns["STOP"])
+        self.assertFalse(result.ns["START"])
+        result.ik_factory.assert_not_called()
+        result.hand.activate.assert_not_called()
 
 
 if __name__ == "__main__":

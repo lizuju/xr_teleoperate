@@ -35,9 +35,11 @@ STOP           = False  # Enable to begin system exit procedure
 READY          = False  # Ready to (1) enter START state, (2) enter RECORD_RUNNING state
 RECORD_RUNNING = False  # True if [Recording]
 RECORD_TOGGLE  = False  # Toggle recording state
+RECORD_OUTCOME = 'unspecified'
 DRY_RUN_MODE = False
 ARM_REQUEST_GENERATION = 0
 R1_A7_DEFERRED_REAL_MODE = False
+R1_PAUSE = None
 #  -------        ---------                -----------                -----------            ---------
 #   state          [Ready]      ==>        [Recording]     ==>         [AutoSave]     -->     [Ready]
 #  -------        ---------      |         -----------      |         -----------      |     ---------
@@ -51,8 +53,12 @@ R1_A7_DEFERRED_REAL_MODE = False
 #  --> auto  : Auto-transition after saving data.
 
 def on_press(key):
-    global STOP, START, RECORD_TOGGLE, ARM_REQUEST_GENERATION
+    global STOP, START, RECORD_TOGGLE, RECORD_OUTCOME, ARM_REQUEST_GENERATION
     if key == 'r':
+        if R1_PAUSE is not None and R1_PAUSE.paused:
+            R1_PAUSE.request_resume()
+            logger_mp.info("[R1 PAUSE] Resume requested; keep both hands stable to realign and continue.")
+            return
         if R1_A7_DEFERRED_REAL_MODE and not READY:
             logger_mp.warning("[on_press] System is not ready; ignoring r.")
             return
@@ -62,6 +68,12 @@ def on_press(key):
     elif key == 'q':
         START = False
         STOP = True
+    elif key == 'p' and R1_PAUSE is not None:
+        R1_PAUSE.pause()
+        logger_mp.info("[R1 PAUSE] Paused; arm, head and hand targets held. [r] requests realigned resume; [q] exits.")
+    elif key in ('y', 'n', 'x') and RECORD_RUNNING:
+        RECORD_OUTCOME = {'y': 'success', 'n': 'failure', 'x': 'discarded'}[key]
+        RECORD_TOGGLE = True
     elif key == 's' and (START == True or (DRY_RUN_MODE and READY)):
         RECORD_TOGGLE = True
     else:
@@ -137,21 +149,24 @@ def anchored_wrist_target(
     target[:3, 3] += translation_scale * waist_to_root @ (
         current_pose[:3, 3] - vision_reference[:3, 3]
     )
-    relative_rotation = (
-        current_pose[:3, :3]
-        @ vision_reference[:3, :3].T
-    )
+    relative_rotation = current_pose[:3, :3] @ vision_reference[:3, :3].T
     target[:3, :3] = (
-        waist_to_root
-        @ relative_rotation
-        @ waist_to_root.T
-        @ robot_reference[:3, :3]
+        waist_to_root @ relative_rotation @ waist_to_root.T @ robot_reference[:3, :3]
     )
     return target
 
 def rotation_error_rad(actual_rotation, target_rotation):
     cosine = (np.trace(actual_rotation.T @ target_rotation) - 1.0) / 2.0
     return float(np.arccos(np.clip(cosine, -1.0, 1.0)))
+
+def hold_r1_published_targets(arm_ctrl):
+    published = arm_ctrl.get_recording_snapshot()["published"]
+    arm_ctrl.ctrl_dual_arm_and_head(
+        np.array(published["arm_q"]),
+        np.array(published["arm_tau"]),
+        np.array(published["head_q"]),
+    )
+    arm_ctrl.hold_waist()
 
 def write_json_line(file, payload, flush=False):
     file.write(json.dumps(payload, separators=(",", ":")) + "\n")
@@ -182,7 +197,7 @@ def acquire_live_writer_lock(live_state_path: Path):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     # basic control parameters
-    parser.add_argument('--frequency', type = float, default = 30.0, help = 'control and record \'s frequency')
+    parser.add_argument('--frequency', type = float, default = 40.0, help = 'control and record \'s frequency')
     parser.add_argument('--input-mode', type=str, choices=['hand', 'controller'], default='hand', help='Select XR device input tracking source')
     parser.add_argument('--display-mode', type=str, choices=['immersive', 'ego', 'pass-through'], default='immersive', help='Select XR device display mode')
     parser.add_argument('--arm', type=str, choices=['G1_29', 'G1_23', 'H1_2', 'H1', 'H2', 'R1_A5', 'R1_A7'], default='G1_29', help='Select arm controller')
@@ -201,9 +216,12 @@ if __name__ == '__main__':
     parser.add_argument('--linker-o6-urdf-root', type=str, default='/home/hnh/unitree_r1_dev/linkerhand-urdf/O6', help='Official Linker O6 URDF root')
     parser.add_argument('--linker-o6-method', choices=['vector', 'position', 'dexpilot'], default='vector', help='dex-retargeting optimizer for Linker O6')
     parser.add_argument('--linker-o6-live-state', type=str, default=None, help='Atomic JSON target snapshot for isolated Linker O6 simulation')
-    parser.add_argument('--arm-translation-scale', type=float, default=1.0, help='R1_A7 Cartesian translation scale relative to Vision Pro motion')
+    parser.add_argument('--arm-translation-scale', type=float, default=1.1, help='R1_A7 Cartesian translation scale relative to Vision Pro motion')
     parser.add_argument('--arm-diagnostic-dir', type=str, default=None, help='Directory for R1_A7 alignment JSONL diagnostics')
     parser.add_argument('--waist-follow', action='store_true', help='R1_A7: sustained head turns drive waist yaw with feedback-based head and arm compensation')
+    parser.add_argument('--waist-follow-threshold-deg', type=float, default=12.0, help='Head yaw needed to engage waist following (degrees)')
+    parser.add_argument('--waist-follow-dwell', type=float, default=0.2, help='Seconds the head yaw threshold must be held before waist following engages')
+    parser.add_argument('--startup-wrist-align', action='store_true', help='R1_A7: align wrist orientation to the initial Vision Pro pose before following')
     # record mode and task info
     parser.add_argument('--record', action = 'store_true', help = 'Enable data recording mode')
     parser.add_argument('--task-dir', type = str, default = './utils/data/', help = 'path to save data')
@@ -234,6 +252,10 @@ if __name__ == '__main__':
         parser.error("--frequency must be positive.")
     if not (math.isfinite(args.arm_translation_scale) and args.arm_translation_scale > 0.0):
         parser.error("--arm-translation-scale must be positive.")
+    if not (math.isfinite(args.waist_follow_threshold_deg) and args.waist_follow_threshold_deg > 0.0):
+        parser.error("--waist-follow-threshold-deg must be positive.")
+    if not (math.isfinite(args.waist_follow_dwell) and args.waist_follow_dwell > 0.0):
+        parser.error("--waist-follow-dwell must be positive.")
     if args.waist_follow and (args.arm != "R1_A7" or args.hand_only or args.dry_run or args.motion):
         parser.error("--waist-follow requires R1_A7 full arm control without --motion.")
 
@@ -276,6 +298,8 @@ if __name__ == '__main__':
     img_client = None
     tv_wrapper = None
     recorder = None
+    r1_capture = None
+    failure_reason = None
     sim_state_subscriber = None
     ipc_server = None
     listen_keyboard_thread = None
@@ -663,11 +687,20 @@ if __name__ == '__main__':
         # record + headless / non-headless mode
         if args.record:
             from teleop.utils.episode_writer import EpisodeWriter
+            metadata = None
+            image_height, image_width = camera_config['head_camera']['image_shape']
+            if camera_config['head_camera']['binocular']:
+                image_width //= 2
+            if r1_a7_deferred_real and args.ee == "linker_o6":
+                from teleop.utils.r1_capture import R1Capture, capture_metadata
+                metadata = capture_metadata(args, camera_config, linker_o6_retargeter)
             recorder = EpisodeWriter(task_dir = os.path.join(args.task_dir, args.task_name),
                                      task_goal = args.task_goal,
                                      task_desc = args.task_desc,
                                      task_steps = args.task_steps,
                                      frequency = args.frequency, 
+                                     image_size = (image_width, image_height),
+                                     metadata = metadata,
                                      rerun_log = not args.headless)
 
         logger_mp.info("----------------------------------------------------------------")
@@ -677,6 +710,7 @@ if __name__ == '__main__':
             logger_mp.info("🟢  Press [r] to start syncing the robot with your movements.")
         if args.record:
             logger_mp.info("🟡  Press [s] to START or SAVE recording (toggle cycle).")
+            logger_mp.info("[RECORD] While recording: [y] save success; [n] save failure; [x] discard. [s] leaves outcome unspecified.")
         else:
             logger_mp.info("🔵  Recording is DISABLED (run with --record to enable).")
         logger_mp.info("🔴  Press [q] to stop and exit the program.")
@@ -703,6 +737,8 @@ if __name__ == '__main__':
             time.sleep(0.033)
             if STOP:
                 break
+            if r1_a7_anchored:
+                arm_ctrl.raise_if_failed()
             if r1_a7_deferred_real and time.monotonic() >= tracking_diagnostic_next_time:
                 tracking_diagnostic_next_time = time.monotonic() + 2.0
                 logger_mp.info(
@@ -780,17 +816,114 @@ if __name__ == '__main__':
                             raise RuntimeError(
                                 f"R1_A7 failed to enter debug mode: status={status}, result={result}"
                             )
-                    arm_ctrl.activate()
+                    try:
+                        arm_ctrl.defer_publishing()
+                        arm_ctrl.activate(cancel_requested=lambda: STOP)
+                    except InterruptedError:
+                        if STOP:
+                            continue
+                        raise
                     if STOP:
                         continue
                     post_recenter_motor_q = arm_ctrl.get_current_motor_q()
                     r1_waist_yaw_reference = float(post_recenter_motor_q[13])
+                    arm_ik = R1_A7_ArmIK(waist_yaw=r1_waist_yaw_reference)
+                    arm_ctrl.start_publishing()
                     r1_waist_to_root = np.array([
                         [math.cos(r1_waist_yaw_reference), -math.sin(r1_waist_yaw_reference), 0.0],
                         [math.sin(r1_waist_yaw_reference), math.cos(r1_waist_yaw_reference), 0.0],
                         [0.0, 0.0, 1.0],
                     ])
-                    arm_ik = R1_A7_ArmIK(waist_yaw=r1_waist_yaw_reference)
+                    initial_head_yaw_reference = head_yaw_rotation(reference_tele_data.head_pose)
+                    initial_head_pose_reference = reference_tele_data.head_pose.copy()
+                    vision_left_initial = reference_tele_data.left_wrist_pose.copy()
+                    vision_right_initial = reference_tele_data.right_wrist_pose.copy()
+                    if getattr(args, "startup_wrist_align", False):
+                        current_q = arm_ctrl.get_current_dual_arm_q()
+                        current_dq = arm_ctrl.get_current_dual_arm_dq()
+                        robot_left_pose, robot_right_pose = arm_ik.forward_wrist_poses(current_q)
+                        left_initial_pose = wrist_in_reference_head_yaw_frame(
+                            vision_left_initial,
+                            initial_head_pose_reference,
+                            initial_head_yaw_reference,
+                            initial_head_pose_reference[:3, 3],
+                        )
+                        right_initial_pose = wrist_in_reference_head_yaw_frame(
+                            vision_right_initial,
+                            initial_head_pose_reference,
+                            initial_head_yaw_reference,
+                            initial_head_pose_reference[:3, 3],
+                        )
+                        left_align_target = robot_left_pose.copy()
+                        right_align_target = robot_right_pose.copy()
+                        left_align_target[:3, :3] = left_initial_pose[:3, :3]
+                        right_align_target[:3, :3] = right_initial_pose[:3, :3]
+                        arm_ik.reset_smoothing(reference_q=current_q)
+                        align_q, align_tau = arm_ik.solve_ik(
+                            left_align_target,
+                            right_align_target,
+                            current_q,
+                            current_dq,
+                            raise_on_failure=True,
+                        )
+                        arm_ctrl.ctrl_dual_arm(align_q, align_tau)
+                        align_deadline = time.monotonic() + 8.0
+                        align_next_ik = time.monotonic() + 0.1
+                        while time.monotonic() < align_deadline and not STOP:
+                            now = time.monotonic()
+                            if now >= align_next_ik:
+                                current_align_q = arm_ctrl.get_current_dual_arm_q()
+                                current_align_dq = arm_ctrl.get_current_dual_arm_dq()
+                                align_q, align_tau = arm_ik.solve_ik(
+                                    left_align_target,
+                                    right_align_target,
+                                    current_align_q,
+                                    current_align_dq,
+                                    raise_on_failure=True,
+                                )
+                                align_next_ik = now + 0.1
+                            arm_ctrl.ctrl_dual_arm(align_q, align_tau)
+                            current_align_q = arm_ctrl.get_current_dual_arm_q()
+                            current_left_pose, current_right_pose = arm_ik.forward_wrist_poses(current_align_q)
+                            left_position_error = np.linalg.norm(
+                                current_left_pose[:3, 3] - left_align_target[:3, 3]
+                            )
+                            right_position_error = np.linalg.norm(
+                                current_right_pose[:3, 3] - right_align_target[:3, 3]
+                            )
+                            left_rotation_error = rotation_error_rad(
+                                current_left_pose[:3, :3], left_align_target[:3, :3]
+                            )
+                            right_rotation_error = rotation_error_rad(
+                                current_right_pose[:3, :3], right_align_target[:3, :3]
+                            )
+                            if (
+                                max(left_position_error, right_position_error) <= 0.02
+                                and max(left_rotation_error, right_rotation_error) <= 0.12
+                            ):
+                                break
+                            time.sleep(0.02)
+                        if STOP:
+                            continue
+                        aligned_q = arm_ctrl.get_current_dual_arm_q()
+                        aligned_left_pose, aligned_right_pose = arm_ik.forward_wrist_poses(aligned_q)
+                        aligned_position_error = max(
+                            np.linalg.norm(aligned_left_pose[:3, 3] - left_align_target[:3, 3]),
+                            np.linalg.norm(aligned_right_pose[:3, 3] - right_align_target[:3, 3]),
+                        )
+                        aligned_rotation_error = max(
+                            rotation_error_rad(aligned_left_pose[:3, :3], left_align_target[:3, :3]),
+                            rotation_error_rad(aligned_right_pose[:3, :3], right_align_target[:3, :3]),
+                        )
+                        if aligned_position_error > 0.02 or aligned_rotation_error > 0.12:
+                            logger_mp.warning(
+                                "[R1 STARTUP] Absolute wrist alignment was not reachable; "
+                                f"position_error_m={aligned_position_error:.3f} "
+                                f"rotation_error_rad={aligned_rotation_error:.3f}; "
+                                "continuing from the current robot posture."
+                            )
+                        else:
+                            logger_mp.info("[R1 STARTUP] Wrist orientation aligned to initial Vision Pro pose.")
                     if STOP:
                         continue
                     r1_activation_prepared = True
@@ -817,10 +950,15 @@ if __name__ == '__main__':
                 r1_head_pose_reference = reference_tele_data.head_pose.copy()
                 if args.waist_follow:
                     waist_follower = R1HeadWaistFollower(
-                        r1_waist_yaw_reference, time.monotonic(), args.tracking_timeout,
+                        r1_waist_yaw_reference,
+                        time.monotonic(),
+                        args.tracking_timeout,
+                        math.radians(getattr(args, "waist_follow_threshold_deg", 12.0)),
+                        getattr(args, "waist_follow_dwell", 0.2),
                     )
                     logger_mp.info(
-                        "R1_A7 head/waist following enabled: 20 deg for 0.4 s to engage, "
+                        f"R1_A7 head/waist following enabled: {args.waist_follow_threshold_deg:g} deg for "
+                        f"{args.waist_follow_dwell:g} s to engage, "
                         "0.35 rad/s waist speed, URDF waist range +/-2.618 rad."
                     )
                 if STOP:
@@ -861,6 +999,12 @@ if __name__ == '__main__':
         right_wrist_img = None
         last_fresh_tele_data = reference_tele_data if r1_a7_anchored else None
         tracking_hold_active = False
+        r1_head_q_offset = np.zeros(2)
+        r1_frozen_generation = -1
+        if r1_independent_hands and args.ee in (None, "linker_o6"):
+            from teleop.robot_control.r1_pause import R1PauseState
+            R1_PAUSE = R1PauseState()
+            logger_mp.info("[R1 CONTROL] [p] pauses and holds; [r] realigns and resumes after stable hands; [q] exits.")
         if r1_independent_hands:
             wrist_holds = (R1WristHold(r1_robot_left_reference), R1WristHold(r1_robot_right_reference))
             held_head_q_target = arm_ctrl.get_current_head_q().copy()
@@ -877,11 +1021,18 @@ if __name__ == '__main__':
             linker_o6_loop = LinkerO6ControlLoop(
                 tv_wrapper.get_tele_data, linker_o6_retargeter, hand_ctrl,
                 args.frequency, args.tracking_timeout, lambda: STOP, save_hand_sample,
+                should_pause=lambda: R1_PAUSE is not None and R1_PAUSE.paused,
             )
             linker_o6_loop.start()
 
+        if args.record and r1_a7_deferred_real and args.ee == "linker_o6":
+            r1_capture = R1Capture(arm_ctrl, hand_ctrl, linker_o6_loop,
+                                   args.tracking_timeout, camera_config['head_camera']['image_shape'])
+
         # main loop. robot start to follow VR user's motion
         while not STOP:
+            if r1_a7_anchored:
+                arm_ctrl.raise_if_failed()
             if linker_o6_loop is not None:
                 linker_o6_loop.raise_if_failed()
             if r1_a7_deferred_real and time.monotonic() >= tracking_diagnostic_next_time:
@@ -911,26 +1062,86 @@ if __name__ == '__main__':
                     right_wrist_img = img_client.get_right_wrist_frame()
 
             # record mode
+            if args.record:
+                recorder.raise_if_failed()
             if args.record and RECORD_TOGGLE:
                 RECORD_TOGGLE = False
                 if not RECORD_RUNNING:
                     if recorder.create_episode():
                         RECORD_RUNNING = True
+                        RECORD_OUTCOME = 'unspecified'
+                        if r1_capture is not None:
+                            r1_capture.reset_episode()
                     else:
                         logger_mp.error("Failed to create episode. Recording not started.")
                 else:
                     RECORD_RUNNING = False
-                    recorder.save_episode()
+                    recorder.save_episode(outcome=RECORD_OUTCOME)
+                    RECORD_OUTCOME = 'unspecified'
                     if args.sim:
                         publish_reset_category(1, reset_pose_publisher)
 
             # get xr's tele data
             tele_data = tv_wrapper.get_tele_data()
+            capture_mode = "following"
+            run_motion = True
+            if R1_PAUSE is not None and R1_PAUSE.paused:
+                capture_mode = "paused"
+                run_motion = False
+                pause_generation = R1_PAUSE.generation
+                if r1_frozen_generation != pause_generation:
+                    hold_r1_published_targets(arm_ctrl)
+                    r1_frozen_generation = pause_generation
+                arm_ctrl.hold_targets()
+                resume_generation = R1_PAUSE.poll_resume(
+                    tele_data, args.tracking_timeout, time.monotonic(),
+                )
+                if resume_generation is not None:
+                    held = arm_ctrl.get_recording_snapshot()["requested"]
+                    held_q = np.array(held["arm_q"])
+                    r1_robot_left_reference, r1_robot_right_reference = arm_ik.forward_wrist_poses(held_q)
+                    actual_waist_yaw = arm_ctrl.get_current_waist_yaw()
+                    if args.waist_follow:
+                        r1_robot_left_reference, r1_robot_right_reference = (
+                            compensate_wrist_for_waist(pose, r1_waist_yaw_reference, actual_waist_yaw)
+                            for pose in (r1_robot_left_reference, r1_robot_right_reference)
+                        )
+                        waist_follower = R1HeadWaistFollower(
+                            actual_waist_yaw,
+                            time.monotonic(),
+                            args.tracking_timeout,
+                            math.radians(getattr(args, "waist_follow_threshold_deg", 12.0)),
+                            getattr(args, "waist_follow_dwell", 0.2),
+                        )
+                    r1_waist_to_root = np.array([
+                        [math.cos(actual_waist_yaw), -math.sin(actual_waist_yaw), 0.0],
+                        [math.sin(actual_waist_yaw), math.cos(actual_waist_yaw), 0.0],
+                        [0.0, 0.0, 1.0],
+                    ])
+                    r1_vision_left_reference = tele_data.left_wrist_pose.copy()
+                    r1_vision_right_reference = tele_data.right_wrist_pose.copy()
+                    r1_head_pose_reference = tele_data.head_pose.copy()
+                    r1_head_yaw_reference = head_yaw_rotation(tele_data.head_pose)
+                    r1_head_q_offset = np.array(held["head_q"])
+                    held_head_q_target = r1_head_q_offset.copy()
+                    wrist_holds = (R1WristHold(r1_robot_left_reference), R1WristHold(r1_robot_right_reference))
+                    arm_ik.reset_smoothing(reference_q=held_q)
+                    last_fresh_tele_data = tele_data
+                    tracking_hold_active = False
+                    if (
+                        R1_PAUSE.poll_resume(tele_data, args.tracking_timeout, time.monotonic()) == resume_generation
+                        and R1_PAUSE.complete_resume(resume_generation)
+                    ):
+                        logger_mp.info("[R1 PAUSE] References realigned at held targets; following resumes next frame.")
             if r1_independent_hands:
-                hand_fresh = hand_tracking_freshness(tele_data, args.tracking_timeout, time.monotonic())
+                raw_hand_fresh = hand_tracking_freshness(tele_data, args.tracking_timeout, time.monotonic())
+                hand_fresh = []
+                for index, (side, hold, fresh) in enumerate(zip(("left", "right"), wrist_holds, raw_hand_fresh)):
+                    hold.resume_streak = hold.resume_streak + 1 if fresh else 0
+                    hand_fresh.append(fresh and (hold.tracking or hold.resume_streak >= 2))
+                hand_fresh = tuple(hand_fresh)
                 for side, hold, fresh in zip(("left", "right"), wrist_holds, hand_fresh):
-                    if fresh != hold.tracking:
-                        arm_ik.reset_smoothing(0 if side == "left" else 1)
+                    if fresh != hold.tracking and capture_mode != "paused":
                         logger_mp.info(f"[R1 HAND TRACKING] {side}: {'resumed; position follows fixed reference via IK filter' if fresh else 'stale; holding target'}")
                     if not fresh:
                         hold.hold()
@@ -940,9 +1151,10 @@ if __name__ == '__main__':
                     elif tracking_hold_active:
                         waist_follower.reset(arm_ctrl.get_current_waist_yaw(), time.monotonic())
                 tracking_hold_active = not all(hand_fresh)
+                if tracking_hold_active and capture_mode != "paused":
+                    capture_mode = "tracking_hold"
                 if not any(hand_fresh):
-                    time.sleep(1.0 / args.frequency)
-                    continue
+                    run_motion = False
             elif r1_a7_anchored:
                 if is_fresh_motion_data(tele_data, args.tracking_timeout):
                     last_fresh_tele_data = tele_data
@@ -963,8 +1175,8 @@ if __name__ == '__main__':
                 if args.waist_follow and tracking_hold_active:
                     # Do not refresh the waist watchdog with a cached XR sample.
                     arm_ctrl.hold_waist()
-                    time.sleep(1.0 / args.frequency)
-                    continue
+                    capture_mode = "tracking_hold"
+                    run_motion = False
             if args.ee in ("dex3", "inspire_ftp", "inspire_dfx", "brainco")  and args.input_mode == "hand":
                 with left_hand_pos_array.get_lock():
                     left_hand_pos_array[:] = tele_data.left_hand_pos.flatten()
@@ -1014,81 +1226,87 @@ if __name__ == '__main__':
 
             # solve ik using motor data and wrist pose, then use ik results to control arms.
             time_ik_start = time.time()
-            left_wrist_target = tele_data.left_wrist_pose
-            right_wrist_target = tele_data.right_wrist_pose
-            if r1_a7_anchored:
-                head_q_target = relative_head_pitch_yaw(
-                    tele_data.head_pose,
-                    r1_head_pose_reference,
-                )
-                left_wrist_pose = wrist_in_reference_head_yaw_frame(
-                    tele_data.left_wrist_pose,
-                    tele_data.head_pose,
-                    r1_head_yaw_reference,
-                    r1_head_pose_reference[:3, 3],
-                )
-                right_wrist_pose = wrist_in_reference_head_yaw_frame(
-                    tele_data.right_wrist_pose,
-                    tele_data.head_pose,
-                    r1_head_yaw_reference,
-                    r1_head_pose_reference[:3, 3],
-                )
-                left_wrist_target = anchored_wrist_target(
-                    left_wrist_pose,
-                    r1_vision_left_reference,
-                    r1_robot_left_reference,
-                    r1_waist_to_root,
-                    args.arm_translation_scale,
-                )
-                right_wrist_target = anchored_wrist_target(
-                    right_wrist_pose,
-                    r1_vision_right_reference,
-                    r1_robot_right_reference,
-                    r1_waist_to_root,
-                    args.arm_translation_scale,
-                )
-            if r1_independent_hands:
-                left_wrist_target = wrist_holds[0].prepare(left_wrist_target, hand_fresh[0])
-                right_wrist_target = wrist_holds[1].prepare(right_wrist_target, hand_fresh[1])
-                if not all(hand_fresh):
-                    head_q_target = held_head_q_target.copy()
-            left_ik_target = left_wrist_target
-            right_ik_target = right_wrist_target
-            waist_yaw_actual = None
+            waist_yaw_actual = arm_ctrl.get_current_waist_yaw() if args.waist_follow else None
             waist_yaw_target = None
-            if args.waist_follow:
-                waist_yaw_actual = arm_ctrl.get_current_waist_yaw()
-                if not r1_independent_hands or all(hand_fresh):
-                    head_q_target, waist_yaw_target = waist_follower.update(
-                        tele_data.head_pose, r1_head_pose_reference,
-                        waist_yaw_actual, time.monotonic(),
+            if r1_independent_hands:
+                left_wrist_target, right_wrist_target = (hold.target.copy() for hold in wrist_holds)
+            if run_motion:
+                left_wrist_target = tele_data.left_wrist_pose
+                right_wrist_target = tele_data.right_wrist_pose
+                if r1_a7_anchored:
+                    head_q_target = r1_head_q_offset + relative_head_pitch_yaw(
+                        tele_data.head_pose,
+                        r1_head_pose_reference,
                     )
-                left_ik_target = compensate_wrist_for_waist(
-                    left_wrist_target, waist_yaw_actual, r1_waist_yaw_reference,
-                )
-                right_ik_target = compensate_wrist_for_waist(
-                    right_wrist_target, waist_yaw_actual, r1_waist_yaw_reference,
-                )
-            if r1_a7_anchored:
-                sol_q, sol_tauff = arm_ik.solve_ik(
-                    left_ik_target,
-                    right_ik_target,
-                    current_lr_arm_q,
-                    current_lr_arm_dq,
-                    raise_on_failure=True,
-                )
-            else:
-                sol_q, sol_tauff = arm_ik.solve_ik(
-                    left_wrist_target,
-                    right_wrist_target,
-                    current_lr_arm_q,
-                    current_lr_arm_dq,
-                )
+                    left_wrist_pose = wrist_in_reference_head_yaw_frame(
+                        tele_data.left_wrist_pose,
+                        tele_data.head_pose,
+                        r1_head_yaw_reference,
+                        r1_head_pose_reference[:3, 3],
+                    )
+                    right_wrist_pose = wrist_in_reference_head_yaw_frame(
+                        tele_data.right_wrist_pose,
+                        tele_data.head_pose,
+                        r1_head_yaw_reference,
+                        r1_head_pose_reference[:3, 3],
+                    )
+                    left_wrist_target = anchored_wrist_target(
+                        left_wrist_pose,
+                        r1_vision_left_reference,
+                        r1_robot_left_reference,
+                        r1_waist_to_root,
+                        args.arm_translation_scale,
+                    )
+                    right_wrist_target = anchored_wrist_target(
+                        right_wrist_pose,
+                        r1_vision_right_reference,
+                        r1_robot_right_reference,
+                        r1_waist_to_root,
+                        args.arm_translation_scale,
+                    )
+                if r1_independent_hands:
+                    left_wrist_target = wrist_holds[0].prepare(left_wrist_target, hand_fresh[0])
+                    right_wrist_target = wrist_holds[1].prepare(right_wrist_target, hand_fresh[1])
+                    if not all(hand_fresh):
+                        head_q_target = held_head_q_target.copy()
+                left_ik_target = left_wrist_target
+                right_ik_target = right_wrist_target
+                waist_yaw_actual = None
+                waist_yaw_target = None
+                if args.waist_follow:
+                    waist_yaw_actual = arm_ctrl.get_current_waist_yaw()
+                    if not r1_independent_hands or all(hand_fresh):
+                        head_q_target, waist_yaw_target = waist_follower.update(
+                            tele_data.head_pose, r1_head_pose_reference,
+                            waist_yaw_actual, time.monotonic(),
+                        )
+                        head_q_target = head_q_target + r1_head_q_offset
+                    left_ik_target = compensate_wrist_for_waist(
+                        left_wrist_target, waist_yaw_actual, r1_waist_yaw_reference,
+                    )
+                    right_ik_target = compensate_wrist_for_waist(
+                        right_wrist_target, waist_yaw_actual, r1_waist_yaw_reference,
+                    )
+                if r1_a7_anchored:
+                    sol_q, sol_tauff = arm_ik.solve_ik(
+                        left_ik_target,
+                        right_ik_target,
+                        current_lr_arm_q,
+                        current_lr_arm_dq,
+                        raise_on_failure=True,
+                    )
+                else:
+                    sol_q, sol_tauff = arm_ik.solve_ik(
+                        left_wrist_target,
+                        right_wrist_target,
+                        current_lr_arm_q,
+                        current_lr_arm_dq,
+                    )
             time_ik_end = time.time()
             logger_mp.debug(f"ik:\t{round(time_ik_end - time_ik_start, 6)}")
             if STOP:
                 break
-            if r1_independent_hands:
+            if r1_independent_hands and run_motion:
                 fresh_after_ik = hand_tracking_freshness(tele_data, args.tracking_timeout, time.monotonic())
                 if any(before and not after for before, after in zip(hand_fresh, fresh_after_ik)):
                     arm_ik.reset_smoothing()
@@ -1098,29 +1316,49 @@ if __name__ == '__main__':
                     if args.waist_follow:
                         arm_ctrl.hold_waist()
                     tracking_hold_active = True
-                    time.sleep(1.0 / args.frequency)
-                    continue
-            elif args.waist_follow and not is_fresh_motion_data(tele_data, args.tracking_timeout):
+                    capture_mode = "tracking_hold"
+                    run_motion = False
+            elif run_motion and args.waist_follow and not is_fresh_motion_data(tele_data, args.tracking_timeout):
                 arm_ik.reset_smoothing()
                 arm_ctrl.hold_waist()
                 tracking_hold_active = True
-                continue
+                capture_mode = "tracking_hold"
+                run_motion = False
             if linker_o6_loop is not None:
                 linker_o6_loop.raise_if_failed()
             if STOP:
                 break
-            if args.waist_follow:
-                arm_ctrl.ctrl_dual_arm_and_head(
-                    sol_q, sol_tauff, head_q_target, waist_yaw_target=waist_yaw_target,
-                )
-            elif r1_a7_anchored:
-                arm_ctrl.ctrl_dual_arm_and_head(sol_q, sol_tauff, head_q_target)
+            if R1_PAUSE is not None and R1_PAUSE.paused:
+                capture_mode = "paused"
+                run_motion = False
+                pause_generation = R1_PAUSE.generation
+                if r1_frozen_generation != pause_generation:
+                    hold_r1_published_targets(arm_ctrl)
+                    r1_frozen_generation = pause_generation
+            if run_motion:
+                if args.waist_follow:
+                    arm_ctrl.ctrl_dual_arm_and_head(
+                        sol_q, sol_tauff, head_q_target, waist_yaw_target=waist_yaw_target,
+                    )
+                elif r1_a7_anchored:
+                    arm_ctrl.ctrl_dual_arm_and_head(sol_q, sol_tauff, head_q_target)
+                else:
+                    arm_ctrl.ctrl_dual_arm(sol_q, sol_tauff)
+                if r1_independent_hands:
+                    wrist_holds[0].commit(left_wrist_target)
+                    wrist_holds[1].commit(right_wrist_target)
+                    held_head_q_target = head_q_target.copy()
             else:
-                arm_ctrl.ctrl_dual_arm(sol_q, sol_tauff)
-            if r1_independent_hands:
-                wrist_holds[0].commit(left_wrist_target)
-                wrist_holds[1].commit(right_wrist_target)
-                held_head_q_target = head_q_target.copy()
+                arm_ctrl.hold_targets()
+                held = arm_ctrl.get_recording_snapshot()["requested"]
+                sol_q = np.array(held["arm_q"])
+                sol_tauff = np.array(held["arm_tau"])
+                head_q_target = np.array(held["head_q"])
+                if r1_independent_hands:
+                    left_wrist_target, right_wrist_target = (hold.target.copy() for hold in wrist_holds)
+                else:
+                    left_wrist_target = r1_robot_left_reference.copy()
+                    right_wrist_target = r1_robot_right_reference.copy()
             diagnostic_now = time.monotonic()
             if args.waist_follow and diagnostic_now >= waist_diagnostic_next_time:
                 waist_diagnostic_next_time = diagnostic_now + 1.0
@@ -1137,12 +1375,24 @@ if __name__ == '__main__':
             ):
                 actual_left_pose, actual_right_pose = arm_ik.forward_wrist_poses(current_lr_arm_q)
                 solved_left_pose, solved_right_pose = arm_ik.forward_wrist_poses(sol_q)
+                if not run_motion:
+                    left_ik_target, right_ik_target = solved_left_pose.copy(), solved_right_pose.copy()
+                    left_wrist_pose = wrist_in_reference_head_yaw_frame(
+                        tele_data.left_wrist_pose, tele_data.head_pose,
+                        r1_head_yaw_reference, r1_head_pose_reference[:3, 3],
+                    )
+                    right_wrist_pose = wrist_in_reference_head_yaw_frame(
+                        tele_data.right_wrist_pose, tele_data.head_pose,
+                        r1_head_yaw_reference, r1_head_pose_reference[:3, 3],
+                    )
                 if args.waist_follow:
                     # Fixed-waist IK FK must be returned to the actual robot root frame.
                     actual_left_pose, actual_right_pose, solved_left_pose, solved_right_pose = (
                         compensate_wrist_for_waist(pose, r1_waist_yaw_reference, waist_yaw_actual)
                         for pose in (actual_left_pose, actual_right_pose, solved_left_pose, solved_right_pose)
                     )
+                if not run_motion:
+                    left_wrist_target, right_wrist_target = solved_left_pose.copy(), solved_right_pose.copy()
                 arm_diagnostic_sequence += 1
                 arm_diagnostic_next_time = diagnostic_now + 0.1
                 write_json_line(arm_diagnostic_file, {
@@ -1193,8 +1443,10 @@ if __name__ == '__main__':
                 })
 
             # record data
-            if args.record:
-                READY = recorder.is_ready() # now ready to (2) enter RECORD_RUNNING state
+            if args.record and r1_capture is not None:
+                if RECORD_RUNNING:
+                    recorder.add_item(**r1_capture.frame(tele_data, head_img, capture_mode))
+            elif args.record:
                 # dex hand or gripper
                 if args.ee == "dex3" and args.input_mode == "hand":
                     with dual_hand_data_lock:
@@ -1358,8 +1610,9 @@ if __name__ == '__main__':
 
     except KeyboardInterrupt:
         logger_mp.info("⛔ KeyboardInterrupt, exiting program...")
-    except Exception:
+    except Exception as error:
         exit_code = 1
+        failure_reason = str(error)
         import traceback
         logger_mp.error(traceback.format_exc())
     finally:
@@ -1434,6 +1687,10 @@ if __name__ == '__main__':
                 if dry_run_record_file is not None:
                     dry_run_record_file.close()
                 elif recorder is not None:
+                    if exit_code:
+                        recorder.abort(failure_reason or "Teleoperation cleanup failed")
+                    else:
+                        recorder.save_episode(outcome=RECORD_OUTCOME)
                     recorder.close()
         except Exception as e:
             exit_code = 1

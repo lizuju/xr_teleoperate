@@ -37,6 +37,10 @@ class FakeController:
     def get_state(self):
         return np.zeros(6), np.zeros(6)
 
+    def get_recording_snapshot(self):
+        return {"requested": [action.tolist() for action in self.actions],
+                "sequence": len(self.updates), "monotonic_ns": time.monotonic_ns()}
+
     def update(self, left, right, tracking_fresh):
         if self.stopped:
             raise AssertionError("publish after stop")
@@ -86,6 +90,131 @@ class LinkerO6ControlLoopTest(unittest.TestCase):
         self.assertEqual(self.retargeter.left.calls, 1)
         self.assertEqual(self.retargeter.left.resets, 1)
         self.assertEqual(self.retargeter.right.calls, 2)
+
+    def test_pause_keeps_heartbeat_and_targets_without_consuming_new_xr(self):
+        snapshot = sample()
+        self.loop.get_tele_data = lambda: snapshot
+        self.loop._step()
+        inputs = self.loop.get_target_inputs()
+        actions = self.controller.get_action()
+        self.loop.should_pause = lambda: True
+        self.loop.get_tele_data = mock.Mock(side_effect=AssertionError("read XR while paused"))
+        for _ in range(4):
+            self.loop._step()
+        self.assertEqual(len(self.controller.updates), 5)
+        self.assertEqual(self.retargeter.left.calls, 1)
+        self.assertEqual(self.retargeter.right.calls, 1)
+        self.assertEqual(self.loop.get_target_inputs(), inputs)
+        self.assertEqual(inputs["left"]["received_monotonic_ns"], int(snapshot.left_hand_timestamp * 1e9))
+        self.assertEqual(inputs["left"]["points"], snapshot.left_hand_pos.tolist())
+        for actual, held in zip(self.controller.get_action(), actions):
+            np.testing.assert_array_equal(actual, held)
+        self.assertFalse(self.controller.stopped)
+
+    def test_pause_during_retarget_discards_unpublished_target_and_input(self):
+        self.loop._step()
+        held_inputs = self.loop.get_target_inputs()
+        actions = self.controller.get_action()
+        self.loop.get_tele_data = lambda: sample(value=0.8)
+        original = self.retargeter.left.retarget
+
+        def pause(points):
+            self.loop.should_pause = lambda: True
+            return original(points)
+
+        self.retargeter.left.retarget = pause
+        self.loop._step()
+        for actual, held in zip(self.controller.get_action(), actions):
+            np.testing.assert_array_equal(actual, held)
+        self.assertEqual(self.loop.get_target_inputs(), held_inputs)
+
+    def test_pause_does_not_reenable_a_hand_previously_released_for_tracking_loss(self):
+        self.loop.get_tele_data = lambda: sample(fresh=(False, True))
+        self.loop._step()
+        self.loop.should_pause = lambda: True
+        self.loop._step()
+        self.assertEqual(self.controller.updates[-1][1], (False, True))
+        self.assertIsNone(self.loop.get_target_inputs()["left"])
+
+    def test_resume_resets_retargeting_and_publishes_copied_input_provenance(self):
+        self.loop._step()
+        self.loop.should_pause = lambda: True
+        self.loop._step()
+        self.loop.should_pause = lambda: False
+        snapshot = sample(value=0.7)
+        self.loop.get_tele_data = lambda: snapshot
+        self.loop._step()
+        self.assertEqual(self.retargeter.left.resets, 1)
+        self.assertEqual(self.retargeter.right.resets, 1)
+        inputs = self.loop.get_target_inputs()
+        self.assertEqual(inputs["right"]["points"], snapshot.right_hand_pos.tolist())
+        inputs["right"]["points"][0][0] = -100
+        self.assertEqual(self.loop.get_target_inputs()["right"]["points"][0][0], 0.7)
+
+    def test_recording_sample_stays_paired_when_capture_interleaves_with_a_publish(self):
+        self.loop._step()
+        previous = self.loop.get_recording_sample()
+        snapshot_started = threading.Event()
+        allow_snapshot = threading.Event()
+        original_snapshot = self.controller.get_recording_snapshot
+
+        def delayed_snapshot():
+            snapshot_started.set()
+            if not allow_snapshot.wait(1.0):
+                raise AssertionError("snapshot consumer blocked by DDS publication")
+            return original_snapshot()
+
+        self.controller.get_recording_snapshot = delayed_snapshot
+        self.loop.get_tele_data = lambda: sample(value=0.8)
+        worker = threading.Thread(target=self.loop._step)
+        worker.start()
+        try:
+            self.assertTrue(snapshot_started.wait(1.0))
+            self.assertEqual(self.controller.get_action()[0][0], 0.8)
+            self.assertEqual(self.loop.get_recording_sample(), previous)
+        finally:
+            allow_snapshot.set()
+            worker.join(1.0)
+        self.assertFalse(worker.is_alive())
+        paired = self.loop.get_recording_sample()
+        self.assertEqual(paired["hand"]["sequence"], 2)
+        self.assertEqual(paired["hand"]["requested"][0][0], 0.8)
+        self.assertEqual(paired["target_inputs"]["left"]["points"][0][0], 0.8)
+        paired["hand"]["requested"][0][0] = -100
+        self.assertEqual(self.loop.get_recording_sample()["hand"]["requested"][0][0], 0.8)
+
+    def test_paused_recording_pair_refreshes_command_time_without_replacing_xr_inputs(self):
+        initial = self.loop.get_recording_sample()
+        self.assertEqual(initial["target_inputs"], {"left": None, "right": None})
+        self.loop._step()
+        previous = self.loop.get_recording_sample()
+        self.loop.should_pause = lambda: True
+        self.loop._step()
+        paused = self.loop.get_recording_sample()
+        self.assertEqual(paused["target_inputs"], previous["target_inputs"])
+        self.assertEqual(paused["hand"]["sequence"], previous["hand"]["sequence"] + 1)
+        self.assertGreater(paused["hand"]["monotonic_ns"], previous["hand"]["monotonic_ns"])
+
+    def test_paused_worker_keeps_ticking_and_reports_feedback_failure(self):
+        self.loop._step()
+        self.loop.should_pause = lambda: True
+        self.loop.get_tele_data = mock.Mock(side_effect=AssertionError("read XR while paused"))
+        self.loop.start()
+        try:
+            before = len(self.controller.updates)
+            threading.Event().wait(0.18)
+            self.assertGreaterEqual(len(self.controller.updates) - before, 4)
+            error = TimeoutError("feedback stale")
+            self.controller.update = mock.Mock(side_effect=error)
+            self.loop.thread.join(0.5)
+            self.assertFalse(self.loop.thread.is_alive())
+            self.assertTrue(self.controller.stopped)
+            with self.assertRaises(RuntimeError) as raised:
+                self.loop.raise_if_failed()
+            self.assertIs(raised.exception.__cause__, error)
+        finally:
+            if self.loop.thread.is_alive():
+                self.loop.stop()
 
     def test_source_disconnect_is_not_refreshed_by_worker_heartbeat(self):
         self.loop.get_tele_data = lambda: sample(timestamp=time.monotonic() - 1)

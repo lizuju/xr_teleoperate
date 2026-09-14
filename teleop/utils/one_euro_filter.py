@@ -3,7 +3,7 @@ import numpy as np
 
 class OneEuroFilter:
     # Initial tuning for radian joint targets; algorithm: https://gery.casiez.net/1euro/
-    def __init__(self, min_cutoff=3.0, beta=8.0, derivative_cutoff=1.0):
+    def __init__(self, min_cutoff=3.5, beta=12.0, derivative_cutoff=1.0):
         self.min_cutoff = min_cutoff
         self.beta = beta
         self.derivative_cutoff = derivative_cutoff

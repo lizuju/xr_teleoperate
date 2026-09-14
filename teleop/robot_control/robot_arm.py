@@ -2058,8 +2058,16 @@ class R1_A7_ArmController:
         self.waist_tracking_error_limit = np.deg2rad(5.0)
         self.waist_target_timeout = 0.25
         self.waist_hold_requested = False
+        self.feedback_timeout = 0.25
+        self.target_timeout = 0.5
+        # The startup live-pose hold also covers IK loading before the first tracking target.
+        self.target_updated_at = None
+        self.publish_error = None
+        self.published_sequence = 0
+        self.published_command = None
         self.simulation_mode = simulation_mode
         self.deferred_activation = deferred_activation
+        self.defer_publisher_start = False
         self.kp_high = 200.0
         self.kd_high = 3.0
         self.kp_low = 50.0
@@ -2095,25 +2103,27 @@ class R1_A7_ArmController:
         else:
             self.activate()
 
-    def activate(self):
+    def activate(self, cancel_requested=None):
         with self.lifecycle_lock:
+            self.raise_if_failed()
             if self.active:
                 return
             if not self.subscribe_running:
                 raise RuntimeError("R1_A7_ArmController has been stopped.")
+            self._check_activation_cancelled(cancel_requested)
 
             self.crc = CRC()
             self.msg = unitree_hg_msg_dds__LowCmd_()
             self.lowcmd_publisher = ChannelPublisher(kTopicLowCommand_Debug, hg_LowCmd)
             self.lowcmd_publisher.Init()
 
-            request_sequence = self.lowstate_buffer.GetData().sequence
+            request_sequence = self._get_fresh_lowstate().sequence
             wait_for_dds(
-                lambda: self.lowstate_buffer.GetData() is not None
-                and self.lowstate_buffer.GetData().sequence > request_sequence,
+                lambda: self._check_activation_cancelled(cancel_requested) is None
+                and self._get_fresh_lowstate().sequence > request_sequence,
                 "R1_A7_ArmController activation",
             )
-            lowstate = self.lowstate_buffer.GetData()
+            lowstate = self._get_fresh_lowstate()
 
             self.msg.mode_pr = 0
             self.msg.mode_machine = lowstate.mode_machine
@@ -2163,19 +2173,27 @@ class R1_A7_ArmController:
                         self.msg.motor_cmd[id].kp = self.kp_high
                         self.msg.motor_cmd[id].kd = self.kd_high
                 self.msg.motor_cmd[id].q = self.all_motor_q[id]
-            self.msg.crc = self.crc.Crc(self.msg)
-            if not self.lowcmd_publisher.Write(self.msg):
-                raise RuntimeError("R1_A7 initial live-pose hold could not be published.")
-            self.ctrl_head_and_waist_go_home()
+            self._write_command(cancel_requested=cancel_requested)
+            self.ctrl_head_and_waist_go_home(cancel_requested=cancel_requested)
             logger_mp.info("Lock OK!")
 
-            self.publish_running = True
+            self._check_activation_cancelled(cancel_requested)
             self.active = True
-            self.publish_thread = threading.Thread(target=self._ctrl_motor_state)
-            self.publish_thread.daemon = True
-            self.publish_thread.start()
+            if not self.defer_publisher_start:
+                self.start_publishing()
 
         logger_mp.info("Initialize R1_A7_ArmController OK!")
+
+    def defer_publishing(self):
+        self.defer_publisher_start = True
+
+    def start_publishing(self):
+        if self.publish_running:
+            return
+        self.publish_running = True
+        self.publish_thread = threading.Thread(target=self._ctrl_motor_state)
+        self.publish_thread.daemon = True
+        self.publish_thread.start()
 
     def _subscribe_motor_state(self, msg):
         if not self.subscribe_running:
@@ -2199,7 +2217,7 @@ class R1_A7_ArmController:
         cliped_arm_q_target = current_q + delta / max(motion_scale, 1.0)
         return cliped_arm_q_target
 
-    def ctrl_head_and_waist_go_home(self, duration = 3.0):
+    def ctrl_head_and_waist_go_home(self, duration = 3.0, cancel_requested=None):
         '''Linearly move the head and available waist joints to zero at startup.'''
         logger_mp.info("[R1_A7_ArmController] head and waist returning to zero...")
         waist_indices = (
@@ -2210,6 +2228,7 @@ class R1_A7_ArmController:
         start_waist_q = self.all_motor_q[[id.value for id in waist_indices]]
         steps = max(1, int(duration / self.control_dt))
         for step in range(1, steps + 1):
+            self._check_activation_cancelled(cancel_requested)
             scale = 1.0 - step / steps
             head_q = start_head_q * scale
             waist_q = start_waist_q * scale
@@ -2217,12 +2236,19 @@ class R1_A7_ArmController:
                 self.msg.motor_cmd[id].q = head_q[idx]
             for idx, id in enumerate(waist_indices):
                 self.msg.motor_cmd[id].q = waist_q[idx]
-            self.msg.crc = self.crc.Crc(self.msg)
-            self.lowcmd_publisher.Write(self.msg)
+            self._write_command(cancel_requested=cancel_requested)
             time.sleep(self.control_dt)
         logger_mp.info("[R1_A7_ArmController] head and waist return to zero OK!")
 
     def _ctrl_motor_state(self):
+        try:
+            self._publish_motor_state_loop()
+        except Exception as error:
+            with self.ctrl_lock:
+                self.publish_error = error
+                self.publish_running = False
+
+    def _publish_motor_state_loop(self):
         while self.publish_running:
             start_time = time.monotonic()
 
@@ -2234,6 +2260,7 @@ class R1_A7_ArmController:
                 waist_updated_at = self.waist_target_updated_at
                 waist_target_sequence = self.waist_target_sequence
                 waist_hold_requested = self.waist_hold_requested
+                target_updated_at = self.target_updated_at
 
             if self.simulation_mode:
                 cliped_arm_q_target = arm_q_target
@@ -2286,8 +2313,7 @@ class R1_A7_ArmController:
                 self.msg.motor_cmd[R1_A7_JointIndex.kWaistYaw].dq = 0.0
                 self.msg.motor_cmd[R1_A7_JointIndex.kWaistYaw].tau = 0.0
 
-            self.msg.crc = self.crc.Crc(self.msg)
-            self.lowcmd_publisher.Write(self.msg)
+            self._write_command(target_updated_at=target_updated_at)
 
             current_time = time.monotonic()
             all_t_elapsed = current_time - start_time
@@ -2296,12 +2322,16 @@ class R1_A7_ArmController:
 
     def ctrl_dual_arm(self, q_target, tauff_target):
         '''Set control target values q & tau of the left and right arm motors.'''
+        self.raise_if_failed()
         with self.ctrl_lock:
+            self._check_target_freshness(self.target_updated_at)
             self.q_target = q_target
             self.tauff_target = tauff_target
+            self.target_updated_at = time.monotonic()
 
     def ctrl_dual_arm_and_head(self, q_target, tauff_target, head_q_target, waist_yaw_target=None):
         '''Set arm, head, and optional waist targets from one tracking sample.'''
+        self.raise_if_failed()
         head_q_target = np.asarray(head_q_target, dtype=float)
         if head_q_target.shape != (2,) or not np.isfinite(head_q_target).all():
             raise ValueError("head_q_target must contain two finite values")
@@ -2318,9 +2348,11 @@ class R1_A7_ArmController:
                 waist_yaw_target, -self.waist_yaw_limit, self.waist_yaw_limit
             ))
         with self.ctrl_lock:
+            self._check_target_freshness(self.target_updated_at)
             self.q_target = q_target
             self.tauff_target = tauff_target
             self.head_q_target = head_q_target
+            self.target_updated_at = time.monotonic()
             if waist_yaw_target is not None:
                 self.waist_yaw_target = waist_yaw_target
                 self.waist_target_updated_at = time.monotonic()
@@ -2332,40 +2364,113 @@ class R1_A7_ArmController:
             if self.waist_yaw_target is not None:
                 self.waist_hold_requested = True
 
+    def hold_targets(self):
+        self._get_fresh_lowstate()
+        with self.ctrl_lock:
+            self._check_target_freshness(self.target_updated_at)
+            if self.target_updated_at is not None:
+                self.target_updated_at = time.monotonic()
+
+    def raise_if_failed(self):
+        if self.publish_error is not None:
+            raise RuntimeError(f"R1-A7 command publishing stopped: {self.publish_error}") from self.publish_error
+
+    def _check_activation_cancelled(self, cancel_requested):
+        if cancel_requested is not None and cancel_requested():
+            raise InterruptedError("R1-A7 startup cancelled; command output stopped.")
+
+    def _check_target_freshness(self, updated_at):
+        if updated_at is not None:
+            age = time.monotonic() - updated_at
+            if not np.isfinite(age) or age < 0.0 or age >= self.target_timeout:
+                raise RuntimeError("R1-A7 arm/head target expired; command output stopped.")
+
+    def _get_fresh_lowstate(self):
+        self.raise_if_failed()
+        lowstate = self.lowstate_buffer.GetData()
+        if lowstate is None or lowstate.monotonic_timestamp is None:
+            raise RuntimeError("R1-A7 motor feedback is not ready.")
+        age = time.monotonic() - lowstate.monotonic_timestamp
+        if not np.isfinite(age) or age < 0.0 or age > self.feedback_timeout:
+            raise RuntimeError("R1-A7 motor feedback is stale; command output stopped.")
+        return lowstate
+
+    def _write_command(self, target_updated_at=None, cancel_requested=None):
+        self.msg.crc = self.crc.Crc(self.msg)
+        self._check_activation_cancelled(cancel_requested)
+        self._get_fresh_lowstate()
+        self._check_target_freshness(target_updated_at)
+        # The first tracking target may arrive while a startup-hold command is being built.
+        self._check_target_freshness(self.target_updated_at)
+        if not self.lowcmd_publisher.Write(self.msg):
+            raise RuntimeError("R1-A7 lowcmd Write failed; command output stopped.")
+        with self.ctrl_lock:
+            self.published_sequence += 1
+            self.published_command = {
+                "sequence": self.published_sequence,
+                "monotonic_ns": int(time.monotonic() * 1e9),
+                "arm_q": [float(self.msg.motor_cmd[i].q) for i in R1_A7_JointArmIndex],
+                "arm_tau": [float(self.msg.motor_cmd[i].tau) for i in R1_A7_JointArmIndex],
+                "head_q": [float(self.msg.motor_cmd[i].q) for i in R1_A7_JointHeadIndex],
+                "waist_q": float(self.msg.motor_cmd[R1_A7_JointIndex.kWaistYaw].q),
+            }
+
+    def get_recording_snapshot(self):
+        lowstate = self._get_fresh_lowstate()
+        with self.ctrl_lock:
+            requested = {
+                "arm_q": self.q_target.tolist(),
+                "arm_tau": self.tauff_target.tolist(),
+                "head_q": self.head_q_target.tolist(),
+                "waist_q": self.waist_yaw_target,
+                "monotonic_ns": None if self.target_updated_at is None else int(self.target_updated_at * 1e9),
+            }
+            published = None if self.published_command is None else {
+                key: value[:] if isinstance(value, list) else value
+                for key, value in self.published_command.items()
+            }
+        return {
+            "state": {
+                "monotonic_ns": int(lowstate.monotonic_timestamp * 1e9),
+                "sequence": lowstate.sequence,
+                "q": [float(lowstate.motor_state[i].q) for i in R1_A7_JointArmIndex],
+                "dq": [float(lowstate.motor_state[i].dq) for i in R1_A7_JointArmIndex],
+                "head_q": [float(lowstate.motor_state[i].q) for i in R1_A7_JointHeadIndex],
+                "waist_q": float(lowstate.motor_state[R1_A7_JointIndex.kWaistYaw].q),
+            },
+            "requested": requested,
+            "published": published,
+        }
+
     def get_mode_machine(self):
         '''Return current dds mode machine.'''
-        lowstate = self.lowstate_buffer.GetData()
-        if lowstate is None or lowstate.mode_machine is None:
+        lowstate = self._get_fresh_lowstate()
+        if lowstate.mode_machine is None:
             raise RuntimeError("R1-A7 low state is not ready.")
         return lowstate.mode_machine
 
     def get_current_motor_q(self):
         '''Return current state q of all body motors.'''
-        lowstate = self.lowstate_buffer.GetData()
+        lowstate = self._get_fresh_lowstate()
         return np.array([lowstate.motor_state[id].q for id in R1_A7_JointIndex])
 
     def get_current_dual_arm_q(self):
         '''Return current state q of the left and right arm motors.'''
-        lowstate = self.lowstate_buffer.GetData()
+        lowstate = self._get_fresh_lowstate()
         return np.array([lowstate.motor_state[id].q for id in R1_A7_JointArmIndex])
 
     def get_current_dual_arm_dq(self):
         '''Return current state dq of the left and right arm motors.'''
-        lowstate = self.lowstate_buffer.GetData()
+        lowstate = self._get_fresh_lowstate()
         return np.array([lowstate.motor_state[id].dq for id in R1_A7_JointArmIndex])
 
     def get_current_head_q(self):
         '''Return current state q of the head pitch/yaw motors.'''
-        lowstate = self.lowstate_buffer.GetData()
+        lowstate = self._get_fresh_lowstate()
         return np.array([lowstate.motor_state[id].q for id in R1_A7_JointHeadIndex])
 
     def get_current_waist_yaw(self):
-        lowstate = self.lowstate_buffer.GetData()
-        if lowstate is None or lowstate.monotonic_timestamp is None:
-            raise RuntimeError("R1-A7 waist feedback is not ready.")
-        age = time.monotonic() - lowstate.monotonic_timestamp
-        if not np.isfinite(age) or age < 0.0 or age > self.waist_target_timeout:
-            raise RuntimeError("R1-A7 waist feedback is stale.")
+        lowstate = self._get_fresh_lowstate()
         waist_yaw = float(lowstate.motor_state[R1_A7_JointIndex.kWaistYaw].q)
         if not np.isfinite(waist_yaw):
             raise RuntimeError("R1-A7 waist feedback must be finite.")

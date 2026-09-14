@@ -15,6 +15,7 @@ class R1WristHold:
     def __init__(self, target):
         self.target = target.copy()
         self.tracking = True
+        self.resume_streak = 0
 
     def hold(self):
         self.tracking = False

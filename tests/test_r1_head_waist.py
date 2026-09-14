@@ -33,7 +33,7 @@ class R1HeadWaistTest(unittest.TestCase):
         follower = R1HeadWaistFollower(0.1, 0.0)
         for index in range(1, 201):
             now = index * 0.01
-            yaw = math.radians(45.0 if now < 0.3 else 15.0)
+            yaw = math.radians(45.0 if now < 0.15 else 8.0)
             head, waist = follower.update(head_pose(yaw), np.eye(4), 0.1, now)
             self.assertAlmostEqual(waist, 0.1)
             self.assertAlmostEqual(head[1], yaw)
@@ -59,6 +59,14 @@ class R1HeadWaistTest(unittest.TestCase):
                 head_pose(math.radians(25.0)), np.eye(4), actual, index * 0.01,
             )
         self.assertAlmostEqual(actual, settled)
+
+    def test_default_engagement_settings_reduce_follow_start_delay(self):
+        follower = R1HeadWaistFollower(0.0, 0.0)
+        for index in range(1, 24):
+            follower.update(head_pose(math.radians(15.0)), np.eye(4), 0.0, index * 0.01)
+        self.assertTrue(follower.following)
+        self.assertAlmostEqual(follower.engage_threshold, math.radians(12.0))
+        self.assertEqual(follower.engage_duration, 0.2)
 
     def test_alternating_short_glances_do_not_accumulate_dwell(self):
         follower = R1HeadWaistFollower(0.0, 0.0)
@@ -130,7 +138,9 @@ class R1HeadWaistTest(unittest.TestCase):
             self.assertFalse(follower.following)
 
     def test_nearly_vertical_heading_brakes_then_recovery_requires_new_dwell(self):
-        follower = R1HeadWaistFollower(0.0, 0.0)
+        follower = R1HeadWaistFollower(
+            0.0, 0.0, engage_threshold=math.radians(20.0), engage_duration=0.4,
+        )
         targets = [0.0]
         for index in range(1, 131):
             _, target = follower.update(head_pose(0.8), np.eye(4), targets[-1], index * 0.01)
@@ -180,7 +190,9 @@ class R1HeadWaistTest(unittest.TestCase):
             self.assertAlmostEqual(head[1], 2.0071)
 
     def test_timeout_reanchors_to_actual_and_requires_new_dwell(self):
-        follower = R1HeadWaistFollower(0.0, 0.0)
+        follower = R1HeadWaistFollower(
+            0.0, 0.0, engage_threshold=math.radians(20.0), engage_duration=0.4,
+        )
         for index in range(1, 81):
             follower.update(head_pose(0.8), np.eye(4), 0.0, index * 0.01)
         self.assertTrue(follower.following)
@@ -206,7 +218,13 @@ class R1HeadWaistTest(unittest.TestCase):
         np.testing.assert_allclose(head_at_reference, [0.4, 0.7], atol=1e-12)
 
     def test_explicit_reset_after_short_stale_clears_motion_and_dwell(self):
-        follower = R1HeadWaistFollower(0.17, 0.0, tracking_timeout=0.25)
+        follower = R1HeadWaistFollower(
+            0.17,
+            0.0,
+            tracking_timeout=0.25,
+            engage_threshold=math.radians(20.0),
+            engage_duration=0.4,
+        )
         for index in range(1, 81):
             follower.update(head_pose(0.8), np.eye(4), 0.17, index * 0.01)
         self.assertTrue(follower.following)

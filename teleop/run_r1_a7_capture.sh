@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -lt 2 ]]; then
+  echo "Usage: $0 TASK_NAME TASK_GOAL [teleop options...]" >&2
+  exit 2
+fi
+if [[ -z "$1" || "$1" == */* || "$1" == "." || "$1" == ".." || -z "$2" ]]; then
+  echo "TASK_NAME must be a single directory name and TASK_GOAL must be nonempty." >&2
+  exit 2
+fi
+task_name="$1"
+task_goal="$2"
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+dev_root="$(cd -- "${script_dir}/../.." && pwd)"
+bash "${script_dir}/run_r1_a7_vector.sh" --check-only
+check_only=false
+if [[ "${3:-}" == "--check-only" ]]; then
+  check_only=true
+  shift 3
+else
+  shift 2
+fi
+if [[ "$check_only" == true ]]; then
+  exit 0
+fi
+
+export XR_TELEOP_CERT="${HOME}/.config/xr_teleoperate/cert.pem"
+export XR_TELEOP_KEY="${HOME}/.config/xr_teleoperate/key.pem"
+cd "$script_dir"
+exec "${dev_root}/.venv-xr/bin/python" -u teleop_hand_and_arm.py \
+  --input-mode hand \
+  --display-mode immersive \
+  --arm R1_A7 \
+  --ee linker_o6 \
+  --linker-o6-method vector \
+  --linker-o6-urdf-root "${dev_root}/linkerhand-urdf/O6" \
+  --waist-follow \
+  --network-interface eno1 \
+  --img-server-ip 192.168.124.147 \
+  --headless \
+  --record \
+  --task-dir "${dev_root}/teleop-recordings" \
+  --task-name "$task_name" \
+  --task-goal "$task_goal" \
+  "$@"

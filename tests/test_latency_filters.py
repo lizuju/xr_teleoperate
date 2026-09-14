@@ -40,7 +40,7 @@ class LatencyFilterTest(unittest.TestCase):
             retarget = LPFilter(retarget_alpha)
             retarget.next(np.zeros(6))
             action = np.zeros(6)
-            controller_alpha = -math.expm1(-(1 / 30) / 0.04)
+            controller_alpha = -math.expm1(-(1 / 30) / 0.03)
             outputs = []
             for step in range(1, 16):
                 target = retarget.next(np.ones(6))

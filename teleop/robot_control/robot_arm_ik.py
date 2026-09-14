@@ -1985,10 +1985,15 @@ class R1_A7_ArmIK:
             self.reduced_robot.data.oMf[self.R_hand_id].homogeneous.copy(),
         )
 
-    def reset_smoothing(self, side=None):
-        filters = self.smooth_filters if side is None else [self.smooth_filters[side]]
-        for smoothing in filters:
+    def reset_smoothing(self, side=None, reference_q=None):
+        sides = range(2) if side is None else (side,)
+        timestamp = time.monotonic()
+        for index in sides:
+            smoothing = self.smooth_filters[index]
             smoothing.reset()
+            if reference_q is not None:
+                arm_q = np.asarray(reference_q)[index * 7:(index + 1) * 7]
+                smoothing.filter(arm_q, timestamp, arm_q)
 
     def solve_ik(
         self,

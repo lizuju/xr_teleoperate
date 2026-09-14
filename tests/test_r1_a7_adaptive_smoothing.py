@@ -63,6 +63,17 @@ class R1A7AdaptiveSmoothingTest(unittest.TestCase):
         measured = np.full(14, 0.1)
         np.testing.assert_array_equal(self.solve(2.0, measured), measured)
 
+    def test_explicit_resume_seeds_from_frozen_published_target(self):
+        held = np.full(14, 0.2)
+        self.clock.return_value = 2.0
+        self.ik.reset_smoothing(reference_q=held)
+        self.target[:] = held
+        np.testing.assert_array_equal(self.solve(2.0 + 1 / 30.0, np.zeros(14)), held)
+        self.target[:] = 0.4
+        result = self.solve(2.0 + 2 / 30.0, np.zeros(14))
+        self.assertTrue(np.all(result > held))
+        self.assertTrue(np.all(result < self.target))
+
     def test_failed_ik_clears_filter_history_before_the_next_solution(self):
         self.solve(1.0, np.zeros(14))
         self.solve(1.0 + 1 / 30.0, np.zeros(14))

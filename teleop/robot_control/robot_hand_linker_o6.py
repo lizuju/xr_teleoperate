@@ -37,6 +37,9 @@ class LinkerO6Controller:
         self.left_action = None
         self.right_action = None
         self.action_time = None
+        self.requested_targets = None
+        self.published_commands = {"left": None, "right": None}
+        self.published_sequences = {"left": 0, "right": 0}
         self.ready = False
         self.active = False
         self.closed = False
@@ -159,6 +162,14 @@ class LinkerO6Controller:
             try:
                 if publisher.Write(message, timeout=COMMAND_TIMEOUT) is not True:
                     raise RuntimeError(f"Failed to publish {side} Linker O6 command")
+                with self.state_lock:
+                    self.published_sequences[side] += 1
+                    self.published_commands[side] = {
+                        "q": [float(command.q) for command in message.cmds],
+                        "mode": int(message.cmds[0].mode),
+                        "monotonic_ns": int(time.monotonic() * 1e9),
+                        "sequence": self.published_sequences[side],
+                    }
             except Exception as write_error:
                 if error is None:
                     error = write_error
@@ -209,6 +220,7 @@ class LinkerO6Controller:
         left_state, right_state, _, _, _, _ = self._state_snapshot()
         self.left_action = left_state
         self.right_action = right_state
+        self.requested_targets = (left_state.copy(), right_state.copy())
         self.action_time = time.monotonic()
         self.active = True
 
@@ -217,6 +229,8 @@ class LinkerO6Controller:
             raise RuntimeError("Linker O6 controller is not active")
         left = self._values(left_target, "left target")
         right = self._values(right_target, "right target")
+        with self.state_lock:
+            self.requested_targets = (left.copy(), right.copy())
         left_state, right_state, left_state_time, right_state_time, left_mode, right_mode = self._state_snapshot()
         now = time.monotonic()
         if (
@@ -253,7 +267,7 @@ class LinkerO6Controller:
                 raise TimeoutError(message)
         targets, modes, release_times = [], [], []
         dt = min(max(now - self.action_time, 0.0), 1.0 / 30.0)
-        alpha = -math.expm1(-dt / 0.04)
+        alpha = -math.expm1(-dt / 0.03)
         for target, previous, state, state_time, gate_mode, fresh, released_at in zip(
             (left, right), (self.left_action, self.right_action),
             (left_state, right_state), (left_state_time, right_state_time),
@@ -288,6 +302,33 @@ class LinkerO6Controller:
         if self.left_action is None or self.right_action is None:
             raise RuntimeError("Linker O6 action is not ready")
         return self.left_action.copy(), self.right_action.copy()
+
+    def get_recording_snapshot(self):
+        with self.state_lock:
+            if self.left_state is None or self.right_state is None:
+                raise RuntimeError("Linker O6 state is not ready")
+            states = {}
+            for side, values, timestamp, sequence, mode in (
+                ("left", self.left_state, self.left_state_time, self.left_state_count, self.left_gate_mode),
+                ("right", self.right_state, self.right_state_time, self.right_state_count, self.right_gate_mode),
+            ):
+                states[side] = {
+                    "q": values.tolist(), "monotonic_ns": int(timestamp * 1e9),
+                    "sequence": sequence, "mode": mode,
+                }
+            return {
+                "state": states,
+                "requested": None if self.requested_targets is None else {
+                    "left_q": self.requested_targets[0].tolist(),
+                    "right_q": self.requested_targets[1].tolist(),
+                },
+                "published": {
+                    side: None if command is None else {
+                        key: value[:] if isinstance(value, list) else value
+                        for key, value in command.items()
+                    } for side, command in self.published_commands.items()
+                },
+            }
 
     def stop(self):
         if self.closed:

@@ -29,14 +29,29 @@ def compensate_wrist_for_waist(target, waist_actual, waist_reference):
 
 
 class R1HeadWaistFollower:
-    def __init__(self, waist_reference, now, tracking_timeout=0.25):
+    def __init__(
+        self,
+        waist_reference,
+        now,
+        tracking_timeout=0.25,
+        engage_threshold=math.radians(12.0),
+        engage_duration=0.2,
+    ):
         self.waist_reference = float(waist_reference)
         self._last_time = float(now)
         self.tracking_timeout = float(tracking_timeout)
+        self.engage_threshold = float(engage_threshold)
+        self.engage_duration = float(engage_duration)
         if not all(math.isfinite(value) for value in (
-            self.waist_reference, self._last_time, self.tracking_timeout
-        )) or self.tracking_timeout <= 0.0:
-            raise ValueError("reference/time must be finite and tracking_timeout must be positive")
+            self.waist_reference,
+            self._last_time,
+            self.tracking_timeout,
+            self.engage_threshold,
+            self.engage_duration,
+        )) or self.tracking_timeout <= 0.0 or self.engage_threshold <= 0.0 or self.engage_duration <= 0.0:
+            raise ValueError(
+                "reference/time and engagement settings must be finite and positive"
+            )
         self.reset(self.waist_reference, self._last_time)
 
     def reset(self, waist_actual, now):
@@ -96,12 +111,12 @@ class R1HeadWaistFollower:
                     self.following = False
                     self._trigger_since = None
                     self._trigger_sign = 0.0
-            elif heading_is_valid and abs(residual) > math.radians(20.0):
+            elif heading_is_valid and abs(residual) > self.engage_threshold:
                 trigger_sign = math.copysign(1.0, residual)
                 if self._trigger_since is None or trigger_sign != self._trigger_sign:
                     self._trigger_since = now
                     self._trigger_sign = trigger_sign
-                elif now - self._trigger_since >= 0.4:
+                elif now - self._trigger_since >= self.engage_duration:
                     self.following = True
                     self._trigger_since = None
                     self._trigger_sign = 0.0

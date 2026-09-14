@@ -318,7 +318,7 @@ class TeleVuerHandFreshnessTest(unittest.TestCase):
             self.assertEqual(sample.right_hand_timestamp, 0.0)
             self.assertEqual(sample.motion_data_timestamp, 0.0)
 
-    def test_runtime_diagnostics_precede_tracking_hold_early_continue(self):
+    def test_runtime_diagnostics_precede_tracking_decisions_without_skipping_recording(self):
         source = (STAGE_ROOT / "teleop" / "teleop_hand_and_arm.py").read_text()
         tree = ast.parse(source)
         loop = next(node for node in ast.walk(tree) if isinstance(node, ast.While)
@@ -327,9 +327,12 @@ class TeleVuerHandFreshnessTest(unittest.TestCase):
                         for target in child.targets) for child in node.body))
         diagnostic = next(index for index, node in enumerate(loop.body)
                           if "get_tracking_diagnostics" in ast.unparse(node))
-        first_continue = next(index for index, node in enumerate(loop.body)
-                              if any(isinstance(child, ast.Continue) for child in ast.walk(node)))
-        self.assertLess(diagnostic, first_continue)
+        tracking = next(index for index, node in enumerate(loop.body)
+                        if isinstance(node, ast.Assign) and any(
+                            isinstance(target, ast.Name) and target.id == "tele_data"
+                            for target in node.targets))
+        self.assertLess(diagnostic, tracking)
+        self.assertFalse(any(isinstance(node, ast.Continue) for node in ast.walk(loop)))
         self.assertIn("+ 2.0", ast.unparse(loop.body[diagnostic]))
 
 
