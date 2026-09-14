@@ -127,7 +127,11 @@ def check_streams():
             request.send(b"GET_DATA")
             if not request.poll(3000):
                 raise RuntimeError("camera configuration timed out; check 60000 forwarding and r1-teleimager")
-            validate_camera_config(request.recv_json())
+            response = request.recv_json()
+            # teleimager >= 2.0 wraps the roster as {"webrtc": ..., "camera": {...}};
+            # 1.6 returned the camera map at the top level. Accept either.
+            camera_config = response.get("camera", response) if isinstance(response, dict) else response
+            validate_camera_config(camera_config)
         print("[OK] stereo camera configuration (1088x448, RTP 5002/5003)", flush=True)
         windows = {
             "rt/lowstate (robot feedback on eno1)": StreamWindow(0.25),
