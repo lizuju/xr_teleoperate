@@ -71,6 +71,14 @@ class R1HeadWaistIntegrationTest(unittest.TestCase):
         start = next(i for i, node in enumerate(self.loop.body) if assigns(node, "tele_data"))
         end = next(i for i, node in enumerate(self.loop.body) if calls(node, "write_json_line"))
         self.control_nodes = self.loop.body[start:end + 1]
+        # The main loop calls this module-level helper; pull it in the same way.
+        workspace_nodes = [
+            node for node in self.tree.body if isinstance(node, ast.FunctionDef)
+            and node.name in ("r1_workspace_saturation", "rotation_error_rad")
+        ]
+        workspace_ns = {"np": np, "math": math}
+        execute(workspace_nodes, workspace_ns)
+        self.workspace_saturation = workspace_ns["r1_workspace_saturation"]
         self.left = pose(0.6, [0.4, 0.2, 0.8])
         self.right = pose(-0.4, [0.35, -0.22, 0.78])
 
@@ -102,6 +110,8 @@ class R1HeadWaistIntegrationTest(unittest.TestCase):
             "args": SimpleNamespace(
                 waist_follow=True, ee=None, input_mode="hand", motion=False,
                 tracking_timeout=0.25, frequency=30.0, arm_translation_scale=1.0,
+                arm_diagnostic_hz=10.0,
+                workspace_position_tolerance_m=0.05, workspace_rotation_tolerance_rad=0.15,
             ),
             "r1_a7_anchored": True, "r1_a7_deferred_real": True,
             "r1_independent_hands": False,
@@ -110,6 +120,10 @@ class R1HeadWaistIntegrationTest(unittest.TestCase):
             "r1_vision_left_reference": self.left, "r1_vision_right_reference": self.right,
             "r1_robot_left_reference": self.left, "r1_robot_right_reference": self.right,
             "last_fresh_tele_data": tele_data, "tracking_hold_active": False,
+            "tracking_hold_previous": False, "tracking_hold_events": 0,
+            "workspace_diagnostic_next_time": 0.0, "workspace_warned_side": None,
+            "workspace_saturation_events": 0,
+            "r1_workspace_saturation": self.workspace_saturation,
             "tv_wrapper": Mock(get_tele_data=Mock(return_value=tele_data)),
             "is_fresh_motion_data": Mock(side_effect=freshness),
             "logger_mp": Mock(), "arm_ctrl": controller, "arm_ik": ik,

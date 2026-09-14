@@ -161,12 +161,48 @@ def rotation_error_rad(actual_rotation, target_rotation):
 
 def hold_r1_published_targets(arm_ctrl):
     published = arm_ctrl.get_recording_snapshot()["published"]
-    arm_ctrl.ctrl_dual_arm_and_head(
-        np.array(published["arm_q"]),
-        np.array(published["arm_tau"]),
-        np.array(published["head_q"]),
-    )
+    # Before the first successful publication there is nothing to replay, so the
+    # controller's own hold path is the only safe way to keep the pose.
+    if published is not None and published.get("arm_q") is not None:
+        arm_ctrl.ctrl_dual_arm_and_head(
+            np.array(published["arm_q"]),
+            np.array(published["arm_tau"]),
+            np.array(published["head_q"]),
+        )
+    else:
+        arm_ctrl.hold_targets()
     arm_ctrl.hold_waist()
+
+def r1_workspace_saturation(
+    solved_left_pose,
+    solved_right_pose,
+    left_ik_target,
+    right_ik_target,
+    position_limit_m,
+    rotation_limit_rad,
+):
+    '''Return per-side IK shortfall once a target leaves the reachable workspace.
+
+    The solver treats position and orientation as soft costs, so an unreachable
+    target is not an error: the arm silently follows as far as it can. This turns
+    that silent shortfall into a reportable signal.
+    '''
+    sinks = (left_ik_target, right_ik_target)
+    return {
+        side: {
+            "position_m": float(np.linalg.norm(solved[:3, 3] - target[:3, 3])),
+            "rotation_rad": rotation_error_rad(solved[:3, :3], target[:3, :3]),
+            "outside": bool(
+                np.linalg.norm(solved[:3, 3] - target[:3, 3]) > position_limit_m
+                or rotation_error_rad(solved[:3, :3], target[:3, :3]) > rotation_limit_rad
+            ),
+        }
+        for side, solved, target in zip(
+            ("left", "right"),
+            (solved_left_pose, solved_right_pose),
+            sinks,
+        )
+    }
 
 def write_json_line(file, payload, flush=False):
     file.write(json.dumps(payload, separators=(",", ":")) + "\n")
@@ -229,6 +265,9 @@ if __name__ == '__main__':
     parser.add_argument('--task-goal', type = str, default = 'pick up cube.', help = 'task goal for recording at json file')
     parser.add_argument('--task-desc', type = str, default = 'task description', help = 'task description for recording at json file')
     parser.add_argument('--task-steps', type = str, default = 'step1: do this; step2: do that;', help = 'task steps for recording at json file')
+    parser.add_argument('--arm-diagnostic-hz', type=float, default=10.0, help='R1_A7 alignment JSONL sample rate; lower it to shrink long sessions')
+    parser.add_argument('--workspace-position-tolerance-m', type=float, default=0.05, help='R1_A7: IK position shortfall above which a target counts as outside the reachable workspace')
+    parser.add_argument('--workspace-rotation-tolerance-rad', type=float, default=0.15, help='R1_A7: IK rotation shortfall above which a target counts as outside the reachable workspace')
 
     args = parser.parse_args()
     logger_mp.debug(f"args: {args}")
@@ -258,6 +297,12 @@ if __name__ == '__main__':
         parser.error("--waist-follow-dwell must be positive.")
     if args.waist_follow and (args.arm != "R1_A7" or args.hand_only or args.dry_run or args.motion):
         parser.error("--waist-follow requires R1_A7 full arm control without --motion.")
+    if not (math.isfinite(args.arm_diagnostic_hz) and args.arm_diagnostic_hz > 0.0):
+        parser.error("--arm-diagnostic-hz must be positive.")
+    if not (math.isfinite(args.workspace_position_tolerance_m) and args.workspace_position_tolerance_m >= 0.0):
+        parser.error("--workspace-position-tolerance-m must be finite and non-negative.")
+    if not (math.isfinite(args.workspace_rotation_tolerance_rad) and args.workspace_rotation_tolerance_rad >= 0.0):
+        parser.error("--workspace-rotation-tolerance-rad must be finite and non-negative.")
 
     DRY_RUN_MODE = args.dry_run
     r1_a7_deferred_real = (
@@ -292,6 +337,11 @@ if __name__ == '__main__':
     arm_diagnostic_path = None
     arm_diagnostic_sequence = 0
     arm_diagnostic_next_time = 0.0
+    workspace_diagnostic_next_time = 0.0
+    workspace_saturation_events = 0
+    workspace_warned_side = None
+    tracking_hold_events = 0
+    tracking_hold_previous = False
     arm_control_previous_time = None
     dry_run_record_file = None
     linker_o6_retargeter = None
@@ -1324,6 +1374,11 @@ if __name__ == '__main__':
                 tracking_hold_active = True
                 capture_mode = "tracking_hold"
                 run_motion = False
+            # Count hold transitions once per event; a long single-side loss is one
+            # event, not thousands of frames, so the exit summary stays readable.
+            if tracking_hold_active and not tracking_hold_previous:
+                tracking_hold_events += 1
+            tracking_hold_previous = tracking_hold_active
             if linker_o6_loop is not None:
                 linker_o6_loop.raise_if_failed()
             if STOP:
@@ -1393,8 +1448,32 @@ if __name__ == '__main__':
                     )
                 if not run_motion:
                     left_wrist_target, right_wrist_target = solved_left_pose.copy(), solved_right_pose.copy()
+                # The solver reports position/orientation as soft costs, so an
+                # unreachable target silently under-follows. Surface it instead.
+                workspace_saturation = r1_workspace_saturation(
+                    solved_left_pose, solved_right_pose, left_ik_target, right_ik_target,
+                    args.workspace_position_tolerance_m, args.workspace_rotation_tolerance_rad,
+                )
+                workspace_outside = tuple(
+                    side for side, item in workspace_saturation.items() if item["outside"]
+                )
+                if workspace_outside and diagnostic_now >= workspace_diagnostic_next_time:
+                    workspace_diagnostic_next_time = diagnostic_now + 1.0
+                    logger_mp.warning(
+                        "[R1 WORKSPACE] %s target is outside the reachable workspace; "
+                        "the arm is following as far as it can. shortfall position=%.3f m rotation=%.2f rad. "
+                        "Move closer to the body or lower --arm-translation-scale.",
+                        "/".join(workspace_outside),
+                        max(workspace_saturation[side]["position_m"] for side in workspace_outside),
+                        max(workspace_saturation[side]["rotation_rad"] for side in workspace_outside),
+                    )
+                    if workspace_warned_side != workspace_outside:
+                        workspace_saturation_events += 1
+                        workspace_warned_side = workspace_outside
+                elif not workspace_outside:
+                    workspace_warned_side = None
                 arm_diagnostic_sequence += 1
-                arm_diagnostic_next_time = diagnostic_now + 0.1
+                arm_diagnostic_next_time = diagnostic_now + 1.0 / args.arm_diagnostic_hz
                 write_json_line(arm_diagnostic_file, {
                     "schema": "r1_a7_alignment_v1",
                     "event": "sample",
@@ -1427,6 +1506,7 @@ if __name__ == '__main__':
                     "q_actual": current_lr_arm_q.tolist(),
                     "dq_actual": current_lr_arm_dq.tolist(),
                     "q_ik_command": sol_q.tolist(),
+                    "workspace": workspace_saturation,
                     "actual_left_pose": actual_left_pose.tolist(),
                     "actual_right_pose": actual_right_pose.tolist(),
                     "solved_left_pose": solved_left_pose.tolist(),
@@ -1619,6 +1699,18 @@ if __name__ == '__main__':
         active_exception = sys.exc_info()[1]
         if isinstance(active_exception, SystemExit) and active_exception.code not in (None, 0):
             exit_code = active_exception.code if isinstance(active_exception.code, int) else 1
+        try:
+            # One readable line per session: a long single-side tracking loss is
+            # otherwise only visible by digging through the alignment JSONL.
+            if r1_a7_anchored and arm_ik is not None:
+                logger_mp.info(
+                    "[R1 SESSION SUMMARY] tracking_holding_events=%d workspace_saturation_events=%d "
+                    "diagnostic_samples=%d. A hold event means at least one hand lost tracking; "
+                    "the arm kept its last pose until tracking returned.",
+                    tracking_hold_events, workspace_saturation_events, arm_diagnostic_sequence,
+                )
+        except Exception as e:
+            logger_mp.warning(f"Failed to write session summary: {e}")
         try:
             if linker_o6_loop is not None:
                 linker_o6_loop.stop()
