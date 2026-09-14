@@ -138,12 +138,13 @@ class HandOnlyDryRunIsolationTest(unittest.TestCase):
         logging_module.basicConfig = lambda **kwargs: None
         logging_module.getLogger = lambda name: FakeLogger()
 
-        class FakeImageClient:
-            def __init__(self, **kwargs):
-                image_client_calls.append(kwargs)
+        class FakeTeleImageClient:
+            def __init__(self, camera_topic, **kwargs):
+                image_client_calls.append({"camera_topic": camera_topic, **kwargs})
 
-            def get_cam_config(self):
-                self.assert_keyboard_ready = keyboard_ready.wait(1.0)
+            @classmethod
+            def scan(cls, server_host=None, request_port=60000):
+                keyboard_ready.wait(1.0)
                 return {
                     "head_camera": {
                         "binocular": False,
@@ -154,13 +155,16 @@ class HandOnlyDryRunIsolationTest(unittest.TestCase):
                     },
                     "left_wrist_camera": {"enable_zmq": False},
                     "right_wrist_camera": {"enable_zmq": False},
-                }
+                }, False
+
+            def get_frame(self):
+                return None
 
             def close(self):
                 pass
 
-        image_module = types.ModuleType("teleimager.image_client")
-        image_module.ImageClient = FakeImageClient
+        image_module = types.ModuleType("teleimager.client")
+        image_module.TeleImageClient = FakeTeleImageClient
         teleimager_module = types.ModuleType("teleimager")
         teleimager_module.__path__ = []
 
@@ -239,7 +243,7 @@ class HandOnlyDryRunIsolationTest(unittest.TestCase):
         fake_modules = {
             "logging_mp": logging_module,
             "teleimager": teleimager_module,
-            "teleimager.image_client": image_module,
+            "teleimager.client": image_module,
             "teleop.utils.ipc": ipc_module,
             "sshkeyboard": keyboard_module,
             "televuer": televuer_module,

@@ -409,7 +409,7 @@ class Gripper_JointIndex(IntEnum):
 if __name__ == "__main__":
     import argparse
     from televuer import TeleVuerWrapper
-    from teleimager import ImageClient
+    from teleimager.client import TeleImageClient
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--xr-mode', type=str, choices=['hand', 'controller'], default='hand', help='Select XR device tracking source')
@@ -419,12 +419,15 @@ if __name__ == "__main__":
 
     ChannelFactoryInitialize(1) # 0 for real robot, 1 for simulation
     
-    # image client
-    img_client = ImageClient(host='127.0.0.1') #host='192.168.123.164'
-    if not img_client.has_head_cam():
+    # image client (teleimager >= 2.0: scan the roster, then subscribe per topic)
+    camera_config, _from_server = TeleImageClient.scan(server_host='127.0.0.1')  # host='192.168.123.164'
+    head_cfg = camera_config.get('head_camera') or {}
+    if not head_cfg.get('enable_zmq'):
         logger_mp.error("Head camera is required. Please enable head camera on the image server side.")
-    head_img_shape = img_client.get_head_shape()
-    tv_binocular = img_client.head_is_binocular()
+    head_img_shape = head_cfg.get('image_shape')
+    tv_binocular = head_cfg.get('binocular', False)
+    head_img_client = TeleImageClient('head_camera', server_host='127.0.0.1',
+                                      zmq_port=head_cfg.get('zmq_port'), request_bgr=True)
 
     # television: obtain hand pose data from the XR device and transmit the robot's head camera image to the XR device.
     tv_wrapper = TeleVuerWrapper(binocular=tv_binocular, use_hand_tracking=args.xr_mode == "hand", img_shape=head_img_shape, return_hand_rot_data = False)
@@ -448,8 +451,8 @@ if __name__ == "__main__":
     user_input = input("Please enter the start signal (enter 's' to start the subsequent program):\n")
     if user_input.lower() == 's':
         while True:
-            head_img, head_img_fps = img_client.get_head_frame()
-            tv_wrapper.set_display_image(head_img)
+            head_img = head_img_client.get_frame()
+            tv_wrapper.set_display_image(head_img.bgr)
             tele_data = tv_wrapper.get_tele_data()
             if args.ee == "dex3" and args.xr_mode == "hand":
                 with left_hand_pos_array.get_lock():

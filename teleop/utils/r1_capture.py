@@ -20,7 +20,7 @@ def capture_metadata(args, camera_config, retargeter):
             versions[package] = None
     code_paths = [root / "teleop/teleop_hand_and_arm.py", Path(__file__),
                   root / "teleop/utils/episode_writer.py",
-                  root / "teleop/teleimager/src/teleimager/image_client.py"]
+                  root / "teleop/teleimager/src/teleimager/client.py"]
     code_paths += list((root / "teleop/robot_control").glob("*.py"))
     models = {
         "arm": root / "assets/r1/r1_a7.urdf",

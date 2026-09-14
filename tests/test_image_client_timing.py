@@ -10,7 +10,7 @@ import numpy as np
 import zmq
 
 
-SOURCE = Path(__file__).resolve().parents[1] / "teleop/teleimager/src/teleimager/image_client.py"
+SOURCE = Path(__file__).resolve().parents[1] / "teleop/teleimager/src/teleimager/client.py"
 SPEC = importlib.util.spec_from_file_location("collection_image_client_timing", SOURCE)
 image_client = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(image_client)

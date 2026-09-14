@@ -17,7 +17,7 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
 sys.path.append(parent_dir)
 
-from teleimager.image_client import ImageClient
+from teleimager.client import TeleImageClient
 from teleop.utils.ipc import IPC_Server
 from teleop.robot_control.r1_head_waist import R1HeadWaistFollower, compensate_wrist_for_waist
 from teleop.robot_control.r1_hand_tracking import R1WristHold, hand_tracking_freshness
@@ -345,7 +345,7 @@ if __name__ == '__main__':
     arm_control_previous_time = None
     dry_run_record_file = None
     linker_o6_retargeter = None
-    img_client = None
+    img_clients = {}
     tv_wrapper = None
     recorder = None
     r1_capture = None
@@ -402,9 +402,19 @@ if __name__ == '__main__':
                 "right_wrist_camera": {"enable_zmq": False},
             }
         else:
-            img_client = ImageClient(host=args.img_server_ip, request_bgr=True)
-            camera_config = img_client.get_cam_config()
+            camera_config, _from_server = TeleImageClient.scan(server_host=args.img_server_ip)
             logger_mp.debug(f"Camera config: {camera_config}")
+            # teleimager >= 2.0 subscribes per camera topic; only instantiate the
+            # topics the server actually publishes over ZMQ.
+            for _topic in ("head_camera", "left_wrist_camera", "right_wrist_camera"):
+                _cfg = camera_config.get(_topic)
+                if _cfg and _cfg.get("enable_zmq"):
+                    img_clients[_topic] = TeleImageClient(
+                        _topic,
+                        server_host=args.img_server_ip,
+                        zmq_port=_cfg["zmq_port"],
+                        request_bgr=True,
+                    )
         xr_need_local_img = not (args.display_mode == 'pass-through' or camera_config['head_camera']['enable_webrtc'])
 
         # televuer_wrapper: obtain hand pose data from the XR device and transmit the robot's head camera image to the XR device.
@@ -452,7 +462,7 @@ if __name__ == '__main__':
             while not STOP:
                 start_time = time.monotonic()
                 if camera_config['head_camera']['enable_zmq'] and xr_need_local_img:
-                    head_img = img_client.get_head_frame()
+                    head_img = img_clients["head_camera"].get_frame()
                     if head_img.bgr is not None:
                         tv_wrapper.render_to_xr(head_img.bgr)
 
@@ -795,7 +805,7 @@ if __name__ == '__main__':
                     "[XR TRACKING] " + json.dumps(tv_wrapper.tvuer.get_tracking_diagnostics())
                 )
             if camera_config['head_camera']['enable_zmq'] and xr_need_local_img:
-                head_img = img_client.get_head_frame()
+                head_img = img_clients["head_camera"].get_frame()
                 if head_img.bgr is not None:
                     tv_wrapper.render_to_xr(head_img.bgr)
 
@@ -1101,15 +1111,15 @@ if __name__ == '__main__':
             # get image
             if camera_config['head_camera']['enable_zmq']:
                 if args.record or xr_need_local_img:
-                    head_img = img_client.get_head_frame()
+                    head_img = img_clients["head_camera"].get_frame()
                 if xr_need_local_img and head_img.bgr is not None:
                     tv_wrapper.render_to_xr(head_img.bgr)
             if camera_config['left_wrist_camera']['enable_zmq']:
                 if args.record:
-                    left_wrist_img = img_client.get_left_wrist_frame()
+                    left_wrist_img = img_clients["left_wrist_camera"].get_frame()
             if camera_config['right_wrist_camera']['enable_zmq']:
                 if args.record:
-                    right_wrist_img = img_client.get_right_wrist_frame()
+                    right_wrist_img = img_clients["right_wrist_camera"].get_frame()
 
             # record mode
             if args.record:
@@ -1745,8 +1755,9 @@ if __name__ == '__main__':
             logger_mp.error(f"Failed to stop keyboard listener or ipc server: {e}")
         
         try:
-            if img_client is not None:
-                img_client.close()
+            if img_clients:
+                for _client in img_clients.values():
+                    _client.close()
         except Exception as e:
             exit_code = 1
             logger_mp.error(f"Failed to close image client: {e}")
