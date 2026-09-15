@@ -18,7 +18,7 @@ OUTCOMES = {"unspecified", "success", "failure", "discarded"}
 
 class EpisodeWriter:
     def __init__(self, task_dir, task_goal=None, task_desc=None, task_steps=None,
-                 frequency=30, image_size=(640, 480), rerun_log=True, metadata=None,
+                 frequency=30, image_size=(640, 480), depth_size=None, rerun_log=True, metadata=None,
                  queue_capacity=60):
         if queue_capacity <= 0:
             raise ValueError("queue_capacity must be positive")
@@ -33,7 +33,11 @@ class EpisodeWriter:
             "date": datetime.date.today().isoformat(),
             "author": "unitree",
             "image": {"width": image_size[0], "height": image_size[1], "fps": frequency},
-            "depth": {"width": image_size[0], "height": image_size[1], "fps": frequency},
+            # Declared only when depth frames are actually recorded. A manifest
+            # that advertises depth while every sample carries depths=null makes
+            # downstream consumers believe a modality is present that is not.
+            "depth": None if depth_size is None else {"width": depth_size[0], "height": depth_size[1],
+                                                      "fps": frequency},
             "audio": {"sample_rate": 16000, "channels": 1, "format": "PCM", "bits": 16},
             "joint_names": {name: [] for name in ("left_arm", "left_ee", "right_arm", "right_ee", "body")},
             "tactile_names": {"left_ee": [], "right_ee": []},
@@ -129,6 +133,8 @@ class EpisodeWriter:
         self.episode_dir = episode_dir
         self._frame_count = 0
         for name in ("colors", "depths", "audios"):
+            if name == "depths" and self.info.get("depth") is None:
+                continue
             (episode_dir / name).mkdir()
         self._frames = (episode_dir / "frames.jsonl").open("x", encoding="utf-8")
         self._write_manifest("recording")
@@ -165,8 +171,17 @@ class EpisodeWriter:
         idx = item["idx"]
         for field in ("colors", "depths"):
             for key, image in (item[field] or {}).items():
+                # A modality key may be present with a null payload: the camera
+                # is configured for this run but did not deliver a usable frame
+                # for this sample. Keep the key so the schema stays stable and
+                # the matching sample.sources entry stays checkable.
+                if image is None:
+                    continue
                 suffix = ".jpg" if field == "colors" else ".png"
                 relative = Path(field) / f"{idx:06d}_{key}{suffix}"
+                # `depths/` only exists when the manifest declares depth, so a
+                # legacy caller that supplies one anyway still lands on disk.
+                (self.episode_dir / field).mkdir(exist_ok=True)
                 if not cv2.imwrite(str(self.episode_dir / relative), image):
                     raise OSError(f"Failed to save {relative}")
                 item[field][key] = str(relative)

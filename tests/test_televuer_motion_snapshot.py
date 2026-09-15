@@ -13,6 +13,10 @@ from unittest import mock
 import numpy as np
 
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from teleop.robot_control.r1_hand_tracking import hand_tracking_freshness  # noqa: E402
+
+
 STAGE_ROOT = Path(__file__).resolve().parents[1]
 TELEVUER_PATH = STAGE_ROOT / "teleop" / "televuer" / "src" / "televuer" / "televuer.py"
 
@@ -317,6 +321,24 @@ class TeleVuerHandFreshnessTest(unittest.TestCase):
             self.assertEqual(sample.left_hand_timestamp, 100.03)
             self.assertEqual(sample.right_hand_timestamp, 0.0)
             self.assertEqual(sample.motion_data_timestamp, 0.0)
+
+    def test_single_visible_hand_marks_the_stream_ready_without_the_other(self):
+        # One hand from the very first frame must be enough: requiring both sides
+        # here is what previously made a single lost hand look like a dead stream.
+        self.tele_vuer = bare_televuer()
+        sample = self.publish(100.0, "left")
+        self.assertTrue(sample.motion_data_ready)
+        self.assertEqual(sample.left_hand_timestamp, 100.0)
+        self.assertEqual(sample.right_hand_timestamp, 0.0)
+
+    def test_one_stale_side_does_not_invalidate_the_other(self):
+        self.settle(100.0)
+        stale = self.publish(100.01, "right")   # left goes stale, right stays fresh
+        self.assertEqual(stale.left_hand_timestamp, 0.0)
+        self.assertEqual(stale.right_hand_timestamp, 100.01)
+        fresh = hand_tracking_freshness(stale, 0.25, now=100.02)
+        self.assertEqual(fresh, (False, True),
+                         "only the missing side may be reported stale")
 
     def test_runtime_diagnostics_precede_tracking_decisions_without_skipping_recording(self):
         source = (STAGE_ROOT / "teleop" / "teleop_hand_and_arm.py").read_text()

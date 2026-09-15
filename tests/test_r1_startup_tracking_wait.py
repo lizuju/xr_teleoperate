@@ -67,11 +67,16 @@ class R1StartupTrackingWaitTest(unittest.TestCase):
             "r1_a7_anchored": True, "r1_a7_deferred_real": True,
             "r1_vision_left_reference": None, "r1_vision_right_reference": None,
             "args": SimpleNamespace(ee="linker_o6", tracking_timeout=0.25, waist_follow=False,
-                                    arm_translation_scale=1.0),
+                                    arm_translation_scale=1.0,
+                                    arm_limit_softness=0.0, arm_posture_weight=0.0, arm_velocity_limit=3.0),
             "arm_ctrl": arm, "hand_ctrl": None, "arm_ik": None,
             "MotionSwitcher": switcher_factory, "tv_wrapper": wrapper,
-            "camera_config": {"head_camera": {"enable_zmq": False}},
+            "camera_config": {"head_camera": {"enable_zmq": False},
+                              "left_wrist_camera": {"enable_zmq": False},
+                              "right_wrist_camera": {"enable_zmq": False}},
             "xr_need_local_img": False, "logger_mp": Mock(),
+            # the waiting loop also refreshes the XR wrist panels
+            "grab_wrist_frames": Mock(return_value=(None, None)),
             "arm_diagnostic_file": None,
         }
 

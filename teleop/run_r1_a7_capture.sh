@@ -28,6 +28,15 @@ fi
 
 export XR_TELEOP_CERT="${HOME}/.config/xr_teleoperate/cert.pem"
 export XR_TELEOP_KEY="${HOME}/.config/xr_teleoperate/key.pem"
+diagnostics=()
+if [[ -n "${ARM_DIAG_HZ:-}" ]]; then
+  diagnostics+=(--arm-diagnostic-hz "${ARM_DIAG_HZ}")
+fi
+if [[ -n "${ARM_DIAG_DIR:-}" ]]; then
+  mkdir -p "${ARM_DIAG_DIR}"
+  diagnostics+=(--arm-diagnostic-dir "${ARM_DIAG_DIR}")
+fi
+
 cd "$script_dir"
 exec "${dev_root}/.venv-xr/bin/python" -u teleop_hand_and_arm.py \
   --input-mode hand \
@@ -37,6 +46,10 @@ exec "${dev_root}/.venv-xr/bin/python" -u teleop_hand_and_arm.py \
   --linker-o6-method vector \
   --linker-o6-urdf-root "${dev_root}/linkerhand-urdf/O6" \
   --waist-follow \
+  --arm-velocity-limit "${ARM_VELOCITY_LIMIT:-30.0}" \
+  --arm-dq-feedforward "${ARM_DQ_FEEDFORWARD:-on}" \
+  --arm-dq-limit "${ARM_DQ_LIMIT:-6.0}" \
+  --camera-calibration "${CAMERA_CALIBRATION:-}" \
   --network-interface eno1 \
   --img-server-ip 192.168.124.147 \
   --headless \
@@ -44,4 +57,5 @@ exec "${dev_root}/.venv-xr/bin/python" -u teleop_hand_and_arm.py \
   --task-dir "${dev_root}/teleop-recordings" \
   --task-name "$task_name" \
   --task-goal "$task_goal" \
+  "${diagnostics[@]}" \
   "$@"

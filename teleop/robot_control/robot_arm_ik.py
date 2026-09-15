@@ -1873,7 +1873,40 @@ class R1_A7_ArmIK:
             self.var_q,
             self.reduced_robot.model.upperPositionLimit)
         )
-        self.opti.minimize(50 * self.translational_cost + self.rotation_cost + 0.02 * self.regularization_cost + 0.1 * self.smooth_cost)
+        # Redundancy handling for the teleoperation posture. `var_q` holds only the
+        # two 7-DoF arms, so these terms never touch the locked waist/head joints.
+        #
+        # `bounded` above is a hard constraint, so the solver is free to drive a joint
+        # all the way onto a limit and keep it there. That is what makes the wrist feel
+        # locked during long sessions. The quartic barrier below grows steeply only near
+        # the limits and is normalised per joint by its half-range, so a joint sitting
+        # mid-range contributes almost nothing while an edge-riding joint is pushed back.
+        joint_lower = np.asarray(self.reduced_robot.model.lowerPositionLimit, dtype=np.float64)
+        joint_upper = np.asarray(self.reduced_robot.model.upperPositionLimit, dtype=np.float64)
+        self.joint_middle = 0.5 * (joint_lower + joint_upper)
+        self.joint_half_range = 0.5 * (joint_upper - joint_lower)
+        self._nominal_arm_q = self.joint_middle.copy()
+        self.param_nominal_q = self.opti.parameter(self.reduced_robot.model.nq)
+        self.posture_weights = casadi.DM.ones(self.reduced_robot.model.nq)
+        normalised_offset = (self.var_q - self.joint_middle) / self.joint_half_range
+        self.limit_cost = casadi.sumsqr(normalised_offset ** 2)
+        self.posture_cost = casadi.sumsqr(
+            self.posture_weights * (self.var_q - self.param_nominal_q)
+        )
+        # Weights are parameters, because opti.minimize() can only be called once.
+        self.param_posture_weight = self.opti.parameter(1)
+        self.param_limit_weight = self.opti.parameter(1)
+        self.posture_weight = 0.0
+        self.limit_weight = 0.0
+        self.opti.set_value(self.param_nominal_q, self._nominal_arm_q)
+        self.opti.set_value(self.param_posture_weight, self.posture_weight)
+        self.opti.set_value(self.param_limit_weight, self.limit_weight)
+        self.opti.minimize(
+            50 * self.translational_cost + self.rotation_cost
+            + 0.02 * self.regularization_cost + 0.1 * self.smooth_cost
+            + self.param_posture_weight * self.posture_cost
+            + self.param_limit_weight * self.limit_cost
+        )
 
         opts = {
             # CasADi-level options
@@ -1934,6 +1967,33 @@ class R1_A7_ArmIK:
                         ),
                     )
                 )
+
+    def set_redundancy_weights(self, posture_weight=None, limit_weight=None,
+                               nominal_arm_q=None):
+        '''Tune the redundancy terms and the preferred arm posture.
+
+        ``posture_weight`` pulls the arm toward ``nominal_arm_q`` (default: the middle
+        of every joint range). ``limit_weight`` is the soft joint-limit barrier. Both
+        default to zero, so an unconfigured solver behaves exactly as before.
+        '''
+        for name, value in (("posture_weight", posture_weight), ("limit_weight", limit_weight)):
+            if value is None:
+                continue
+            value = float(value)
+            if not np.isfinite(value) or value < 0.0:
+                raise ValueError(f"{name} must be finite and non-negative.")
+            setattr(self, name, value)
+        if nominal_arm_q is not None:
+            nominal = np.asarray(nominal_arm_q, dtype=np.float64)
+            if nominal.shape != self._nominal_arm_q.shape or not np.isfinite(nominal).all():
+                raise ValueError(
+                    f"nominal_arm_q must be a finite array of shape {self._nominal_arm_q.shape}."
+                )
+            self._nominal_arm_q = nominal.copy()
+        self.opti.set_value(self.param_nominal_q, self._nominal_arm_q)
+        self.opti.set_value(self.param_posture_weight, self.posture_weight)
+        self.opti.set_value(self.param_limit_weight, self.limit_weight)
+
 
     # Save both robot.model and reduced_robot.model
     def save_cache(self):

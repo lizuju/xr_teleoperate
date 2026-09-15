@@ -57,6 +57,47 @@ def validate_state(message, hand=False):
             raise ValueError("O6 feedback outside [0, 1]")
 
 
+def unwrap_camera_config(response):
+    """teleimager 2.x answers 60000 with {"webrtc": {...}, "camera": {topic: {...}}};
+    teleimager.client.ZMQ_Requester unwraps ["camera"] the same way."""
+    if isinstance(response, dict) and isinstance(response.get("camera"), dict):
+        return response["camera"]
+    return response
+
+
+def jpeg_decoder():
+    """Decode a teleimager JPEG payload the way the runtime does.
+
+    Both teleimager's TeleImageClient and the uvc library decode with turbojpeg,
+    which accepts the frames the two wrist UVC modules emit without their
+    trailing EOI marker (measured on 2026-09-15: ~85% of wrist frames arrive
+    1-2 KB short, costing at most the last 8 of 480 rows; the head stereo JPEGs
+    are always complete). cv2.imdecode rejects those frames outright, so using
+    it here would report a healthy stream as broken.
+    """
+    try:
+        from turbojpeg import TurboJPEG
+        decoder = TurboJPEG()
+
+        def decode(payload):
+            try:
+                return decoder.decode(payload)
+            except Exception:
+                return None
+    except Exception:
+        import cv2
+        import numpy as np
+
+        def decode(payload):
+            return cv2.imdecode(np.frombuffer(payload, dtype=np.uint8), cv2.IMREAD_COLOR)
+    return decode
+
+
+def jpeg_is_complete(payload):
+    """True when the payload carries both JPEG markers (SOI ... EOI)."""
+    return payload.startswith(b"\xff\xd8") and payload.endswith(b"\xff\xd9")
+
+
 def validate_camera_config(config):
     head = config.get("head_camera", {})
     expected = {
@@ -73,6 +114,57 @@ def validate_camera_config(config):
     for name, value in expected.items():
         if head.get(name) != value:
             raise ValueError(f"head_camera.{name}: expected {value!r}, got {head.get(name)!r}")
+
+    # Wrist cameras feed the Vision Pro HUD panels. They may be disabled on PC2
+    # (both transports off) in which case there is nothing to check, but an
+    # enabled stream must be on the ports the panel URLs and recording use.
+    for topic, zmq_port, webrtc_port in (
+        ("left_wrist_camera", 55556, 60002),
+        ("right_wrist_camera", 55557, 60003),
+    ):
+        wrist = config.get(topic)
+        if not wrist:
+            continue
+        if not (wrist.get("enable_zmq") or wrist.get("enable_webrtc")):
+            continue
+        # Either local driver is valid: `uvc` (libuvc) and `v4l2` (kernel driver)
+        # both serve the same 640x480 stream; production moved to v4l2 on
+        # 2026-09-15 because libuvc fought the kernel driver over the device.
+        if wrist.get("type") not in ("uvc", "v4l2"):
+            raise ValueError(f"{topic}.type: expected 'uvc' or 'v4l2', got {wrist.get('type')!r}")
+        expected = {"image_shape": [480, 640]}
+        if wrist.get("enable_zmq"):
+            expected.update({"zmq_port": zmq_port})
+        if wrist.get("enable_webrtc"):
+            expected.update({"webrtc_port": webrtc_port})
+        for name, value in expected.items():
+            if wrist.get(name) != value:
+                raise ValueError(f"{topic}.{name}: expected {value!r}, got {wrist.get(name)!r}")
+
+
+def wrist_topics(config):
+    """[(topic, zmq_port, webrtc_port)] for every wrist stream that is enabled."""
+    selected = []
+    for topic, zmq_port, webrtc_port in (
+        ("left_wrist_camera", 55556, 60002),
+        ("right_wrist_camera", 55557, 60003),
+    ):
+        wrist = config.get(topic) or {}
+        if wrist.get("enable_zmq") or wrist.get("enable_webrtc"):
+            selected.append((topic, zmq_port, webrtc_port))
+    return selected
+
+
+def https_probe(context, port, label):
+    url = f"https://192.168.124.147:{port}/"
+    try:
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=context)
+        )
+        with opener.open(url, timeout=3.0) as response:
+            response.read(1)
+    except (OSError, ValueError) as error:
+        raise RuntimeError(f"WebRTC HTTPS unavailable for {label} at {url}; check the {port} forwarding and r1-teleimager: {error}") from error
 
 
 def check_local_and_https():
@@ -96,21 +188,11 @@ def check_local_and_https():
             listener.bind(("0.0.0.0", 8012))
     except OSError as error:
         raise RuntimeError(f"XR port 8012 unavailable; stop the existing XR process: {error}") from error
-    url = "https://192.168.124.147:60001/"
-    try:
-        opener = urllib.request.build_opener(
-            urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=context)
-        )
-        with opener.open(url, timeout=3.0) as response:
-            response.read(1)
-    except (OSError, ValueError) as error:
-        raise RuntimeError(f"WebRTC HTTPS unavailable at {url}; check 60001 forwarding and r1-teleimager: {error}") from error
+    https_probe(context, 60001, "head stereo")
     print("[OK] eno1, O6 models, XR TLS files, port 8012 and verified WebRTC HTTPS", flush=True)
 
 
 def check_streams():
-    import cv2
-    import numpy as np
     import zmq
     from unitree_sdk2py.core.channel import ChannelFactoryInitialize, ChannelSubscriber
     from unitree_sdk2py.idl.unitree_go.msg.dds_ import MotorStates_
@@ -119,6 +201,7 @@ def check_streams():
 
     context = zmq.Context()
     subscribers = []
+    frame_sockets = []
     try:
         with context.socket(zmq.REQ) as request:
             request.setsockopt(zmq.LINGER, 0)
@@ -127,14 +210,29 @@ def check_streams():
             request.send(b"GET_DATA")
             if not request.poll(3000):
                 raise RuntimeError("camera configuration timed out; check 60000 forwarding and r1-teleimager")
-            validate_camera_config(request.recv_json())
+            camera_config = unwrap_camera_config(request.recv_json())
+            validate_camera_config(camera_config)
         print("[OK] stereo camera configuration (1088x448, RTP 5002/5003)", flush=True)
+        wrist = wrist_topics(camera_config)
+        if wrist:
+            print("[OK] wrist camera configuration: " + ", ".join(
+                f"{topic} (zmq {zmq_port}{', webrtc ' + str(webrtc_port) if (camera_config.get(topic) or {}).get('enable_webrtc') else ''})"
+                for topic, zmq_port, webrtc_port in wrist), flush=True)
+        else:
+            print("[SKIP] wrist cameras are disabled on PC2; the Vision Pro HUD panels stay hidden", flush=True)
         windows = {
             "rt/lowstate (robot feedback on eno1)": StreamWindow(0.25),
             "rt/linker/left/state (left O6 bridge)": StreamWindow(0.25),
             "rt/linker/right/state (right O6 bridge)": StreamWindow(0.25),
             "stereo JPEG (192.168.124.147:55555)": StreamWindow(0.5),
         }
+        # (label, port, expected shape) for every JPEG feed the XR scene consumes.
+        jpeg_feeds = [("stereo JPEG (192.168.124.147:55555)", 55555, (448, 1088, 3))]
+        for topic, zmq_port, _ in wrist:
+            if (camera_config.get(topic) or {}).get("enable_zmq"):
+                label = f"{topic.removesuffix('_camera').replace('_', ' ')} JPEG (192.168.124.147:{zmq_port})"
+                windows[label] = StreamWindow(0.5)
+                jpeg_feeds.append((label, zmq_port, (480, 640, 3)))
         lock = threading.Lock()
         crc = CRC()
 
@@ -157,19 +255,34 @@ def check_streams():
             subscriber = ChannelSubscriber(name.split()[0], LowState_ if index == 0 else MotorStates_)
             subscribers.append(subscriber)
             subscriber.Init(callback(name, index != 0), 1)
-        with context.socket(zmq.SUB) as frames:
-            frames.setsockopt(zmq.LINGER, 0)
-            frames.setsockopt(zmq.CONFLATE, 1)
-            frames.setsockopt(zmq.SUBSCRIBE, b"")
-            frames.connect("tcp://192.168.124.147:55555")
+        socket_feeds = []
+        for label, port, shape in jpeg_feeds:
+            socket_ = context.socket(zmq.SUB)
+            socket_.setsockopt(zmq.LINGER, 0)
+            socket_.setsockopt(zmq.CONFLATE, 1)
+            socket_.setsockopt(zmq.SUBSCRIBE, b"")
+            socket_.connect(f"tcp://192.168.124.147:{port}")
+            socket_feeds.append((label, socket_, shape))
+            frame_sockets.append(socket_)
+        try:
+            decode_jpeg = jpeg_decoder()
+            truncated = {label: [0, 0] for label, _, _ in jpeg_feeds}
             deadline = time.monotonic() + 8.0
-            print("[CHECK] waiting for continuous robot, O6 and stereo feedback (up to 8s)", flush=True)
+            print("[CHECK] waiting for continuous robot, O6 and camera feedback (up to 8s)", flush=True)
+            problems = {}
             while time.monotonic() < deadline:
-                if frames.poll(50):
-                    frame = cv2.imdecode(np.frombuffer(frames.recv(), dtype=np.uint8), cv2.IMREAD_COLOR)
-                    error = None if frame is not None and frame.shape == (448, 1088, 3) else "JPEG missing or not 448x1088x3"
-                    with lock:
-                        windows["stereo JPEG (192.168.124.147:55555)"].observe(time.monotonic(), error=error)
+                for label, socket_, shape in socket_feeds:
+                    if socket_.poll(50):
+                        payload = socket_.recv()
+                        frame = decode_jpeg(payload)
+                        expected = f"{shape[1]}x{shape[0]}"
+                        error = None if frame is not None and frame.shape == shape else f"JPEG missing or not {expected}x3"
+                        if error is None:
+                            truncated[label][1] += 1
+                            if not jpeg_is_complete(payload):
+                                truncated[label][0] += 1
+                        with lock:
+                            windows[label].observe(time.monotonic(), error=error)
                 with lock:
                     now = time.monotonic()
                     problems = {name: window.problem(now) for name, window in windows.items() if window.problem(now)}
@@ -177,8 +290,16 @@ def check_streams():
                         for name, window in windows.items():
                             rate = (window.count - 1) / (window.last - window.first)
                             print(f"[OK] {name}: {rate:.1f} Hz, age {(now - window.last) * 1000:.0f}ms", flush=True)
+                        for label, (short, total) in truncated.items():
+                            if short:
+                                print(f"[WARN] {label}: {short}/{total} frames arrive without the JPEG EOI marker "
+                                      f"(wrist UVC module quirk; turbojpeg decodes them, losing at most the last MCU row)",
+                                      flush=True)
                         return
             raise RuntimeError("stream checks failed:\n" + "\n".join(f"  {name}: {problem}" for name, problem in problems.items()))
+        finally:
+            for socket_ in frame_sockets:
+                socket_.close()
     finally:
         for subscriber in subscribers:
             subscriber.Close()

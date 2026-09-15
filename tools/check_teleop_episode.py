@@ -11,10 +11,35 @@ import cv2
 SOURCE_NAMES = ("image", "xr", "left_hand_tracking", "right_hand_tracking", "robot",
                 "left_hand_feedback", "right_hand_feedback")
 
+# colour key -> the sample.sources entry that must agree with it. color_0 and
+# color_1 are the two halves of the one head stereo frame, so they share the
+# `image` source. color_2/color_3 are the palm cameras and each has its own
+# stream, which is why each carries its own freshness and sequence.
+COLOR_SOURCES = {"color_0": "image", "color_1": "image",
+                 "color_2": "left_wrist_image", "color_3": "right_wrist_image"}
+HEAD_COLOR_KEYS = ("color_0", "color_1")
+CALIBRATION_STATUSES = ("uncalibrated", "partial", "calibrated")
+IMAGE_FIELDS = ("colors", "depths")
+
+# pairing stream name -> the sample.sources entry holding that camera
+ALIGNMENT_SOURCES = {"head": "image", "left_wrist": "left_wrist_image",
+                     "right_wrist": "right_wrist_image"}
+ALIGNMENT_KEYS = ("anchor", "anchor_monotonic_ns", "offset_ms", "skew_ms",
+                  "tolerance_ms", "aligned")
+
 
 def episode_directory(path):
     path = Path(path).resolve()
     return path.parent if path.name == "episode.json" else path
+
+
+def percentile(values, fraction):
+    """Nearest-rank percentile, so the checker stays free of numpy."""
+    if not values:
+        return None
+    ordered = sorted(values)
+    index = min(len(ordered) - 1, max(0, int(round(fraction * (len(ordered) - 1)))))
+    return float(ordered[index])
 
 
 def episode_file(directory, relative):
@@ -32,7 +57,9 @@ def validate_episode(path):
               "error_count": 0, "warnings": [], "excluded_reasons": [], "frames_checked": 0,
               "images_checked": 0, "modes": {}, "tracking_invalid_frames": 0,
               "usable_following_frames": 0, "requires_frame_filtering": True,
-              "command_inactive_frames": 0,
+              "command_inactive_frames": 0, "absent_image_frames": 0,
+              "measured_torque_frames": 0, "calibration_status": None,
+              "camera_alignment_frames": 0, "unaligned_frames": 0,
               "sources": {}, "sampling": {}}
 
     def error(message):
@@ -113,6 +140,75 @@ def validate_episode(path):
     if not isinstance(joint_names, dict):
         error("manifest.info.joint_names: expected an object")
         joint_names = {}
+
+    # Per-colour-key image specs. `info.image` predates the palm cameras and
+    # only ever described the head stereo half, so it cannot size a 640x480
+    # wrist frame; `info.images` is the authoritative roster when present.
+    raw_images = info.get("images")
+    if raw_images is None:
+        color_specs = None
+    elif not isinstance(raw_images, dict) or not raw_images:
+        error("manifest.info.images: expected a non-empty object")
+        color_specs = None
+    else:
+        color_specs = {}
+        for key, spec in raw_images.items():
+            if key not in COLOR_SOURCES:
+                error(f"manifest.info.images.{key}: unknown colour key")
+                continue
+            if not isinstance(spec, dict):
+                error(f"manifest.info.images.{key}: expected an object")
+                continue
+            width, height = spec.get("width"), spec.get("height")
+            if any(type(value) is not int or value <= 0 for value in (width, height)):
+                error(f"manifest.info.images.{key}: expected positive integer width and height")
+                continue
+            color_specs[key] = {"width": width, "height": height}
+        if color_specs and not all(key in color_specs for key in HEAD_COLOR_KEYS):
+            error("manifest.info.images: color_0 and color_1 (the head stereo pair) must both be declared")
+    required_sources = list(SOURCE_NAMES)
+    for key in (color_specs or {}):
+        name = COLOR_SOURCES[key]
+        if name not in required_sources:
+            required_sources.append(name)
+
+    depth_info = info.get("depth")
+    if depth_info is not None:
+        if (not isinstance(depth_info, dict)
+                or any(type(depth_info.get(name)) is not int or depth_info[name] <= 0
+                       for name in ("width", "height"))):
+            error("manifest.info.depth: expected null or positive integer width and height")
+            depth_info = None
+    depth_declared = depth_info is not None
+
+    calibration = info.get("camera_calibration")
+    if calibration is None:
+        report["warnings"].append(
+            "Episode has no info.camera_calibration block; it predates the calibration schema, so nothing "
+            "here says whether the frames can be undistorted, deprojected or aligned.")
+    elif not isinstance(calibration, dict):
+        error("manifest.info.camera_calibration: expected an object")
+    else:
+        status = calibration.get("status")
+        if status not in CALIBRATION_STATUSES:
+            error("manifest.info.camera_calibration.status: expected " + ", ".join(CALIBRATION_STATUSES))
+        else:
+            report["calibration_status"] = status
+            if status == "uncalibrated":
+                report["warnings"].append(
+                    "Cameras were uncalibrated when this episode was recorded: the frames are raw camera "
+                    "output and cannot be undistorted, deprojected or aligned after the fact.")
+            elif status in ("partial", "calibrated"):
+                cameras = calibration.get("cameras")
+                if not isinstance(cameras, dict) or not cameras:
+                    error("manifest.info.camera_calibration.cameras: expected the calibrated camera entries")
+                elif status == "partial":
+                    report["warnings"].append(
+                        "camera_calibration is partial; missing: "
+                        + ", ".join(calibration.get("missing_cameras") or []) + ".")
+        for warning in calibration.get("warnings") or []:
+            report["warnings"].append(f"camera_calibration: {warning}")
+
     if manifest.get("frames") != "frames.jsonl":
         error("manifest.frames: expected frames.jsonl")
     try:
@@ -124,6 +220,7 @@ def validate_episode(path):
 
     previous = {}
     modes = Counter()
+    skew_samples = []
     gap_count = gap_sum = gap_max = gap_abnormal = zero_gaps = 0
     first_ns = last_ns = None
     sources = {}
@@ -142,28 +239,72 @@ def validate_episode(path):
             if type(frame.get("idx")) is not int or frame["idx"] != line_number - 1:
                 error(f"{label}.idx: expected {line_number - 1}, got {frame.get('idx')!r}")
             colors = frame.get("colors")
+            absent_colors = []
             if not isinstance(colors, dict) or not colors:
                 error(f"{label}.colors: expected image paths")
+                colors = {}
             else:
-                for key, relative in colors.items():
+                if color_specs is not None:
+                    missing = sorted(key for key in color_specs if key not in colors)
+                    if missing:
+                        error(f"{label}.colors: missing declared colour keys: {', '.join(missing)}")
+                    extra = sorted(key for key in colors if key not in color_specs)
+                    if extra:
+                        error(f"{label}.colors: colour keys absent from info.images: {', '.join(extra)}")
+                elif not all(key in colors for key in HEAD_COLOR_KEYS):
+                    error(f"{label}.colors: expected the head stereo pair color_0 and color_1")
+            for key, relative in colors.items():
+                spec = (color_specs or {}).get(key)
+                # A null payload means the camera is part of this run but had no
+                # usable frame for this sample. It is only acceptable when the
+                # matching source says so, which is checked once sources parse.
+                if relative is None:
+                    absent_colors.append(key)
+                    continue
+                if not isinstance(relative, str) or not relative:
+                    error(f"{label}.colors.{key}: expected a relative image path or null")
+                    continue
+                try:
+                    image_path = episode_file(directory, relative)
+                    if not image_path.is_file():
+                        raise ValueError("image does not exist")
+                    pixels = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+                    if pixels is None:
+                        raise ValueError("image cannot be decoded")
+                    expected = (spec["width"], spec["height"]) if spec else size
+                    if expected and (pixels.shape[1], pixels.shape[0]) != expected:
+                        raise ValueError(f"image size {(pixels.shape[1], pixels.shape[0])} differs from {expected}")
+                    report["images_checked"] += 1
+                except (OSError, ValueError, cv2.error) as exc:
+                    error(f"{label}.colors.{key}: {exc}")
+            report["absent_image_frames"] += bool(absent_colors)
+            depths = frame.get("depths") or {}
+            if depths and not isinstance(depths, dict):
+                error(f"{label}.depths: expected an object or null")
+                depths = {}
+            if depth_declared and not depths:
+                error(f"{label}.depths: info.depth is declared but this frame carries no depth")
+            elif depths and not depth_declared:
+                error(f"{label}.depths: depth frames present while info.depth is null")
+            else:
+                for key, relative in depths.items():
                     try:
                         image_path = episode_file(directory, relative)
                         if not image_path.is_file():
-                            raise ValueError("image does not exist")
-                        pixels = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
-                        if pixels is None:
-                            raise ValueError("image cannot be decoded")
-                        if size and (pixels.shape[1], pixels.shape[0]) != size:
-                            raise ValueError(f"image size {(pixels.shape[1], pixels.shape[0])} differs from {size}")
+                            raise ValueError("depth image does not exist")
                         report["images_checked"] += 1
-                    except (OSError, ValueError, cv2.error) as exc:
-                        error(f"{label}.colors.{key}: {exc}")
+                    except (OSError, ValueError) as exc:
+                        error(f"{label}.depths.{key}: {exc}")
             for field in ("states", "actions"):
                 values = frame.get(field)
                 if not isinstance(values, dict) or not values:
                     error(f"{label}.{field}: expected non-empty joint states")
                     continue
                 finite(values, f"{label}.{field}")
+                if field == "states":
+                    arms = [values.get("left_arm"), values.get("right_arm")]
+                    report["measured_torque_frames"] += all(
+                        isinstance(arm, dict) and arm.get("torque") for arm in arms)
                 for group, names in joint_names.items():
                     if isinstance(names, list) and names and group not in values:
                         error(f"{label}.{field}.{group}: missing declared joint group")
@@ -181,8 +322,15 @@ def validate_episode(path):
                     qpos = state.get("qpos")
                     if not isinstance(qpos, list) or not qpos:
                         error(f"{label}.{field}.{group}.qpos: expected a non-empty numeric list")
-                    if isinstance(expected, list) and expected and (not isinstance(qpos, list) or len(qpos) != len(expected)):
-                        error(f"{label}.{field}.{group}.qpos: joint count differs from info.joint_names")
+                    if isinstance(expected, list) and expected:
+                        # A present-but-empty vector is how a modality with no
+                        # data (hand torque) is spelled; only a populated vector
+                        # has to match the declared joint count.
+                        for name in ("qpos", "qvel", "torque"):
+                            vector = state.get(name)
+                            if isinstance(vector, list) and vector and len(vector) != len(expected):
+                                error(f"{label}.{field}.{group}.{name}: {len(vector)} values for "
+                                      f"{len(expected)} declared joints")
             sample = frame.get("sample")
             if not isinstance(sample, dict):
                 error(f"{label}.sample: expected an object")
@@ -254,7 +402,7 @@ def validate_episode(path):
             if not isinstance(source_data, dict):
                 error(f"{label}.sample.sources: expected an object")
                 continue
-            for name in SOURCE_NAMES:
+            for name in required_sources:
                 source = source_data.get(name)
                 if not isinstance(source, dict):
                     error(f"{label}.sample.sources.{name}: missing source metadata")
@@ -299,7 +447,83 @@ def validate_episode(path):
                             stats["sequence_repeats"] += sequence == old_sequence
                             stats["sequence_regressions"] += sequence < old_sequence
                         previous[f"sequence:{name}"] = sequence
+            # A colour key and its source entry have to tell the same story: a
+            # null image means the source was not fresh, and a written image
+            # means it was. Otherwise the freshness flags cannot be used to
+            # filter frames.
+            for key in absent_colors:
+                name = COLOR_SOURCES[key]
+                entry = source_data.get(name)
+                if not isinstance(entry, dict) or entry.get("fresh") is not False:
+                    error(f"{label}.colors.{key}: null image needs sample.sources.{name} with fresh=false")
+            for key, relative in colors.items():
+                if relative is None or key not in COLOR_SOURCES:
+                    continue
+                entry = source_data.get(COLOR_SOURCES[key])
+                if isinstance(entry, dict) and entry.get("fresh") is False:
+                    error(f"{label}.colors.{key}: image present while "
+                          f"sample.sources.{COLOR_SOURCES[key]} reports a stale source")
             tracking = ("xr", "left_hand_tracking", "right_hand_tracking")
+            alignment = sample.get("camera_alignment")
+            if alignment is not None:
+                report["camera_alignment_frames"] += 1
+                if not isinstance(alignment, dict):
+                    error(f"{label}.sample.camera_alignment: expected an object or null")
+                else:
+                    missing = [key for key in ALIGNMENT_KEYS if key not in alignment]
+                    if missing:
+                        error(f"{label}.sample.camera_alignment: missing {', '.join(missing)}")
+                    anchor = alignment.get("anchor")
+                    offsets = alignment.get("offset_ms")
+                    skew = alignment.get("skew_ms")
+                    tolerance = alignment.get("tolerance_ms")
+                    if anchor not in ALIGNMENT_SOURCES:
+                        error(f"{label}.sample.camera_alignment.anchor: unknown stream {anchor!r}")
+                    if not isinstance(offsets, dict) or not offsets:
+                        error(f"{label}.sample.camera_alignment.offset_ms: expected per-stream offsets")
+                    else:
+                        for name, value in offsets.items():
+                            if name not in ALIGNMENT_SOURCES:
+                                error(f"{label}.sample.camera_alignment.offset_ms.{name}: unknown stream")
+                            elif type(value) is not float or not math.isfinite(value):
+                                error(f"{label}.sample.camera_alignment.offset_ms.{name}: expected a finite number")
+                        if isinstance(skew, (int, float)) and not isinstance(skew, bool) and offsets:
+                            spread = max(offsets.values()) - min(offsets.values())
+                            if abs(float(skew) - spread) > 0.51:
+                                error(f"{label}.sample.camera_alignment.skew_ms: {skew} disagrees with "
+                                      f"the offset spread {spread:.3f}")
+                            skew_samples.append(float(skew))
+                            report["unaligned_frames"] += alignment.get("aligned") is False
+                            if type(alignment.get("aligned")) is not bool:
+                                error(f"{label}.sample.camera_alignment.aligned: expected a boolean")
+                            elif type(tolerance) in (int, float) and not isinstance(tolerance, bool):
+                                if alignment["aligned"] != (float(skew) <= float(tolerance)):
+                                    error(f"{label}.sample.camera_alignment.aligned: disagrees with "
+                                          f"skew {skew} and tolerance {tolerance}")
+                        # The anchor offset is zero by construction and its receive
+                        # time must be the one the anchor source reported.
+                        if anchor in ALIGNMENT_SOURCES and isinstance(offsets, dict) \
+                                and offsets.get(anchor) not in (0, 0.0):
+                            error(f"{label}.sample.camera_alignment.offset_ms.{anchor}: "
+                                  "the anchor stream must be at offset zero")
+                        anchor_source = source_data.get(ALIGNMENT_SOURCES.get(anchor, ""))
+                        if isinstance(anchor_source, dict) and type(anchor_source.get("received_monotonic_ns")) is int:
+                            if alignment.get("anchor_monotonic_ns") != anchor_source["received_monotonic_ns"]:
+                                error(f"{label}.sample.camera_alignment.anchor_monotonic_ns: disagrees with "
+                                      f"sample.sources.{ALIGNMENT_SOURCES[anchor]}")
+                    # Per-stream offsets live on the sources too; both copies must agree.
+                    for name, source_name in ALIGNMENT_SOURCES.items():
+                        entry = source_data.get(source_name)
+                        if not isinstance(entry, dict) or "offset_ms" not in entry:
+                            continue
+                        value = entry["offset_ms"]
+                        if type(value) is not float or not math.isfinite(value):
+                            error(f"{label}.sample.sources.{source_name}.offset_ms: expected a finite number")
+                        elif isinstance(offsets, dict) and name in offsets and abs(value - offsets[name]) > 1e-6:
+                            error(f"{label}.sample.sources.{source_name}.offset_ms: disagrees with "
+                                  "sample.camera_alignment")
+            elif color_specs and any(key in color_specs for key in ("color_2", "color_3")):
+                error(f"{label}.sample.camera_alignment: missing for a multi-camera sample")
             report["tracking_invalid_frames"] += any(
                 not isinstance(source_data.get(name), dict) or source_data[name].get("fresh") is not True
                 for name in tracking)
@@ -323,7 +547,7 @@ def validate_episode(path):
                 report["command_inactive_frames"] += not commands_active
             report["usable_following_frames"] += commands_active and mode == "following" and all(
                 isinstance(source_data.get(name), dict) and source_data[name].get("fresh") is True
-                for name in SOURCE_NAMES)
+                for name in required_sources)
 
     if report["frames_checked"] == 0:
         error("frames.jsonl: episode has no frames")
@@ -344,6 +568,31 @@ def validate_episode(path):
                           "mean_gap_ms": gap_sum / gap_count / 1e6 if gap_count else None,
                           "gaps_over_1_5_periods": gap_abnormal, "zero_gaps": zero_gaps}
     report["requires_frame_filtering"] = report["usable_following_frames"] != report["frames_checked"]
+    report["camera_alignment"] = {
+        "frames": report["camera_alignment_frames"],
+        "unaligned": report["unaligned_frames"],
+        "skew_ms_p50": percentile(skew_samples, 0.50),
+        "skew_ms_p95": percentile(skew_samples, 0.95),
+        "skew_ms_max": max(skew_samples) if skew_samples else None,
+    } if skew_samples else None
+    if report["unaligned_frames"]:
+        report["warnings"].append(
+            f"{report['unaligned_frames']}/{report['camera_alignment_frames']} samples pair their cameras "
+            f"looser than the tolerance (skew p95 {percentile(skew_samples, 0.95):.1f} ms). The cameras are "
+            "independent devices with no shared trigger; filter on sample.camera_alignment.aligned when a "
+            "tight multi-view correspondence matters."
+        )
+    if report["absent_image_frames"]:
+        report["warnings"].append(
+            f"{report['absent_image_frames']}/{report['frames_checked']} frames are missing at least one camera. "
+            "Their colours entry is null and the matching sample.sources entry has fresh=false, so filter on "
+            "sample.sources before training."
+        )
+    if require_r1_commands and report["frames_checked"] and not report["measured_torque_frames"]:
+        report["warnings"].append(
+            "No measured arm torque in this episode: states.*.torque is empty. Either it was recorded before "
+            "torque logging, or the DDS build exposes no tau_est field."
+        )
     if report["command_inactive_frames"]:
         report["warnings"].append(
             f"Exclude {report['command_inactive_frames']} R1/O6 frames with unpublished, released or expired commands. "

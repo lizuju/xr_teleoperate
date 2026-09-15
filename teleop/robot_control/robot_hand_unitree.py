@@ -409,7 +409,7 @@ class Gripper_JointIndex(IntEnum):
 if __name__ == "__main__":
     import argparse
     from televuer import TeleVuerWrapper
-    from teleimager import ImageClient
+    from teleimager.client import TeleImageClient
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--xr-mode', type=str, choices=['hand', 'controller'], default='hand', help='Select XR device tracking source')
@@ -420,11 +420,18 @@ if __name__ == "__main__":
     ChannelFactoryInitialize(1) # 0 for real robot, 1 for simulation
     
     # image client
-    img_client = ImageClient(host='127.0.0.1') #host='192.168.123.164'
-    if not img_client.has_head_cam():
+    # teleimager 2.x: one client per camera topic, roster from scan().
+    cam_roster, _ = TeleImageClient.scan('127.0.0.1')
+    if 'head_camera' not in cam_roster:
         logger_mp.error("Head camera is required. Please enable head camera on the image server side.")
-    head_img_shape = img_client.get_head_shape()
-    tv_binocular = img_client.head_is_binocular()
+        raise SystemExit(1)
+    head_entry = cam_roster['head_camera']
+    img_client = TeleImageClient(
+        'head_camera', server_host='127.0.0.1',
+        zmq_port=head_entry['zmq_port'], request_bgr=True,
+    )
+    head_img_shape = tuple(head_entry['image_shape'])
+    tv_binocular = bool(head_entry.get('binocular'))
 
     # television: obtain hand pose data from the XR device and transmit the robot's head camera image to the XR device.
     tv_wrapper = TeleVuerWrapper(binocular=tv_binocular, use_hand_tracking=args.xr_mode == "hand", img_shape=head_img_shape, return_hand_rot_data = False)

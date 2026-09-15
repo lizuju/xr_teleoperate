@@ -252,3 +252,109 @@ class R1A7CancelableActivationTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class R1A7VelocityFeedforwardTest(unittest.TestCase):
+    """The servo is fed the target's own velocity instead of dq=0.
+
+    Measured 2026-09-15: with dq=0 the arm delivered only 56-75% of the commanded
+    joint speed even at the best lag, which is what the operator felt as stutter.
+    """
+
+    def setUp(self):
+        self.namespace = load_r1_controller_namespace()
+        self.controller = self.namespace["R1_A7_ArmController"](
+            deferred_activation=True, simulation_mode=True,
+        )
+        self.controller.lowstate_subscriber.Close()
+        self.now = 10.0
+        self.namespace["time"] = SimpleNamespace(
+            monotonic=lambda: self.now, sleep=lambda _: None,
+        )
+        self.state = self.controller.lowstate_buffer.GetData()
+        self.state.monotonic_timestamp = self.now
+        self.controller.msg = FakeLowCmd()
+        self.controller.crc = FakeCRC()
+        self.published = []
+        self.controller.lowcmd_publisher = Mock(Write=self.capture)
+
+    def tearDown(self):
+        self.controller.stop()
+
+    def capture(self, message):
+        self.published.append(
+            (np.array([message.motor_cmd[i].q for i in range(15, 29)], dtype=float),
+             np.array([message.motor_cmd[i].dq for i in range(15, 29)], dtype=float))
+        )
+        self.controller.publish_running = False
+        return True
+
+    def tick(self):
+        self.controller.publish_running = True
+        self.controller._ctrl_motor_state()
+
+    def submit(self, q):
+        self.controller.ctrl_dual_arm_and_head(np.full(14, q), np.zeros(14), [0.0, 0.0])
+
+    def test_target_velocity_is_published_in_dq(self):
+        self.controller.dq_feedforward_filter = 1.0            # no smoothing for the assertion
+        self.submit(0.0)
+        self.now += 0.025
+        self.submit(0.05)                                      # 0.05 rad / 0.025 s = 2 rad/s
+        self.tick()
+        _, dq = self.published[-1]
+        np.testing.assert_allclose(dq, np.full(14, 2.0), rtol=1e-6,
+                                   err_msg="the commanded joint speed must reach the servo as dq")
+
+    def test_feedforward_is_clamped_and_low_passed(self):
+        self.controller.dq_feedforward_filter = 1.0
+        self.controller.dq_feedforward_limit = 1.0
+        self.submit(0.0)
+        self.now += 0.025
+        self.submit(0.25)                                      # 10 rad/s raw -> clamped to 1
+        self.tick()
+        _, dq = self.published[-1]
+        np.testing.assert_allclose(dq, np.full(14, 1.0), rtol=1e-6)
+
+    def test_feedforward_decays_to_zero_when_the_target_stops_arriving(self):
+        self.controller.dq_feedforward_filter = 1.0
+        self.submit(0.0)
+        self.now += 0.025
+        self.submit(0.05)
+        self.tick()
+        self.assertGreater(abs(self.published[-1][1][0]), 0.5)
+        self.now += self.controller.dq_feedforward_timeout + 0.01
+        for _ in range(40):
+            self.now += 0.004
+            self.state.monotonic_timestamp = self.now     # feedback keeps arriving
+            self.tick()
+        _, dq = self.published[-1]
+        self.assertLess(abs(dq[0]), 0.02, "a hold must not keep the last commanded speed running")
+
+    def test_feedforward_can_be_switched_off(self):
+        """--arm-dq-feedforward off must restore the old dq=0 command exactly."""
+        controller = self.namespace["R1_A7_ArmController"](
+            deferred_activation=True, simulation_mode=True, dq_feedforward=False,
+        )
+        controller.lowstate_subscriber.Close()
+        controller.msg = FakeLowCmd()
+        controller.crc = FakeCRC()
+        state = controller.lowstate_buffer.GetData()
+        state.monotonic_timestamp = self.now
+        published = []
+
+        def capture(message):
+            published.append(np.array([message.motor_cmd[i].dq for i in range(15, 29)]))
+            controller.publish_running = False
+            return True
+
+        controller.lowcmd_publisher = Mock(Write=capture)
+        try:
+            self.assertFalse(controller.dq_feedforward_enabled)
+            controller.ctrl_dual_arm_and_head(np.full(14, 0.1), np.zeros(14), [0.0, 0.0])
+            controller.publish_running = True
+            controller._ctrl_motor_state()
+            np.testing.assert_allclose(published[-1], np.zeros(14))
+        finally:
+            controller.publish_running = False
+            controller.stop()

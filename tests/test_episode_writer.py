@@ -98,6 +98,41 @@ class EpisodeWriterTest(unittest.TestCase):
         self.assertEqual(self.frames(1)[0]["idx"], 0)
         self.assertEqual(self.manifest(), first)
 
+    def test_depth_is_declared_only_when_depth_frames_are_recorded(self):
+        writer = self.make_writer(image_size=(544, 448))
+        writer.create_episode()
+        writer.add_item({"color_0": np.zeros((448, 544, 3), dtype=np.uint8)})
+        writer.save_episode(outcome="success")
+        self.wait_until(writer.is_ready)
+        episode = self.directory / "episode_0000"
+        # Advertising depth while every sample carries depths=null makes a
+        # consumer believe a modality exists that was never recorded.
+        self.assertIsNone(self.manifest()["info"]["depth"])
+        self.assertFalse((episode / "depths").exists())
+
+        with_depth = self.make_writer(image_size=(544, 448), depth_size=(544, 448))
+        with_depth.create_episode()
+        with_depth.add_item({"color_0": np.zeros((448, 544, 3), dtype=np.uint8)},
+                            depths={"depth_0": np.zeros((448, 544), dtype=np.uint16)})
+        with_depth.save_episode(outcome="success")
+        self.wait_until(with_depth.is_ready)
+        self.assertEqual(self.manifest(1)["info"]["depth"], {"width": 544, "height": 448, "fps": 30})
+        self.assertTrue((self.directory / "episode_0001" / "depths").is_dir())
+
+    def test_null_colour_keeps_the_key_without_writing_a_file(self):
+        writer = self.make_writer(image_size=(16, 16))
+        pixels = np.full((16, 16, 3), 90, dtype=np.uint8)
+        writer.create_episode()
+        writer.add_item({"color_0": pixels, "color_1": pixels, "color_2": None})
+        writer.save_episode(outcome="success")
+        self.wait_until(writer.is_ready)
+        row = self.frames()[0]
+        self.assertIsNone(row["colors"]["color_2"])
+        self.assertTrue(row["colors"]["color_0"].endswith("_color_0.jpg"))
+        self.assertFalse((self.directory / "episode_0000" / "colors" / "000000_color_2.jpg").exists())
+        self.assertEqual(sorted(path.name for path in (self.directory / "episode_0000" / "colors").iterdir()),
+                         ["000000_color_0.jpg", "000000_color_1.jpg"])
+
     def test_create_and_save_do_not_wait_for_filesystem(self):
         writer = self.make_writer()
         entered, release = self.hold_worker_start(writer)

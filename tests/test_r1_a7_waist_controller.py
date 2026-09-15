@@ -40,12 +40,20 @@ class R1A7WaistControllerTest(unittest.TestCase):
         controller.published_sequence = 0
         controller.published_command = None
         controller.control_dt = 0.004
+        # velocity feed-forward state that __init__ would normally create
+        controller.dq_feedforward_enabled = False
+        controller.dq_feedforward_limit = 6.0
+        controller.dq_feedforward_filter = 0.5
+        controller._dq_feedforward = np.zeros(14)
+        controller._dq_feedforward_previous = None
+        controller._dq_feedforward_previous_at = None
+        controller._dq_feedforward_updated_at = None
         controller.simulation_mode = True
         controller.msg = FakeLowCmd()
         controller.crc = types.SimpleNamespace(Crc=lambda _: 0)
         controller.lowcmd_publisher = types.SimpleNamespace(Write=self.record_command)
         self.lowstate = types.SimpleNamespace(
-            motor_state=[types.SimpleNamespace(q=0.0, dq=0.0) for _ in range(35)],
+            motor_state=[types.SimpleNamespace(q=0.0, dq=0.0, tau_est=0.0) for _ in range(35)],
             monotonic_timestamp=self.now,
             sequence=1,
         )

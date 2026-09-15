@@ -17,7 +17,6 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
 sys.path.append(parent_dir)
 
-from teleimager.image_client import ImageClient
 from teleop.utils.ipc import IPC_Server
 from teleop.robot_control.r1_head_waist import R1HeadWaistFollower, compensate_wrist_for_waist
 from teleop.robot_control.r1_hand_tracking import R1WristHold, hand_tracking_freshness
@@ -155,18 +154,127 @@ def anchored_wrist_target(
     )
     return target
 
+class TeleImagerCameraClient:
+    '''Camera access built on teleimager 2.x ``TeleImageClient``.
+
+    teleimager 2 addressed one ``TeleImageClient`` per camera topic and dropped the
+    old ``ImageClient`` convenience wrapper, so this adapts the 2.x API back onto the
+    shape the main loop already uses. Topic names come from the server roster and are
+    stable (``head_camera`` etc.), so callers keep indexing ``camera_config`` by topic.
+    '''
+
+    def __init__(self, server_host, request_bgr=True, request_port=60000):
+        self.server_host = server_host
+        self.request_bgr = request_bgr
+        self.cameras = {}
+        self.scanned_from_server = False
+        self.camera_config = self._open(request_port=request_port)
+
+    def _open(self, request_port=60000):
+        '''Read the camera roster once and subscribe to every ZMQ-enabled camera.'''
+        from teleimager.client import TeleImageClient
+
+        config, from_server = TeleImageClient.scan(self.server_host, request_port=request_port)
+        if not config:
+            raise RuntimeError(
+                f'teleimager returned no camera configuration from {self.server_host}:{request_port}.'
+            )
+        self.scanned_from_server = bool(from_server)
+        self.cameras = {}
+        for topic, entry in config.items():
+            if not isinstance(entry, dict):
+                raise RuntimeError(f'Camera entry {topic!r} is not a configuration mapping.')
+            if not entry.get('enable_zmq'):
+                continue
+            port = entry.get('zmq_port')
+            if not isinstance(port, int) or port <= 0:
+                raise RuntimeError(f'Camera {topic!r} enables ZMQ without a usable zmq_port.')
+            self.cameras[topic] = TeleImageClient(
+                topic, server_host=self.server_host, zmq_port=port, request_bgr=self.request_bgr,
+            )
+        logger_mp.info(
+            'Teleimager 2.x camera config from %s (%s); streaming %s',
+            self.server_host,
+            'server' if self.scanned_from_server else 'local cache',
+            ', '.join(sorted(self.cameras)) or 'nothing',
+        )
+        return config
+
+    def get_cam_config(self):
+        '''Return the roster keyed by topic, matching the pre-2.x access pattern.'''
+        return self.camera_config
+
+    def get_head_frame(self):
+        return self._frame('head_camera')
+
+    def get_left_wrist_frame(self):
+        return self._frame('left_wrist_camera')
+
+    def get_right_wrist_frame(self):
+        return self._frame('right_wrist_camera')
+
+    def _frame(self, topic):
+        client = self.cameras.get(topic)
+        if client is None:
+            return None
+        return client.get_frame()
+
+    def close(self):
+        for client in self.cameras.values():
+            try:
+                client.close()
+            except Exception as error:
+                logger_mp.warning('Failed to close camera %s: %s', client, error)
+        self.cameras = {}
+
 def rotation_error_rad(actual_rotation, target_rotation):
     cosine = (np.trace(actual_rotation.T @ target_rotation) - 1.0) / 2.0
     return float(np.arccos(np.clip(cosine, -1.0, 1.0)))
 
 def hold_r1_published_targets(arm_ctrl):
     published = arm_ctrl.get_recording_snapshot()["published"]
-    arm_ctrl.ctrl_dual_arm_and_head(
-        np.array(published["arm_q"]),
-        np.array(published["arm_tau"]),
-        np.array(published["head_q"]),
-    )
+    # Before the first successful publication there is nothing to replay, so the
+    # controller's own hold path is the only safe way to keep the pose.
+    if published is not None and published.get("arm_q") is not None:
+        arm_ctrl.ctrl_dual_arm_and_head(
+            np.array(published["arm_q"]),
+            np.array(published["arm_tau"]),
+            np.array(published["head_q"]),
+        )
+    else:
+        arm_ctrl.hold_targets()
     arm_ctrl.hold_waist()
+
+def r1_workspace_saturation(
+    solved_left_pose,
+    solved_right_pose,
+    left_ik_target,
+    right_ik_target,
+    position_limit_m,
+    rotation_limit_rad,
+):
+    '''Return per-side IK shortfall once a target leaves the reachable workspace.
+
+    The solver treats position and orientation as soft costs, so an unreachable
+    target is not an error: the arm silently follows as far as it can. This turns
+    that silent shortfall into a reportable signal.
+    '''
+    sinks = (left_ik_target, right_ik_target)
+    return {
+        side: {
+            "position_m": float(np.linalg.norm(solved[:3, 3] - target[:3, 3])),
+            "rotation_rad": rotation_error_rad(solved[:3, :3], target[:3, :3]),
+            "outside": bool(
+                np.linalg.norm(solved[:3, 3] - target[:3, 3]) > position_limit_m
+                or rotation_error_rad(solved[:3, :3], target[:3, :3]) > rotation_limit_rad
+            ),
+        }
+        for side, solved, target in zip(
+            ("left", "right"),
+            (solved_left_pose, solved_right_pose),
+            sinks,
+        )
+    }
 
 def write_json_line(file, payload, flush=False):
     file.write(json.dumps(payload, separators=(",", ":")) + "\n")
@@ -194,6 +302,29 @@ def acquire_live_writer_lock(live_state_path: Path):
     lock_file.flush()
     return lock_file
 
+def resolve_run_camera_calibration(args, root):
+    """Resolve the camera calibration for this run, or stop before touching robot state.
+
+    A calibration file that was asked for but cannot be trusted must end the run
+    here rather than let a whole collection session record episodes whose
+    geometry is silently wrong. A file found at the default location is held to
+    the same standard: a corrupt one is a defect, not something to skip past.
+    """
+    from teleop.utils.camera_calibration import CalibrationError, resolve_camera_calibration
+    try:
+        path, calibration = resolve_camera_calibration(args.camera_calibration, root=root)
+    except CalibrationError as error:
+        logger_mp.error(f"[CAMERA CALIBRATION] rejected: {error}")
+        raise SystemExit(2)
+    if calibration is None:
+        logger_mp.info("[CAMERA CALIBRATION] none supplied; episodes will declare status=uncalibrated")
+    else:
+        logger_mp.info(
+            f"[CAMERA CALIBRATION] {path} (sha256={calibration['sha256'][:12]}, "
+            f"cameras={', '.join(sorted(calibration['cameras']))})"
+        )
+    return path, calibration
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     # basic control parameters
@@ -212,11 +343,14 @@ if __name__ == '__main__':
     parser.add_argument('--ipc', action = 'store_true', help = 'Enable IPC server to handle input; otherwise enable sshkeyboard')
     parser.add_argument('--hand-only', action='store_true', help='Skip robot arm, IK, and lowcmd initialization')
     parser.add_argument('--dry-run', action='store_true', help='Compute Linker O6 targets without DDS command publishers')
-    parser.add_argument('--tracking-timeout', type=float, default=0.25, help='XR timeout in seconds; R1_A7 hand tracking holds each stale side independently')
+    parser.add_argument('--tracking-timeout', type=float, default=0.5, help="XR timeout in seconds; a hand sample older than this holds the arm. "
+                        "Vision Pro hand events arrive bursty (~30Hz with a long tail), so 0.25 "
+                        "caused frequent false holds that looked like stuttering.")
     parser.add_argument('--linker-o6-urdf-root', type=str, default='/home/hnh/unitree_r1_dev/linkerhand-urdf/O6', help='Official Linker O6 URDF root')
     parser.add_argument('--linker-o6-method', choices=['vector', 'position', 'dexpilot'], default='vector', help='dex-retargeting optimizer for Linker O6')
     parser.add_argument('--linker-o6-live-state', type=str, default=None, help='Atomic JSON target snapshot for isolated Linker O6 simulation')
-    parser.add_argument('--arm-translation-scale', type=float, default=1.1, help='R1_A7 Cartesian translation scale relative to Vision Pro motion')
+    parser.add_argument('--arm-translation-scale', type=float, default=1.0, help='R1_A7 Cartesian translation scale relative to Vision Pro motion; 1.0 keeps the '
+                        'operator motion 1:1, higher values amplify it and reach the workspace edge sooner')
     parser.add_argument('--arm-diagnostic-dir', type=str, default=None, help='Directory for R1_A7 alignment JSONL diagnostics')
     parser.add_argument('--waist-follow', action='store_true', help='R1_A7: sustained head turns drive waist yaw with feedback-based head and arm compensation')
     parser.add_argument('--waist-follow-threshold-deg', type=float, default=12.0, help='Head yaw needed to engage waist following (degrees)')
@@ -229,9 +363,28 @@ if __name__ == '__main__':
     parser.add_argument('--task-goal', type = str, default = 'pick up cube.', help = 'task goal for recording at json file')
     parser.add_argument('--task-desc', type = str, default = 'task description', help = 'task description for recording at json file')
     parser.add_argument('--task-steps', type = str, default = 'step1: do this; step2: do that;', help = 'task steps for recording at json file')
+    parser.add_argument('--arm-diagnostic-hz', type=float, default=10.0, help='R1_A7 alignment JSONL sample rate; lower it to shrink long sessions')
+    parser.add_argument('--workspace-position-tolerance-m', type=float, default=0.05, help='R1_A7: IK position shortfall above which a target counts as outside the reachable workspace')
+    parser.add_argument('--workspace-rotation-tolerance-rad', type=float, default=0.15, help='R1_A7: IK rotation shortfall above which a target counts as outside the reachable workspace')
+    parser.add_argument('--arm-limit-softness', type=float, default=0.1, help='R1_A7: weight of the soft joint-limit barrier that discourages the arm from riding its limits; 0 disables')
+    parser.add_argument('--arm-posture-weight', type=float, default=0.0, help='R1_A7: weight pulling the arm posture toward the activation posture; 0 disables')
+    parser.add_argument('--arm-velocity-limit', type=float, default=30.0, help='R1_A7: safety cap on how fast the published arm POSITION target may move, in rad/s. 30 ~= off; set 3.0 to run in the conservative capped mode instead of the dq feed-forward.')
+    parser.add_argument('--arm-dq-feedforward', choices=['on', 'off'], default='on', help='R1_A7: feed the target velocity into the servo dq field so the arm follows the commanded motion instead of chasing it with start-stop bursts (default on).')
+    parser.add_argument('--arm-dq-limit', type=float, default=6.0, help='R1_A7: clamp on the feed-forward velocity in rad/s (safety net, not a tracking limit).')
+    parser.add_argument('--arm-dq-filter', type=float, default=0.5, help='R1_A7: low-pass factor for the feed-forward velocity derivative, 1.0 = unfiltered.')
+    parser.add_argument('--wrist-display', type=str, choices=['auto', 'both', 'left', 'right', 'off'], default='auto', help='Vision Pro wrist camera panels: auto/both show both sides, left/right show one, off disables them (panels also need the wrist cameras to publish WebRTC on PC2)')
+    parser.add_argument('--wrist-panel-distance', type=float, default=1.2, help='Distance of the wrist panels in front of the eyes, in meters')
+    parser.add_argument('--wrist-panel-offset', type=float, nargs=2, default=[0.40, 0.40], metavar=('X', 'Y'), help='Wrist panel centre offset in meters; X is mirrored per side, Y is downwards')
+    parser.add_argument('--wrist-panel-height', type=float, default=0.26, help='Wrist panel height in meters at --wrist-panel-distance')
+    parser.add_argument('--camera-calibration', type=str, default='', help='Camera calibration JSON to embed in every recorded episode. Defaults to assets/r1/camera_calibration.json when that file exists; an explicitly given path must exist and validate.')
+    parser.add_argument('--camera-sync-tolerance-ms', type=float, default=25.0, help='R1_A7: cross-camera time spread above which a recorded sample is flagged camera_alignment.aligned=false. Samples are still recorded; filter on the flag downstream.')
 
     args = parser.parse_args()
     logger_mp.debug(f"args: {args}")
+
+    # Resolved before any robot state is touched; see resolve_run_camera_calibration.
+    camera_calibration_path, camera_calibration = resolve_run_camera_calibration(
+        args, Path(__file__).resolve().parents[2])
 
     if args.ee == "dex1_internal" and args.motion:
         parser.error("--ee dex1_internal does not currently support --motion.")
@@ -258,6 +411,16 @@ if __name__ == '__main__':
         parser.error("--waist-follow-dwell must be positive.")
     if args.waist_follow and (args.arm != "R1_A7" or args.hand_only or args.dry_run or args.motion):
         parser.error("--waist-follow requires R1_A7 full arm control without --motion.")
+    if not (math.isfinite(args.arm_diagnostic_hz) and args.arm_diagnostic_hz > 0.0):
+        parser.error("--arm-diagnostic-hz must be positive.")
+    if not (math.isfinite(args.workspace_position_tolerance_m) and args.workspace_position_tolerance_m >= 0.0):
+        parser.error("--workspace-position-tolerance-m must be finite and non-negative.")
+    if not (math.isfinite(args.workspace_rotation_tolerance_rad) and args.workspace_rotation_tolerance_rad >= 0.0):
+        parser.error("--workspace-rotation-tolerance-rad must be finite and non-negative.")
+    if not (math.isfinite(args.arm_limit_softness) and args.arm_limit_softness >= 0.0):
+        parser.error("--arm-limit-softness must be finite and non-negative.")
+    if not (math.isfinite(args.arm_posture_weight) and args.arm_posture_weight >= 0.0):
+        parser.error("--arm-posture-weight must be finite and non-negative.")
 
     DRY_RUN_MODE = args.dry_run
     r1_a7_deferred_real = (
@@ -275,6 +438,7 @@ if __name__ == '__main__':
         parser.error("--arm-diagnostic-dir requires real R1_A7, R1_A7 --sim --input-mode hand, or R1_A7 --sim --waist-follow.")
 
     arm_ctrl = None
+    arm_ik = None
     hand_ctrl = None
     linker_o6_loop = None
     motion_switcher = None
@@ -292,6 +456,17 @@ if __name__ == '__main__':
     arm_diagnostic_path = None
     arm_diagnostic_sequence = 0
     arm_diagnostic_next_time = 0.0
+    # Per-iteration loop-jitter accounting. The 10 Hz JSONL sample cannot show a
+    # stall that lasts a few iterations, which is exactly what a stop-and-go arm
+    # feels like, so every iteration feeds this and the summary reports the tail.
+    loop_jitter = {"iterations": 0, "max_ms": 0.0, "over_40ms": 0, "over_80ms": 0,
+                   "worst_at_s": None}
+    loop_jitter_started = None
+    workspace_diagnostic_next_time = 0.0
+    workspace_saturation_events = 0
+    workspace_warned_side = None
+    tracking_hold_events = 0
+    tracking_hold_previous = False
     arm_control_previous_time = None
     dry_run_record_file = None
     linker_o6_retargeter = None
@@ -352,10 +527,36 @@ if __name__ == '__main__':
                 "right_wrist_camera": {"enable_zmq": False},
             }
         else:
-            img_client = ImageClient(host=args.img_server_ip, request_bgr=True)
+            img_client = TeleImagerCameraClient(server_host=args.img_server_ip, request_bgr=True)
             camera_config = img_client.get_cam_config()
             logger_mp.debug(f"Camera config: {camera_config}")
         xr_need_local_img = not (args.display_mode == 'pass-through' or camera_config['head_camera']['enable_webrtc'])
+
+        # Wrist camera panels: one independent HUD panel per side, fed with the
+        # teleimager JPEG frames the recording path already uses. A second WebRTC
+        # element never negotiates on this headset client (measured 2026-09-15:
+        # zero requests to 60002/60003 while the head's own stream connects), so
+        # the panels ride the scene channel as ImageBackground overlays instead.
+        wrist_panels = []
+        if args.display_mode != 'pass-through' and args.wrist_display != 'off':
+            for side, topic in (("left", "left_wrist_camera"), ("right", "right_wrist_camera")):
+                if args.wrist_display not in ('auto', 'both', side):
+                    continue
+                wrist_cfg = camera_config.get(topic) or {}
+                if wrist_cfg.get('enable_zmq'):
+                    wrist_panels.append(side)
+        wrist_image_shape = (camera_config.get('left_wrist_camera') or {}).get('image_shape') or [480, 640]
+        wrist_panel_aspect = float(wrist_image_shape[1]) / float(wrist_image_shape[0])
+        if wrist_panels:
+            logger_mp.info(
+                f"[XR WRIST PANELS] sides={wrist_panels} "
+                f"(height={args.wrist_panel_height:.2f}m distance={args.wrist_panel_distance:.2f}m "
+                f"offset={list(args.wrist_panel_offset)})"
+            )
+        else:
+            logger_mp.info(
+                f"[XR WRIST PANELS] disabled (display={args.display_mode}, wrist_display={args.wrist_display})"
+            )
 
         # televuer_wrapper: obtain hand pose data from the XR device and transmit the robot's head camera image to the XR device.
         from televuer import TeleVuerWrapper
@@ -369,8 +570,31 @@ if __name__ == '__main__':
                                      zmq=camera_config['head_camera']['enable_zmq'],
                                      webrtc=camera_config['head_camera']['enable_webrtc'],
                                      webrtc_url=f"https://{args.img_server_ip}:{camera_config['head_camera']['webrtc_port']}/offer",
+                                     wrist_panels=tuple(wrist_panels),
+                                     wrist_panel_height=args.wrist_panel_height,
+                                     wrist_panel_distance=args.wrist_panel_distance,
+                                     wrist_panel_offset=tuple(args.wrist_panel_offset),
+                                     wrist_panel_aspect=wrist_panel_aspect,
                                      arm_reference_mode="head_yaw"
                                      )
+
+        def grab_wrist_frames():
+            """Fetch the wrist frames the XR panels (and recording) need.
+
+            Called from the pre-start waiting loop as well as the control loop, so
+            the panels are live from the moment the headset page connects instead
+            of only after the operator arms the robot.
+            """
+            left_frame = right_frame = None
+            if camera_config['left_wrist_camera']['enable_zmq'] and (args.record or 'left' in wrist_panels):
+                left_frame = img_client.get_left_wrist_frame()
+                if left_frame is not None and 'left' in wrist_panels:
+                    tv_wrapper.render_wrist_to_xr('left', left_frame.bgr)
+            if camera_config['right_wrist_camera']['enable_zmq'] and (args.record or 'right' in wrist_panels):
+                right_frame = img_client.get_right_wrist_frame()
+                if right_frame is not None and 'right' in wrist_panels:
+                    tv_wrapper.render_wrist_to_xr('right', right_frame.bgr)
+            return left_frame, right_frame
 
         if args.ee == "linker_o6":
             from teleop.robot_control.linker_o6_retargeting import DualLinkerO6Retargeter
@@ -605,11 +829,21 @@ if __name__ == '__main__':
                         motion_mode=args.motion,
                         simulation_mode=args.sim,
                         deferred_activation=True,
+                        arm_velocity_limit=args.arm_velocity_limit,
+                        dq_feedforward=args.arm_dq_feedforward == 'on',
+                        dq_feedforward_limit=args.arm_dq_limit,
+                        dq_feedforward_filter=args.arm_dq_filter,
                     )
                     arm_ik = None
                 else:
                     arm_ik = R1_A7_ArmIK()
-                    arm_ctrl = R1_A7_ArmController(motion_mode=args.motion, simulation_mode=args.sim)
+                    arm_ctrl = R1_A7_ArmController(
+                        motion_mode=args.motion, simulation_mode=args.sim,
+                        arm_velocity_limit=args.arm_velocity_limit,
+                        dq_feedforward=args.arm_dq_feedforward == 'on',
+                        dq_feedforward_limit=args.arm_dq_limit,
+                        dq_feedforward_filter=args.arm_dq_filter,
+                    )
 
         # end-effector
         if args.ee in ("dex3", "inspire_ftp", "inspire_dfx") and args.input_mode == "controller":
@@ -693,7 +927,24 @@ if __name__ == '__main__':
                 image_width //= 2
             if r1_a7_deferred_real and args.ee == "linker_o6":
                 from teleop.utils.r1_capture import R1Capture, capture_metadata
-                metadata = capture_metadata(args, camera_config, linker_o6_retargeter)
+                metadata = capture_metadata(args, camera_config, linker_o6_retargeter, camera_calibration)
+                calibration = metadata["camera_calibration"]
+                logger_mp.info(
+                    f"[RECORD] colour streams: {', '.join(sorted(metadata['images']))} "
+                    f"(color_2/color_3 are the palm cameras)"
+                )
+                if calibration["status"] == "uncalibrated":
+                    logger_mp.warning(
+                        "[RECORD] camera_calibration status=uncalibrated; episodes will carry no intrinsics "
+                        "and can never be undistorted or aligned afterwards."
+                    )
+                else:
+                    logger_mp.info(
+                        f"[RECORD] camera_calibration status={calibration['status']} "
+                        f"cameras={', '.join(sorted(calibration['cameras']))}"
+                    )
+                for warning in calibration["warnings"]:
+                    logger_mp.warning(f"[RECORD] camera_calibration: {warning}")
             recorder = EpisodeWriter(task_dir = os.path.join(args.task_dir, args.task_name),
                                      task_goal = args.task_goal,
                                      task_desc = args.task_desc,
@@ -748,6 +999,263 @@ if __name__ == '__main__':
                 head_img = img_client.get_head_frame()
                 if head_img.bgr is not None:
                     tv_wrapper.render_to_xr(head_img.bgr)
+            grab_wrist_frames()
+
+            if r1_a7_anchored and ARM_REQUEST_GENERATION > r1_arm_request_floor:
+                r1_arm_request_floor = ARM_REQUEST_GENERATION
+                r1_start_requested = True
+                START = False
+                if not r1_activation_prepared:
+                    logger_mp.info("[R1 STARTUP] Start requested; waiting for fresh hands before recentering. [q] cancels.")
+
+            if r1_activation_prepared:
+                # Waiting for XR is allowed; stale robot feedback is not.
+                arm_ctrl.get_current_waist_yaw()
+                startup_tele_data = tv_wrapper.get_tele_data()
+                startup_now = time.monotonic()
+                startup_timestamp = startup_tele_data.motion_data_timestamp
+                if (
+                    not is_fresh_motion_data(startup_tele_data, args.tracking_timeout, now=startup_now)
+                    or startup_timestamp <= r1_startup_sample_floor
+                ):
+                    if r1_startup_tracking_ready:
+                        logger_mp.warning("[R1 STARTUP] Tracking lost; holding posture and waiting for both hands. No recentering.")
+                    r1_startup_fresh_since = None
+                    r1_startup_last_timestamp = 0.0
+                    r1_startup_fresh_samples = 0
+                    r1_startup_tracking_ready = False
+                    START = False
+                else:
+                    if startup_timestamp > r1_startup_last_timestamp:
+                        if r1_startup_fresh_since is None:
+                            r1_startup_fresh_since = startup_now
+                        r1_startup_last_timestamp = startup_timestamp
+                        r1_startup_fresh_samples += 1
+                    if not r1_startup_tracking_ready:
+                        START = False
+                        if startup_now - r1_startup_fresh_since >= 0.35 and r1_startup_fresh_samples >= 5:
+                            r1_startup_tracking_ready = True
+                            logger_mp.info("[R1 STARTUP] Both hands stable; automatically starting following. No additional key or recentering.")
+
+            if (
+                r1_a7_anchored
+                and r1_start_requested
+                and (not r1_activation_prepared or r1_startup_tracking_ready)
+            ):
+                r1_arm_request_floor = ARM_REQUEST_GENERATION
+                START = False
+                reference_tele_data = tv_wrapper.get_tele_data()
+                if not is_fresh_motion_data(
+                    reference_tele_data,
+                    args.tracking_timeout,
+                ):
+                    r1_startup_fresh_since = None
+                    r1_startup_last_timestamp = 0.0
+                    r1_startup_fresh_samples = 0
+                    r1_startup_tracking_ready = False
+                    continue
+                if not r1_activation_prepared:
+                    if args.ee == "linker_o6":
+                        from teleop.robot_control.robot_hand_linker_o6 import LinkerO6Controller
+                        hand_ctrl = LinkerO6Controller()
+                        hand_ctrl.wait_until_ready(timeout=3.0)
+                        if STOP:
+                            continue
+                    if r1_a7_deferred_real:
+                        motion_switcher = MotionSwitcher()
+                        status, result = motion_switcher.Enter_Debug_Mode()
+                        if status != 0:
+                            raise RuntimeError(
+                                f"R1_A7 failed to enter debug mode: status={status}, result={result}"
+                            )
+                    try:
+                        arm_ctrl.defer_publishing()
+                        arm_ctrl.activate(cancel_requested=lambda: STOP)
+                    except InterruptedError:
+                        if STOP:
+                            continue
+                        raise
+                    if STOP:
+                        continue
+                    post_recenter_motor_q = arm_ctrl.get_current_motor_q()
+                    r1_waist_yaw_reference = float(post_recenter_motor_q[13])
+                    arm_ik = R1_A7_ArmIK(waist_yaw=r1_waist_yaw_reference)
+                    # Prefer the posture the operator actually started from, and let the
+                    # soft barrier keep the solver off the joint limits during long sessions.
+                    arm_ik.set_redundancy_weights(
+                        posture_weight=args.arm_posture_weight,
+                        limit_weight=args.arm_limit_softness,
+                        nominal_arm_q=post_recenter_motor_q[:14],
+                    )
+                    if args.arm_limit_softness > 0.0:
+                        logger_mp.info(
+                            "[R1 IK] redundancy terms: limit_softness=%.3g posture_weight=%.3g "
+                            "nominal=activation posture",
+                            args.arm_limit_softness, args.arm_posture_weight,
+                        )
+                    arm_ctrl.start_publishing()
+                    r1_waist_to_root = np.array([
+                        [math.cos(r1_waist_yaw_reference), -math.sin(r1_waist_yaw_reference), 0.0],
+                        [math.sin(r1_waist_yaw_reference), math.cos(r1_waist_yaw_reference), 0.0],
+                        [0.0, 0.0, 1.0],
+                    ])
+                    initial_head_yaw_reference = head_yaw_rotation(reference_tele_data.head_pose)
+                    initial_head_pose_reference = reference_tele_data.head_pose.copy()
+                    vision_left_initial = reference_tele_data.left_wrist_pose.copy()
+                    vision_right_initial = reference_tele_data.right_wrist_pose.copy()
+                    if getattr(args, "startup_wrist_align", False):
+                        current_q = arm_ctrl.get_current_dual_arm_q()
+                        current_dq = arm_ctrl.get_current_dual_arm_dq()
+                        robot_left_pose, robot_right_pose = arm_ik.forward_wrist_poses(current_q)
+                        left_initial_pose = wrist_in_reference_head_yaw_frame(
+                            vision_left_initial,
+                            initial_head_pose_reference,
+                            initial_head_yaw_reference,
+                            initial_head_pose_reference[:3, 3],
+                        )
+                        right_initial_pose = wrist_in_reference_head_yaw_frame(
+                            vision_right_initial,
+                            initial_head_pose_reference,
+                            initial_head_yaw_reference,
+                            initial_head_pose_reference[:3, 3],
+                        )
+                        left_align_target = robot_left_pose.copy()
+                        right_align_target = robot_right_pose.copy()
+                        left_align_target[:3, :3] = left_initial_pose[:3, :3]
+                        right_align_target[:3, :3] = right_initial_pose[:3, :3]
+                        arm_ik.reset_smoothing(reference_q=current_q)
+                        align_q, align_tau = arm_ik.solve_ik(
+                            left_align_target,
+                            right_align_target,
+                            current_q,
+                            current_dq,
+                            raise_on_failure=True,
+                        )
+                        arm_ctrl.ctrl_dual_arm(align_q, align_tau)
+                        align_deadline = time.monotonic() + 8.0
+                        align_next_ik = time.monotonic() + 0.1
+                        while time.monotonic() < align_deadline and not STOP:
+                            now = time.monotonic()
+                            if now >= align_next_ik:
+                                current_align_q = arm_ctrl.get_current_dual_arm_q()
+                                current_align_dq = arm_ctrl.get_current_dual_arm_dq()
+                                align_q, align_tau = arm_ik.solve_ik(
+                                    left_align_target,
+                                    right_align_target,
+                                    current_align_q,
+                                    current_align_dq,
+                                    raise_on_failure=True,
+                                )
+                                align_next_ik = now + 0.1
+                            arm_ctrl.ctrl_dual_arm(align_q, align_tau)
+                            current_align_q = arm_ctrl.get_current_dual_arm_q()
+                            current_left_pose, current_right_pose = arm_ik.forward_wrist_poses(current_align_q)
+                            left_position_error = np.linalg.norm(
+                                current_left_pose[:3, 3] - left_align_target[:3, 3]
+                            )
+                            right_position_error = np.linalg.norm(
+                                current_right_pose[:3, 3] - right_align_target[:3, 3]
+                            )
+                            left_rotation_error = rotation_error_rad(
+                                current_left_pose[:3, :3], left_align_target[:3, :3]
+                            )
+                            right_rotation_error = rotation_error_rad(
+                                current_right_pose[:3, :3], right_align_target[:3, :3]
+                            )
+                            if (
+                                max(left_position_error, right_position_error) <= 0.02
+                                and max(left_rotation_error, right_rotation_error) <= 0.12
+                            ):
+                                break
+                            time.sleep(0.02)
+                        if STOP:
+                            continue
+                        aligned_q = arm_ctrl.get_current_dual_arm_q()
+                        aligned_left_pose, aligned_right_pose = arm_ik.forward_wrist_poses(aligned_q)
+                        aligned_position_error = max(
+                            np.linalg.norm(aligned_left_pose[:3, 3] - left_align_target[:3, 3]),
+                            np.linalg.norm(aligned_right_pose[:3, 3] - right_align_target[:3, 3]),
+                        )
+                        aligned_rotation_error = max(
+                            rotation_error_rad(aligned_left_pose[:3, :3], left_align_target[:3, :3]),
+                            rotation_error_rad(aligned_right_pose[:3, :3], right_align_target[:3, :3]),
+                        )
+                        if aligned_position_error > 0.02 or aligned_rotation_error > 0.12:
+                            logger_mp.warning(
+                                "[R1 STARTUP] Absolute wrist alignment was not reachable; "
+                                f"position_error_m={aligned_position_error:.3f} "
+                                f"rotation_error_rad={aligned_rotation_error:.3f}; "
+                                "continuing from the current robot posture."
+                            )
+                        else:
+                            logger_mp.info("[R1 STARTUP] Wrist orientation aligned to initial Vision Pro pose.")
+                    if STOP:
+                        continue
+                    r1_activation_prepared = True
+                    r1_startup_sample_floor = time.monotonic()
+                    r1_arm_request_floor = ARM_REQUEST_GENERATION
+                    logger_mp.info(
+                        "[R1 STARTUP] Recenter and IK ready. Holding posture; waiting for both hands, "
+                        "following will start automatically once tracking is stable. [q] exits."
+                    )
+                    continue
+                activation_motor_q = arm_ctrl.get_current_motor_q()
+                if abs(float(activation_motor_q[13]) - r1_waist_yaw_reference) > 0.02:
+                    raise RuntimeError(
+                        "R1_A7 waist changed while IK was loading; command output has been stopped."
+                    )
+                current_lr_arm_q = arm_ctrl.get_current_dual_arm_q()
+                (
+                    r1_robot_left_reference,
+                    r1_robot_right_reference,
+                ) = arm_ik.forward_wrist_poses(current_lr_arm_q)
+                r1_vision_left_reference = reference_tele_data.left_wrist_pose.copy()
+                r1_vision_right_reference = reference_tele_data.right_wrist_pose.copy()
+                r1_head_yaw_reference = head_yaw_rotation(reference_tele_data.head_pose)
+                r1_head_pose_reference = reference_tele_data.head_pose.copy()
+                if args.waist_follow:
+                    waist_follower = R1HeadWaistFollower(
+                        r1_waist_yaw_reference,
+                        time.monotonic(),
+                        args.tracking_timeout,
+                        math.radians(getattr(args, "waist_follow_threshold_deg", 12.0)),
+                        getattr(args, "waist_follow_dwell", 0.2),
+                    )
+                    logger_mp.info(
+                        f"R1_A7 head/waist following enabled: {args.waist_follow_threshold_deg:g} deg for "
+                        f"{args.waist_follow_dwell:g} s to engage, "
+                        "0.35 rad/s waist speed, URDF waist range +/-2.618 rad."
+                    )
+                if STOP:
+                    continue
+                if args.ee == "linker_o6":
+                    hand_ctrl.activate()
+                if arm_diagnostic_file is not None:
+                    write_json_line(arm_diagnostic_file, {
+                        "schema": "r1_a7_alignment_v1",
+                        "event": "activation",
+                        "wall_time_ns": time.time_ns(),
+                        "monotonic_time_ns": time.monotonic_ns(),
+                        "translation_scale": args.arm_translation_scale,
+                        "official_head_waist_recenter": True,
+                        "waist_follow": args.waist_follow,
+                        "waist_yaw_rad": r1_waist_yaw_reference,
+                        "waist_to_root": r1_waist_to_root.tolist(),
+                        "head_pose_reference": reference_tele_data.head_pose.tolist(),
+                        "head_yaw_reference": r1_head_yaw_reference.tolist(),
+                        "vision_left_reference": r1_vision_left_reference.tolist(),
+                        "vision_right_reference": r1_vision_right_reference.tolist(),
+                        "robot_left_reference": r1_robot_left_reference.tolist(),
+                        "robot_right_reference": r1_robot_right_reference.tolist(),
+                        "motor_q_reference": activation_motor_q.tolist(),
+                    }, flush=True)
+                START = True
+                logger_mp.info(
+                    "R1_A7 activated from live posture; Vision heading and wrist references captured."
+                )
+
+        if STOP:
+            raise SystemExit(0)
 
             if r1_a7_anchored and ARM_REQUEST_GENERATION > r1_arm_request_floor:
                 r1_arm_request_floor = ARM_REQUEST_GENERATION
@@ -1026,8 +1534,24 @@ if __name__ == '__main__':
             linker_o6_loop.start()
 
         if args.record and r1_a7_deferred_real and args.ee == "linker_o6":
+            # The palm cameras are recorded on the same samples as the head
+            # stereo. Their streams are independent and run at ~28-29 fps
+            # against this 30 Hz loop, so a repeated frame is normal; a stream
+            # that never delivers fails the episode instead of silently
+            # producing an episode without its wrist observation.
+            wrist_image_shapes = {
+                side: camera_config[f"{side}_wrist_camera"]["image_shape"]
+                for side in ("left", "right")
+                if (camera_config.get(f"{side}_wrist_camera") or {}).get("enable_zmq")
+            }
             r1_capture = R1Capture(arm_ctrl, hand_ctrl, linker_o6_loop,
-                                   args.tracking_timeout, camera_config['head_camera']['image_shape'])
+                                   args.tracking_timeout, camera_config['head_camera']['image_shape'],
+                                   wrist_image_shapes=wrist_image_shapes,
+                                   sync_tolerance_ms=args.camera_sync_tolerance_ms)
+            logger_mp.info(
+                f"[RECORD] camera sync: nearest frame to the head frame, "
+                f"tolerance {args.camera_sync_tolerance_ms:.1f} ms"
+            )
 
         # main loop. robot start to follow VR user's motion
         while not STOP:
@@ -1048,18 +1572,37 @@ if __name__ == '__main__':
                 else 1000.0 * (loop_monotonic - arm_control_previous_time)
             )
             arm_control_previous_time = loop_monotonic
+            if loop_period_ms is not None:
+                loop_jitter["iterations"] += 1
+                if loop_jitter_started is None:
+                    loop_jitter_started = loop_monotonic
+                if loop_period_ms > loop_jitter["max_ms"]:
+                    loop_jitter["max_ms"] = loop_period_ms
+                    loop_jitter["worst_at_s"] = loop_monotonic - loop_jitter_started
+                if loop_period_ms > 40.0:
+                    loop_jitter["over_40ms"] += 1
+                if loop_period_ms > 80.0:
+                    loop_jitter["over_80ms"] += 1
+                    # Report a real stall while it happens instead of only at exit.
+                    logger_mp.warning(
+                        "[R1 LOOP STALL] iteration took %.0f ms (budget %.0f ms); "
+                        "capture_mode=%s tracking_hold=%s",
+                        loop_period_ms, 1000.0 / args.frequency,
+                        capture_mode, tracking_hold_active,
+                    )
             # get image
             if camera_config['head_camera']['enable_zmq']:
                 if args.record or xr_need_local_img:
                     head_img = img_client.get_head_frame()
                 if xr_need_local_img and head_img.bgr is not None:
                     tv_wrapper.render_to_xr(head_img.bgr)
-            if camera_config['left_wrist_camera']['enable_zmq']:
-                if args.record:
-                    left_wrist_img = img_client.get_left_wrist_frame()
-            if camera_config['right_wrist_camera']['enable_zmq']:
-                if args.record:
-                    right_wrist_img = img_client.get_right_wrist_frame()
+            # The panels need the frames even when recording is off; the fetch is a
+            # cached ring-buffer read (measured 0.002 ms) plus one resize.
+            left_wrist_img, right_wrist_img = grab_wrist_frames()
+            if r1_capture is not None:
+                # Keep the pairing history warm while not recording, so the first
+                # sample of an episode already has frames to choose between.
+                r1_capture.observe(head_img, {"left": left_wrist_img, "right": right_wrist_img})
 
             # record mode
             if args.record:
@@ -1223,6 +1766,13 @@ if __name__ == '__main__':
             # get current robot state data.
             current_lr_arm_q  = arm_ctrl.get_current_dual_arm_q()
             current_lr_arm_dq = arm_ctrl.get_current_dual_arm_dq()
+            # Measured torque, when the controller exposes it. A missing getter must
+            # not break the loop, so this degrades to None.
+            tau_getter = getattr(arm_ctrl, "get_current_dual_arm_tau", None)
+            try:
+                arm_tau_actual = None if tau_getter is None else tau_getter()
+            except RuntimeError:
+                arm_tau_actual = None
 
             # solve ik using motor data and wrist pose, then use ik results to control arms.
             time_ik_start = time.time()
@@ -1324,6 +1874,11 @@ if __name__ == '__main__':
                 tracking_hold_active = True
                 capture_mode = "tracking_hold"
                 run_motion = False
+            # Count hold transitions once per event; a long single-side loss is one
+            # event, not thousands of frames, so the exit summary stays readable.
+            if tracking_hold_active and not tracking_hold_previous:
+                tracking_hold_events += 1
+            tracking_hold_previous = tracking_hold_active
             if linker_o6_loop is not None:
                 linker_o6_loop.raise_if_failed()
             if STOP:
@@ -1393,8 +1948,32 @@ if __name__ == '__main__':
                     )
                 if not run_motion:
                     left_wrist_target, right_wrist_target = solved_left_pose.copy(), solved_right_pose.copy()
+                # The solver reports position/orientation as soft costs, so an
+                # unreachable target silently under-follows. Surface it instead.
+                workspace_saturation = r1_workspace_saturation(
+                    solved_left_pose, solved_right_pose, left_ik_target, right_ik_target,
+                    args.workspace_position_tolerance_m, args.workspace_rotation_tolerance_rad,
+                )
+                workspace_outside = tuple(
+                    side for side, item in workspace_saturation.items() if item["outside"]
+                )
+                if workspace_outside and diagnostic_now >= workspace_diagnostic_next_time:
+                    workspace_diagnostic_next_time = diagnostic_now + 1.0
+                    logger_mp.warning(
+                        "[R1 WORKSPACE] %s target is outside the reachable workspace; "
+                        "the arm is following as far as it can. shortfall position=%.3f m rotation=%.2f rad. "
+                        "Move closer to the body or lower --arm-translation-scale.",
+                        "/".join(workspace_outside),
+                        max(workspace_saturation[side]["position_m"] for side in workspace_outside),
+                        max(workspace_saturation[side]["rotation_rad"] for side in workspace_outside),
+                    )
+                    if workspace_warned_side != workspace_outside:
+                        workspace_saturation_events += 1
+                        workspace_warned_side = workspace_outside
+                elif not workspace_outside:
+                    workspace_warned_side = None
                 arm_diagnostic_sequence += 1
-                arm_diagnostic_next_time = diagnostic_now + 0.1
+                arm_diagnostic_next_time = diagnostic_now + 1.0 / args.arm_diagnostic_hz
                 write_json_line(arm_diagnostic_file, {
                     "schema": "r1_a7_alignment_v1",
                     "event": "sample",
@@ -1427,6 +2006,9 @@ if __name__ == '__main__':
                     "q_actual": current_lr_arm_q.tolist(),
                     "dq_actual": current_lr_arm_dq.tolist(),
                     "q_ik_command": sol_q.tolist(),
+                    "tau_ik_command": sol_tauff.tolist(),
+                    "tau_actual": arm_tau_actual.tolist() if arm_tau_actual is not None else None,
+                    "workspace": workspace_saturation,
                     "actual_left_pose": actual_left_pose.tolist(),
                     "actual_right_pose": actual_right_pose.tolist(),
                     "solved_left_pose": solved_left_pose.tolist(),
@@ -1445,7 +2027,9 @@ if __name__ == '__main__':
             # record data
             if args.record and r1_capture is not None:
                 if RECORD_RUNNING:
-                    recorder.add_item(**r1_capture.frame(tele_data, head_img, capture_mode))
+                    recorder.add_item(**r1_capture.frame(
+                        tele_data, head_img, capture_mode,
+                        {"left": left_wrist_img, "right": right_wrist_img}))
             elif args.record:
                 # dex hand or gripper
                 if args.ee == "dex3" and args.input_mode == "hand":
@@ -1619,6 +2203,28 @@ if __name__ == '__main__':
         active_exception = sys.exc_info()[1]
         if isinstance(active_exception, SystemExit) and active_exception.code not in (None, 0):
             exit_code = active_exception.code if isinstance(active_exception.code, int) else 1
+        try:
+            # One readable line per session: a long single-side tracking loss is
+            # otherwise only visible by digging through the alignment JSONL.
+            if r1_a7_anchored and arm_ik is not None:
+                logger_mp.info(
+                    "[R1 SESSION SUMMARY] tracking_holding_events=%d workspace_saturation_events=%d "
+                    "diagnostic_samples=%d. A hold event means at least one hand lost tracking; "
+                    "the arm kept its last pose until tracking returned.",
+                    tracking_hold_events, workspace_saturation_events, arm_diagnostic_sequence,
+                )
+                # A stop-and-go arm shows up here as iterations that missed the loop
+                # budget, not as a change in the 10 Hz diagnostic averages.
+                logger_mp.info(
+                    "[R1 LOOP JITTER] budget=%.1fms max=%.1fms over_40ms=%d over_80ms=%d "
+                    "worst_at=%.1fs of %d iterations",
+                    1000.0 / args.frequency, loop_jitter["max_ms"],
+                    loop_jitter["over_40ms"], loop_jitter["over_80ms"],
+                    loop_jitter["worst_at_s"] if loop_jitter["worst_at_s"] is not None else -1.0,
+                    loop_jitter["iterations"],
+                )
+        except Exception as e:
+            logger_mp.warning(f"Failed to write session summary: {e}")
         try:
             if linker_o6_loop is not None:
                 linker_o6_loop.stop()

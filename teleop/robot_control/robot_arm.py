@@ -33,6 +33,7 @@ class MotorState:
     def __init__(self):
         self.q = None
         self.dq = None
+        self.tau = None
 
 class G1_29_LowState:
     def __init__(self):
@@ -2043,7 +2044,27 @@ class R1_A5_JointIndex(IntEnum):
     kNotUsedJoint3 = 34
 
 class R1_A7_ArmController:
-    def __init__(self, motion_mode = False, simulation_mode = False, deferred_activation = False):
+    # The published joint target is rate-limited to this many rad/s. The arm's own
+    # servo loop saturates around 1.6-2.7 rad/s (measured 2026-09-15 from the
+    # alignment diagnostics: commanded targets reached 5-11 rad/s, so 42-58% of
+    # moving frames asked for more than 1.5x what the hardware delivered, which is
+    # what the operator feels as the arm stuttering).
+    # Safety cap on how far the published position target may move per publish cycle
+    # (30 rad/s = effectively off, see --arm-velocity-limit).
+    default_arm_velocity_limit = 30.0
+
+    # Velocity feed-forward defaults: the servo's own capability measured around
+    # 1.6-2.7 rad/s (2026-09-15 diagnostics), so 6 rad/s is a safety clamp, not a
+    # tracking limit; the filter keeps a noisy Vision Pro derivative from buzzing.
+    default_dq_feedforward = True
+    default_dq_feedforward_limit = 6.0
+    default_dq_feedforward_filter = 0.5
+    dq_feedforward_timeout = 0.10
+    dq_feedforward_decay = 0.85
+
+    def __init__(self, motion_mode = False, simulation_mode = False, deferred_activation = False,
+                 arm_velocity_limit = None, dq_feedforward = None,
+                 dq_feedforward_limit = None, dq_feedforward_filter = None):
         logger_mp.info("Initialize R1_A7_ArmController...")
         if motion_mode:
             raise ValueError("R1_A7_ArmController does not support motion mode.")
@@ -2080,8 +2101,38 @@ class R1_A7_ArmController:
         self.kd_head = 1.0
 
         self.all_motor_q = None
-        self.set_arm_velocity_limit()
+        self.set_arm_velocity_limit(
+            self.default_arm_velocity_limit if arm_velocity_limit is None else arm_velocity_limit
+        )
+        self.dq_feedforward_enabled = bool(
+            self.default_dq_feedforward if dq_feedforward is None else dq_feedforward
+        )
+        self.dq_feedforward_limit = float(
+            self.default_dq_feedforward_limit if dq_feedforward_limit is None else dq_feedforward_limit
+        )
+        self.dq_feedforward_filter = float(
+            self.default_dq_feedforward_filter if dq_feedforward_filter is None else dq_feedforward_filter
+        )
+        if not np.isfinite(self.dq_feedforward_limit) or self.dq_feedforward_limit <= 0.0:
+            raise ValueError("dq_feedforward_limit must be a positive finite value.")
+        if not np.isfinite(self.dq_feedforward_filter) or not 0.0 < self.dq_feedforward_filter <= 1.0:
+            raise ValueError("dq_feedforward_filter must be inside (0, 1].")
+        self._dq_feedforward = np.zeros(14)
+        self._dq_feedforward_previous = None
+        self._dq_feedforward_previous_at = None
+        self._dq_feedforward_updated_at = None
         self.control_dt = 1.0 / 250.0
+        logger_mp.info(
+            f"[R1_A7_ArmController] published arm target speed limit: "
+            f"{self.arm_velocity_limit:.2f} rad/s ({self.arm_velocity_limit * self.control_dt:.4f} rad per publish cycle)"
+        )
+        logger_mp.info(
+            f"[R1_A7_ArmController] velocity feed-forward (dq): "
+            f"{'on' if self.dq_feedforward_enabled else 'off'} "
+            f"limit={self.dq_feedforward_limit:.2f} rad/s "
+            f"filter={self.dq_feedforward_filter:.2f} "
+            f"hold-timeout={self.dq_feedforward_timeout:.2f} s"
+        )
 
         self.ctrl_lock = threading.Lock()
         self.lifecycle_lock = threading.Lock()
@@ -2187,9 +2238,32 @@ class R1_A7_ArmController:
     def defer_publishing(self):
         self.defer_publisher_start = True
 
+    def _wait_for_fresh_feedback(self, timeout=2.0):
+        """Block until the lowstate buffer holds a sample inside the feedback window.
+
+        Loading the IK model blocks the DDS executor for about a second, so the buffer
+        can still hold a pre-load sample when the publisher starts. Waiting here keeps
+        the first clip step from being judged stale and latching a fatal failure.
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            lowstate = self.lowstate_buffer.GetData()
+            if lowstate is not None and lowstate.monotonic_timestamp is not None:
+                age = time.monotonic() - lowstate.monotonic_timestamp
+                if np.isfinite(age) and 0.0 <= age <= self.feedback_timeout:
+                    return
+            if time.monotonic() >= deadline:
+                logger_mp.warning(
+                    "R1-A7 motor feedback did not refresh within %.1fs before publishing; "
+                    "starting anyway and relying on the publish watchdog.", timeout,
+                )
+                return
+            time.sleep(0.005)
+
     def start_publishing(self):
         if self.publish_running:
             return
+        self._wait_for_fresh_feedback()
         self.publish_running = True
         self.publish_thread = threading.Thread(target=self._ctrl_motor_state)
         self.publish_thread.daemon = True
@@ -2198,6 +2272,18 @@ class R1_A7_ArmController:
     def _subscribe_motor_state(self, msg):
         if not self.subscribe_running:
             return
+        try:
+            self._ingest_motor_state(msg)
+        except Exception as error:
+            # A raising DDS callback kills the reader thread, which then only
+            # shows up 5s later as an opaque "Failed to subscribe dds" timeout
+            # and aborts startup. Log it here instead, rate-limited.
+            now = time.monotonic()
+            if now - getattr(self, "_last_lowstate_error_log", 0.0) >= 1.0:
+                logger_mp.error(f"[R1_A7_ArmController] Failed to parse motor state: {error}")
+                self._last_lowstate_error_log = now
+
+    def _ingest_motor_state(self, msg):
         self.lowstate_sequence += 1
         lowstate = R1_A7_LowState(
             mode_machine=msg.mode_machine,
@@ -2207,6 +2293,14 @@ class R1_A7_ArmController:
         for id in range(R1_A7_Num_Motors):
             lowstate.motor_state[id].q = msg.motor_state[id].q
             lowstate.motor_state[id].dq = msg.motor_state[id].dq
+            # Measured joint torque: needed to tell an ineffective feed-forward
+            # apart from a torque-limited (saturated) shoulder. The DDS field is
+            # `tau_est` (unitree_hg MotorState_: mode, q, dq, ddq, tau_est,
+            # temperature, vol, sensor, motorstate, reserve) — reading `.tau`
+            # raised AttributeError inside the DDS reader thread, which killed
+            # the subscription and timed out ArmController startup.
+            # getattr keeps that thread alive on SDK builds without the field.
+            lowstate.motor_state[id].tau = getattr(msg.motor_state[id], "tau_est", 0.0)
         self.lowstate_buffer.SetData(lowstate)
         self.lowstate_sub_ready = True
 
@@ -2261,15 +2355,40 @@ class R1_A7_ArmController:
                 waist_target_sequence = self.waist_target_sequence
                 waist_hold_requested = self.waist_hold_requested
                 target_updated_at = self.target_updated_at
+                dq_feedforward = self._dq_feedforward.copy()
+                dq_feedforward_updated_at = self._dq_feedforward_updated_at
 
             if self.simulation_mode:
                 cliped_arm_q_target = arm_q_target
             else:
-                cliped_arm_q_target = self.clip_arm_q_target(arm_q_target, velocity_limit = self.arm_velocity_limit)
+                try:
+                    cliped_arm_q_target = self.clip_arm_q_target(
+                        arm_q_target, velocity_limit=self.arm_velocity_limit,
+                    )
+                except RuntimeError as error:
+                    # No usable feedback this instant. Hold the last commanded position rather
+                    # than stopping output for the rest of the session; _write_command below
+                    # still refuses to publish while feedback is stale.
+                    logger_mp.warning(
+                        "R1-A7 clip step skipped (feedback unavailable): %s", error,
+                    )
+                    cliped_arm_q_target = np.array(
+                        [self.msg.motor_cmd[id].q for id in R1_A7_JointArmIndex],
+                        dtype=np.float64,
+                    )
+
+            # Velocity feed-forward, decayed to zero when no fresh target arrives so that
+            # a hold really holds instead of letting the last commanded speed run on.
+            if dq_feedforward_updated_at is not None and (
+                (time.monotonic() - dq_feedforward_updated_at) > self.dq_feedforward_timeout
+            ):
+                with self.ctrl_lock:
+                    self._dq_feedforward = self._dq_feedforward * self.dq_feedforward_decay
+                    dq_feedforward = self._dq_feedforward.copy()
 
             for idx, id in enumerate(R1_A7_JointArmIndex):
                 self.msg.motor_cmd[id].q = cliped_arm_q_target[idx]
-                self.msg.motor_cmd[id].dq = 0
+                self.msg.motor_cmd[id].dq = float(dq_feedforward[idx])
                 self.msg.motor_cmd[id].tau = arm_tauff_target[idx]
 
             for idx, id in enumerate(R1_A7_JointHeadIndex):
@@ -2320,11 +2439,39 @@ class R1_A7_ArmController:
             sleep_time = max(0, (self.control_dt - all_t_elapsed))
             time.sleep(sleep_time)
 
+    def _update_dq_feedforward(self, q_target):
+        """Low-passed derivative of the arm target, used as the servo velocity feed-forward.
+
+        The motors are commanded with dq=0 today, so a fast operator hand leaves a
+        position error that the servo closes in start-stop bursts. Feeding the target's
+        own velocity tells the servo how fast that joint is supposed to be moving. The
+        estimate is clamped (no commanded lurch after a re-anchor jump) and low-passed
+        (no buzzing from a noisy Vision Pro derivative).
+        """
+        # getattr: bare controllers built via __new__ (tests, shadow tooling) have no
+        # feed-forward state, and this must stay a no-op there.
+        if not getattr(self, "dq_feedforward_enabled", False):
+            return
+        now = time.monotonic()
+        previous = self._dq_feedforward_previous
+        previous_at = self._dq_feedforward_previous_at
+        if previous is not None and previous_at is not None:
+            interval = now - previous_at
+            if interval > 0.0:
+                raw = (np.asarray(q_target, dtype=np.float64) - previous) / interval
+                raw = np.clip(raw, -self.dq_feedforward_limit, self.dq_feedforward_limit)
+                alpha = self.dq_feedforward_filter
+                self._dq_feedforward = alpha * raw + (1.0 - alpha) * self._dq_feedforward
+                self._dq_feedforward_updated_at = now
+        self._dq_feedforward_previous = np.array(q_target, dtype=np.float64, copy=True)
+        self._dq_feedforward_previous_at = now
+
     def ctrl_dual_arm(self, q_target, tauff_target):
         '''Set control target values q & tau of the left and right arm motors.'''
         self.raise_if_failed()
         with self.ctrl_lock:
             self._check_target_freshness(self.target_updated_at)
+            self._update_dq_feedforward(q_target)
             self.q_target = q_target
             self.tauff_target = tauff_target
             self.target_updated_at = time.monotonic()
@@ -2349,6 +2496,7 @@ class R1_A7_ArmController:
             ))
         with self.ctrl_lock:
             self._check_target_freshness(self.target_updated_at)
+            self._update_dq_feedforward(q_target)
             self.q_target = q_target
             self.tauff_target = tauff_target
             self.head_q_target = head_q_target
@@ -2417,6 +2565,12 @@ class R1_A7_ArmController:
 
     def get_recording_snapshot(self):
         lowstate = self._get_fresh_lowstate()
+        # Measured joint torque (`tau_est`). Recorded so an episode carries what
+        # the joints actually exerted next to the torque the controller asked
+        # for, which is what separates "the command was ineffective" from "the
+        # command was never reachable". A None would mean the DDS build has no
+        # torque field; report that as absent rather than as a zero reading.
+        measured_torque = [lowstate.motor_state[i].tau for i in R1_A7_JointArmIndex]
         with self.ctrl_lock:
             requested = {
                 "arm_q": self.q_target.tolist(),
@@ -2435,6 +2589,8 @@ class R1_A7_ArmController:
                 "sequence": lowstate.sequence,
                 "q": [float(lowstate.motor_state[i].q) for i in R1_A7_JointArmIndex],
                 "dq": [float(lowstate.motor_state[i].dq) for i in R1_A7_JointArmIndex],
+                "tau": (None if any(value is None for value in measured_torque)
+                        else [float(value) for value in measured_torque]),
                 "head_q": [float(lowstate.motor_state[i].q) for i in R1_A7_JointHeadIndex],
                 "waist_q": float(lowstate.motor_state[R1_A7_JointIndex.kWaistYaw].q),
             },
@@ -2463,6 +2619,12 @@ class R1_A7_ArmController:
         '''Return current state dq of the left and right arm motors.'''
         lowstate = self._get_fresh_lowstate()
         return np.array([lowstate.motor_state[id].dq for id in R1_A7_JointArmIndex])
+
+    def get_current_dual_arm_tau(self):
+        '''Return the measured joint torque of the left and right arm motors.'''
+        lowstate = self._get_fresh_lowstate()
+        return np.array([lowstate.motor_state[id].tau for id in R1_A7_JointArmIndex])
+
 
     def get_current_head_q(self):
         '''Return current state q of the head pitch/yaw motors.'''

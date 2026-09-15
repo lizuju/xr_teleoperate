@@ -14,11 +14,12 @@ import numpy as np
 
 
 ARM_PATH = Path(__file__).resolve().parents[1] / "teleop/robot_control/robot_arm.py"
+MAIN_PATH = Path(__file__).resolve().parents[1] / "teleop/teleop_hand_and_arm.py"
 
 
 def motor_state(value=0.1):
     return SimpleNamespace(mode_machine=7, motor_state=[
-        SimpleNamespace(q=value + index / 100, dq=-index / 1000) for index in range(35)
+        SimpleNamespace(q=value + index / 100, dq=-index / 1000, tau_est=index / 1000) for index in range(35)
     ])
 
 
@@ -136,6 +137,71 @@ class R1A7FeedbackShutdownTest(unittest.TestCase):
         self.assertFalse(subscriber.worker.is_alive())
         self.assertIsNone(controller.lowstate_subscriber)
         self.assertNotIn("[Reader]", output.getvalue())
+
+    def test_measured_torque_comes_from_the_tau_est_dds_field(self):
+        """unitree_hg MotorState_ has no `.tau`; reading it killed the reader thread."""
+        controller = self.controller_class(deferred_activation=True)
+        try:
+            controller.lowstate_subscriber.messages.put(motor_state(0.4))
+            wait_for(lambda: controller.lowstate_buffer.GetData().motor_state[15].tau is not None, "tau")
+            tau = controller.get_current_dual_arm_tau()
+            self.assertEqual(len(tau), 14)
+            self.assertAlmostEqual(tau[0], 15 / 1000)      # first left-arm joint
+            self.assertAlmostEqual(tau[-1], 28 / 1000)     # last right-arm joint
+        finally:
+            controller.stop()
+
+    def test_feedback_without_a_torque_field_is_not_fatal(self):
+        controller = self.controller_class(deferred_activation=True)
+        try:
+            legacy = SimpleNamespace(mode_machine=7, motor_state=[
+                SimpleNamespace(q=0.1 + index / 100, dq=0.0) for index in range(35)
+            ])
+            controller._subscribe_motor_state(legacy)      # must not raise
+            np.testing.assert_allclose(controller.get_current_dual_arm_tau(), np.zeros(14))
+        finally:
+            controller.stop()
+
+    def test_malformed_feedback_is_swallowed_so_the_reader_thread_survives(self):
+        controller = self.controller_class(deferred_activation=True)
+        try:
+            controller._subscribe_motor_state(SimpleNamespace(mode_machine=7, motor_state=[]))
+            controller._subscribe_motor_state(motor_state(0.9))
+            self.assertEqual(controller.lowstate_buffer.GetData().motor_state[0].q, 0.9)
+            self.namespace["logger_mp"].error.assert_called()
+        finally:
+            controller.stop()
+
+    def test_published_target_is_rate_limited_to_the_arm_capability(self):
+        """Commanding 5-11 rad/s at a 1.6-2.7 rad/s servo is what looked like stutter."""
+        controller = self.controller_class.__new__(self.controller_class)
+        controller.arm_velocity_limit = 3.0
+        controller.control_dt = 1.0 / 250.0
+        controller.get_current_dual_arm_q = lambda: np.zeros(14)
+
+        clipped = controller.clip_arm_q_target(np.full(14, 0.5), controller.arm_velocity_limit)
+        # at most velocity_limit * control_dt per publish cycle for the fastest joint
+        self.assertAlmostEqual(float(np.max(np.abs(clipped))), 3.0 / 250.0, places=9)
+        # the whole arm keeps its coordination: every joint scaled by the same factor
+        np.testing.assert_allclose(clipped, np.full(14, 3.0 / 250.0))
+
+        small = np.full(14, 0.005)
+        np.testing.assert_allclose(
+            controller.clip_arm_q_target(small, controller.arm_velocity_limit), small,
+            err_msg="motion inside the limit must pass through untouched",
+        )
+
+    def test_default_position_limit_is_a_safety_net_not_a_tracking_cap(self):
+        # Mode B (dq feed-forward) keeps the command; the position cap is only a net.
+        self.assertEqual(self.controller_class.default_arm_velocity_limit, 30.0)
+        self.assertTrue(self.controller_class.default_dq_feedforward)
+
+    def test_main_program_exposes_and_forwards_the_limit_and_feedforward(self):
+        source = MAIN_PATH.read_text(encoding="utf-8")
+        for flag in ("'--arm-velocity-limit'", "'--arm-dq-feedforward'", "'--arm-dq-limit'", "'--arm-dq-filter'"):
+            self.assertIn(flag, source)
+        self.assertEqual(source.count("arm_velocity_limit=args.arm_velocity_limit"), 2)
+        self.assertEqual(source.count("dq_feedforward=args.arm_dq_feedforward == 'on'"), 2)
 
     def test_late_callback_after_stop_is_ignored(self):
         controller = self.controller_class(deferred_activation=True)

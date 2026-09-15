@@ -17,10 +17,11 @@ MAIN_PATH = REPO_ROOT / "teleop" / "teleop_hand_and_arm.py"
 
 
 class SilentLogger:
-    def debug(self, message):
+    # logging_mp loggers take a message plus optional %-style arguments.
+    def debug(self, message, *args):
         pass
 
-    def info(self, message):
+    def info(self, message, *args):
         pass
 
 
@@ -61,7 +62,7 @@ class FakeSubscriber:
         return types.SimpleNamespace(
             mode_machine=7,
             motor_state=[
-                types.SimpleNamespace(q=0.01 * index, dq=-0.001 * index)
+                types.SimpleNamespace(q=0.01 * index, dq=-0.001 * index, tau_est=0.0)
                 for index in range(35)
             ],
         )
