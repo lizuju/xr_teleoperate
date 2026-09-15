@@ -1,233 +1,275 @@
-import os
-import cv2
-import json
+from copy import deepcopy
 import datetime
+import json
+import logging
+import os
+from pathlib import Path
+from queue import Empty, Queue
+from threading import Lock, Thread
+
+import cv2
 import numpy as np
-import time
-from .rerun_visualizer import RerunLogger
-from queue import Queue, Empty
-from threading import Thread
-import logging_mp
-logger_mp = logging_mp.getLogger(__name__)
 
-class EpisodeWriter():
-    def __init__(self, task_dir, task_goal=None, task_desc = None, task_steps = None, frequency=30, image_size=[640, 480], rerun_log = True):
-        """
-        image_size: [width, height]
-        """
-        logger_mp.info("==> EpisodeWriter initializing...\n")
-        self.task_dir = task_dir
+
+logger = logging.getLogger(__name__)
+CLOSE_TIMEOUT = 5.0
+OUTCOMES = {"unspecified", "success", "failure", "discarded"}
+
+
+class EpisodeWriter:
+    def __init__(self, task_dir, task_goal=None, task_desc=None, task_steps=None,
+                 frequency=30, image_size=(640, 480), depth_size=None, rerun_log=True, metadata=None,
+                 queue_capacity=60):
+        if queue_capacity <= 0:
+            raise ValueError("queue_capacity must be positive")
+        self.task_dir = Path(task_dir)
         self.text = {
-            "goal": "Pick up the red cup on the table.",
-            "desc": "task description",
-            "steps":"step1: do this; step2: do that; ...",
+            "goal": task_goal if task_goal is not None else "Pick up the red cup on the table.",
+            "desc": task_desc if task_desc is not None else "task description",
+            "steps": task_steps if task_steps is not None else "step1: do this; step2: do that; ...",
         }
-        if task_goal is not None:
-            self.text['goal'] = task_goal
-        if task_desc is not None:
-            self.text['desc'] = task_desc
-        if task_steps is not None:
-            self.text['steps'] = task_steps
-
-        self.frequency = frequency
-        self.image_size = image_size
-
+        self.info = {
+            "version": "2.0.0",
+            "date": datetime.date.today().isoformat(),
+            "author": "unitree",
+            "image": {"width": image_size[0], "height": image_size[1], "fps": frequency},
+            # Declared only when depth frames are actually recorded. A manifest
+            # that advertises depth while every sample carries depths=null makes
+            # downstream consumers believe a modality is present that is not.
+            "depth": None if depth_size is None else {"width": depth_size[0], "height": depth_size[1],
+                                                      "fps": frequency},
+            "audio": {"sample_rate": 16000, "channels": 1, "format": "PCM", "bits": 16},
+            "joint_names": {name: [] for name in ("left_arm", "left_ee", "right_arm", "right_ee", "body")},
+            "tactile_names": {"left_ee": [], "right_ee": []},
+            "sim_state": "",
+        }
+        self.info.update(deepcopy(metadata or {}))
         self.rerun_log = rerun_log
-        if self.rerun_log:
-            logger_mp.info("==> RerunLogger initializing...\n")
-            self.rerun_logger = RerunLogger(prefix="online/", IdxRangeBoundary = 60, memory_limit = "300MB")
-            logger_mp.info("==> RerunLogger initializing ok.\n")
-        
+        self.rerun_logger = None
+        self.item_data_queue = Queue(queue_capacity)
+        self._lock = Lock()
+        self._state = "idle"
+        self._create_pending = False
+        self._closed = False
+        self._error = None
+        self._outcome = "unspecified"
         self.item_id = -1
         self.episode_id = -1
-        if os.path.exists(self.task_dir):
-            episode_dirs = [episode_dir for episode_dir in os.listdir(self.task_dir) if 'episode_' in episode_dir and not episode_dir.endswith('.zip')]
-            episode_last = sorted(episode_dirs)[-1] if len(episode_dirs) > 0 else None
-            self.episode_id = 0 if episode_last is None else int(episode_last.split('_')[-1])
-            logger_mp.info(f"==> task_dir directory already exist, now self.episode_id is:{self.episode_id}\n")
-        else:
-            os.makedirs(self.task_dir)
-            logger_mp.info(f"==> episode directory does not exist, now create one.\n")
-        self.data_info()
-
-        self.is_available = True  # Indicates whether the class is available for new operations
-        # Initialize the queue and worker thread
-        self.item_data_queue = Queue(-1)
-        self.stop_worker = False
-        self.need_save = False  # Flag to indicate when save_episode is triggered
-        self.worker_thread = Thread(target=self.process_queue)
+        self.episode_dir = None
+        self._frames = None
+        self._frame_count = 0
+        self.worker_thread = Thread(target=self.process_queue, name="episode-writer", daemon=True)
         self.worker_thread.start()
 
-        logger_mp.info("==> EpisodeWriter initialized successfully.\n")
-    
+    def raise_if_failed(self):
+        with self._lock:
+            error = self._error
+        if error is not None:
+            raise RuntimeError(f"Episode recording failed: {error}") from error
+
     def is_ready(self):
-        return self.is_available
+        self.raise_if_failed()
+        with self._lock:
+            return self._state == "idle" and not self._closed
 
-    def data_info(self, version='1.0.0', date=None, author=None):
-        self.info = {
-                "version": "1.0.0" if version is None else version, 
-                "date": datetime.date.today().strftime('%Y-%m-%d') if date is None else date,
-                "author": "unitree" if author is None else author,
-                "image": {"width":self.image_size[0], "height":self.image_size[1], "fps":self.frequency},
-                "depth": {"width":self.image_size[0], "height":self.image_size[1], "fps":self.frequency},
-                "audio": {"sample_rate": 16000, "channels": 1, "format":"PCM", "bits":16},    # PCM_S16
-                "joint_names":{
-                    "left_arm":   [],
-                    "left_ee":  [],
-                    "right_arm":  [],
-                    "right_ee": [],
-                    "body":       [],
-                },
-
-                "tactile_names": {
-                    "left_ee": [],
-                    "right_ee": [],
-                }, 
-                "sim_state": ""
-            }
-
- 
     def create_episode(self):
-        """
-        Create a new episode.
-        Returns:
-            bool: True if the episode is successfully created, False otherwise.
-        Note:
-            Once successfully created, this function will only be available again after save_episode complete its save task.
-        """
-        if not self.is_available:
-            logger_mp.info("==> The class is currently unavailable for new operations. Please wait until ongoing tasks are completed.")
-            return False  # Return False if the class is unavailable
+        self.raise_if_failed()
+        with self._lock:
+            if self._closed or self._state != "idle":
+                return False
+            self._state = "recording"
+            self._create_pending = True
+            self._outcome = "unspecified"
+            self.item_id = -1
+        return True
 
-        # Reset episode-related data and create necessary directories
-        self.item_id = -1
-        self.episode_id = self.episode_id + 1
-        
-        self.episode_dir = os.path.join(self.task_dir, f"episode_{str(self.episode_id).zfill(4)}")
-        self.color_dir = os.path.join(self.episode_dir, 'colors')
-        self.depth_dir = os.path.join(self.episode_dir, 'depths')
-        self.audio_dir = os.path.join(self.episode_dir, 'audios')
-        self.json_path = os.path.join(self.episode_dir, 'data.json')
-        os.makedirs(self.episode_dir, exist_ok=True)
-        os.makedirs(self.color_dir, exist_ok=True)
-        os.makedirs(self.depth_dir, exist_ok=True)
-        os.makedirs(self.audio_dir, exist_ok=True)
-        with open(self.json_path, "w", encoding="utf-8") as f:
-            f.write('{\n')
-            f.write('"info": ' + json.dumps(self.info, ensure_ascii=False, indent=4) + ',\n')
-            f.write('"text": ' + json.dumps(self.text, ensure_ascii=False, indent=4) + ',\n')
-            f.write('"data": [\n')
-        self.first_item = True   # Flag to handle commas in JSON array
+    def add_item(self, colors, depths=None, states=None, actions=None, tactiles=None,
+                 audios=None, sim_state=None, sample=None):
+        self.raise_if_failed()
+        with self._lock:
+            if self._closed or self._state != "recording":
+                raise RuntimeError("No episode is accepting frames")
+            if self.item_data_queue.full():
+                self._error = RuntimeError("recording queue is full; episode is incomplete")
+            else:
+                self.item_id += 1
+                # The producer may reuse image buffers or nested state dictionaries.
+                item = deepcopy({
+                    "idx": self.item_id,
+                    "colors": colors,
+                    "depths": depths,
+                    "states": states,
+                    "actions": actions,
+                    "tactiles": tactiles,
+                    "audios": audios,
+                    "sim_state": sim_state,
+                    "sample": sample,
+                })
+                self.item_data_queue.put_nowait(item)
+        self.raise_if_failed()
 
-        if self.rerun_log:
-            self.online_logger = RerunLogger(prefix="online/", IdxRangeBoundary = 60, memory_limit="300MB")
+    def save_episode(self, outcome="unspecified"):
+        if outcome not in OUTCOMES:
+            raise ValueError(f"outcome must be one of {sorted(OUTCOMES)}")
+        self.raise_if_failed()
+        with self._lock:
+            if self._state == "recording":
+                self._outcome = outcome
+                self._state = "saving"
 
-        self.is_available = False  # After the episode is created, the class is marked as unavailable until the episode is successfully saved
-        logger_mp.info(f"==> New episode created: {self.episode_dir}")
-        return True  # Return True if the episode is successfully created
-        
-    def add_item(self, colors, depths=None, states=None, actions=None, tactiles=None, audios=None, sim_state=None):
-        # Increment the item ID
-        self.item_id += 1
-        # Create the item data dictionary
-        item_data = {
-            'idx': self.item_id,
-            'colors': colors,
-            'depths': depths,
-            'states': states,
-            'actions': actions,
-            'tactiles': tactiles,
-            'audios': audios,
-            'sim_state': sim_state,
+    def abort(self, error):
+        with self._lock:
+            if self._state in ("recording", "saving") and self._error is None:
+                self._error = error if isinstance(error, Exception) else RuntimeError(str(error))
+
+    def _start_episode(self):
+        self.episode_dir = None
+        self.task_dir.mkdir(parents=True, exist_ok=True)
+        existing = [int(path.name[8:]) for path in self.task_dir.iterdir()
+                    if path.is_dir() and path.name.startswith("episode_") and path.name[8:].isdigit()]
+        self.episode_id = max(existing, default=-1) + 1
+        episode_dir = self.task_dir / f"episode_{self.episode_id:04d}"
+        episode_dir.mkdir()
+        self.episode_dir = episode_dir
+        self._frame_count = 0
+        for name in ("colors", "depths", "audios"):
+            if name == "depths" and self.info.get("depth") is None:
+                continue
+            (episode_dir / name).mkdir()
+        self._frames = (episode_dir / "frames.jsonl").open("x", encoding="utf-8")
+        self._write_manifest("recording")
+        self.raise_if_failed()
+        if self.rerun_log and self.rerun_logger is None:
+            from .rerun_visualizer import RerunLogger
+            self.rerun_logger = RerunLogger(prefix="online/", IdxRangeBoundary=60, memory_limit="300MB")
+        logger.info("Recording episode: %s", episode_dir)
+
+    def _write_manifest(self, status):
+        with self._lock:
+            outcome, error = self._outcome, self._error
+        manifest = {
+            "schema": "xr_teleop_episode_v2",
+            "status": status,
+            "info": self.info,
+            "text": self.text,
+            "episode_id": self.episode_id,
+            "frame_count": self._frame_count,
+            "frames": "frames.jsonl",
+            "outcome": outcome,
         }
-        # Enqueue the item data
-        self.item_data_queue.put(item_data)
+        if error is not None:
+            manifest["error"] = str(error)
+        temporary = self.episode_dir / ".episode.json.tmp"
+        with temporary.open("w", encoding="utf-8") as stream:
+            json.dump(manifest, stream, ensure_ascii=False, indent=2, allow_nan=False)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, self.episode_dir / "episode.json")
+
+    def _process_item_data(self, item):
+        idx = item["idx"]
+        for field in ("colors", "depths"):
+            for key, image in (item[field] or {}).items():
+                # A modality key may be present with a null payload: the camera
+                # is configured for this run but did not deliver a usable frame
+                # for this sample. Keep the key so the schema stays stable and
+                # the matching sample.sources entry stays checkable.
+                if image is None:
+                    continue
+                suffix = ".jpg" if field == "colors" else ".png"
+                relative = Path(field) / f"{idx:06d}_{key}{suffix}"
+                # `depths/` only exists when the manifest declares depth, so a
+                # legacy caller that supplies one anyway still lands on disk.
+                (self.episode_dir / field).mkdir(exist_ok=True)
+                if not cv2.imwrite(str(self.episode_dir / relative), image):
+                    raise OSError(f"Failed to save {relative}")
+                item[field][key] = str(relative)
+        for key, audio in (item["audios"] or {}).items():
+            relative = Path("audios") / f"audio_{idx:06d}_{key}.npy"
+            np.save(self.episode_dir / relative, audio.astype(np.int16))
+            item["audios"][key] = str(relative)
+        line = json.dumps(item, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+        self._frames.write(line + "\n")
+        self._frames.flush()
+        self._frame_count += 1
+        if self.rerun_logger is not None:
+            self.rerun_logger.log_item_data(item)
+
+    def _finish_episode(self):
+        self._frames.flush()
+        os.fsync(self._frames.fileno())
+        self._frames.close()
+        self._frames = None
+        self.raise_if_failed()
+        self._write_manifest("complete")
+        with self._lock:
+            if self._error is not None:
+                raise self._error
+            self._state = "idle"
+        logger.info("Saved episode: %s (%d frames)", self.episode_dir, self._frame_count)
 
     def process_queue(self):
-        while not self.stop_worker or not self.item_data_queue.empty():
-            # Process items in the queue
-            try:
-                item_data = self.item_data_queue.get(timeout=1)
+        try:
+            while True:
                 try:
-                    self._process_item_data(item_data)
-                except Exception as e:
-                    logger_mp.info(f"Error processing item_data (idx={item_data['idx']}): {e}")
-                self.item_data_queue.task_done()
-            except Empty:
-                pass
-        
-            # Check if save_episode was triggered
-            if self.need_save and self.item_data_queue.empty():
-                self._save_episode()
-
-    def _process_item_data(self, item_data):
-        idx = item_data['idx']
-        colors = item_data.get('colors', {})
-        depths = item_data.get('depths', {})
-        audios = item_data.get('audios', {})
-
-        # Save images
-        if colors:
-            for idx_color, (color_key, color) in enumerate(colors.items()):
-                color_name = f'{str(idx).zfill(6)}_{color_key}.jpg'
-                if not cv2.imwrite(os.path.join(self.color_dir, color_name), color):
-                    logger_mp.info(f"Failed to save color image.")
-                item_data['colors'][color_key] = os.path.join('colors', color_name)
-
-        # Save depths
-        if depths:
-            for idx_depth, (depth_key, depth) in enumerate(depths.items()):
-                depth_name = f'{str(idx).zfill(6)}_{depth_key}.jpg'
-                if not cv2.imwrite(os.path.join(self.depth_dir, depth_name), depth):
-                    logger_mp.info(f"Failed to save depth image.")
-                item_data['depths'][depth_key] = os.path.join('depths', depth_name)
-
-        # Save audios
-        if audios:
-            for mic, audio in audios.items():
-                audio_name = f'audio_{str(idx).zfill(6)}_{mic}.npy'
-                np.save(os.path.join(self.audio_dir, audio_name), audio.astype(np.int16))
-                item_data['audios'][mic] = os.path.join('audios', audio_name)
-
-        # Update episode data
-        with open(self.json_path, "a", encoding="utf-8") as f:
-            if not self.first_item:
-                f.write(",\n")
-            f.write(json.dumps(item_data, ensure_ascii=False, indent=4))
-            self.first_item = False
-
-        # Log data if necessary
-        if self.rerun_log:
-            curent_record_time = time.time()
-            logger_mp.info(f"==> episode_id:{self.episode_id}  item_id:{idx}  current_time:{curent_record_time}")
-            self.rerun_logger.log_item_data(item_data)
-
-    def save_episode(self):
-        """
-        Trigger the save operation. This sets the save flag, and the process_queue thread will handle it.
-        """
-        self.need_save = True  # Set the save flag
-        logger_mp.info(f"==> Episode saved start...")
-
-    def _save_episode(self):
-        """
-        Save the episode data to a JSON file.
-        """
-        with open(self.json_path, "a", encoding="utf-8") as f:
-            f.write("\n]\n}")      # Close the JSON array and object
-
-        self.need_save = False     # Reset the save flag
-        self.is_available = True   # Mark the class as available after saving
-        logger_mp.info(f"==> Episode saved successfully to {self.json_path}.")
+                    item = self.item_data_queue.get(timeout=0.05)
+                except Empty:
+                    item = None
+                with self._lock:
+                    create = self._create_pending
+                    self._create_pending = False
+                try:
+                    if create:
+                        self._start_episode()
+                    self.raise_if_failed()
+                    if item is not None:
+                        self._process_item_data(item)
+                finally:
+                    if item is not None:
+                        self.item_data_queue.task_done()
+                with self._lock:
+                    save = self._state == "saving" and self.item_data_queue.empty()
+                if save:
+                    self._finish_episode()
+                with self._lock:
+                    if self._error is not None:
+                        raise self._error
+                    if self._closed and self._state == "idle":
+                        return
+        except Exception as error:
+            with self._lock:
+                active = self._state in ("recording", "saving")
+                if self._error is None:
+                    self._error = error
+                self._state = "failed"
+            if self._frames is not None:
+                try:
+                    self._frames.close()
+                except Exception:
+                    logger.exception("Failed to close partial episode frames")
+                self._frames = None
+            if active and self.episode_dir is not None:
+                try:
+                    self._write_manifest("incomplete")
+                except Exception:
+                    logger.exception("Could not mark episode incomplete: %s", self.episode_dir)
+            while True:
+                try:
+                    self.item_data_queue.get_nowait()
+                    self.item_data_queue.task_done()
+                except Empty:
+                    break
+            logger.error("Episode recording failed: %s", self._error)
 
     def close(self):
-        """
-        Stop the worker thread and ensure all tasks are completed.
-        """
-        self.item_data_queue.join()
-        if not self.is_available:  # If self.is_available is False, it means there is still data not saved.
-            self.save_episode()
-        while not self.is_available:
-            time.sleep(0.01)
-        self.stop_worker = True
-        self.worker_thread.join()
+        with self._lock:
+            self._closed = True
+            if self._state == "recording":
+                self._state = "saving"
+        self.worker_thread.join(timeout=CLOSE_TIMEOUT)
+        if self.worker_thread.is_alive():
+            with self._lock:
+                if self._error is None:
+                    self._error = TimeoutError(f"recording worker did not stop within {CLOSE_TIMEOUT}s")
+        self.raise_if_failed()

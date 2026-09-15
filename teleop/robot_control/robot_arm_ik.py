@@ -14,6 +14,7 @@ parent2_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__
 sys.path.append(parent2_dir)
 
 from teleop.utils.weighted_moving_filter import WeightedMovingFilter
+from teleop.utils.one_euro_filter import OneEuroFilter
 
 class G1_29_ArmIK:
     def __init__(self, Unit_Test = False, Visualization = False):
@@ -288,7 +289,6 @@ class G1_29_ArmIK:
         
         except Exception as e:
             logger_mp.error(f"ERROR in convergence, plotting debug info.{e}")
-
             sol_q = self.opti.debug.value(self.var_q)
             self.smooth_filter.add_data(sol_q)
             sol_q = self.smooth_filter.filtered_data
@@ -1324,7 +1324,7 @@ class H2_ArmIK:
                 self.reduced_robot.model.upperPositionLimit,
             )
         )
-        self.opti.minimize(50 * self.translational_cost + 0.8 * self.rotation_cost + 0.02 * self.regularization_cost + 0.1 * self.smooth_cost)
+        self.opti.minimize(50 * self.translational_cost + 0.8 * self.rotation_cost + 0.01 * self.regularization_cost + 0.1 * self.smooth_cost)
 
         opts = {
             # CasADi-level options
@@ -1751,11 +1751,16 @@ class R1_A5_ArmIK:
             return current_lr_arm_motor_q, np.zeros(self.reduced_robot.model.nv)
 
 class R1_A7_ArmIK:
-    def __init__(self, Unit_Test = False, Visualization = False):
+    def __init__(self, Unit_Test = False, Visualization = False, waist_yaw = None):
         np.set_printoptions(precision=5, suppress=True, linewidth=200)
 
         self.Unit_Test = Unit_Test
         self.Visualization = Visualization
+        if waist_yaw is not None:
+            waist_yaw = float(waist_yaw)
+            if not np.isfinite(waist_yaw):
+                raise ValueError("waist_yaw must be finite.")
+        self.waist_yaw = waist_yaw
 
         # fixed cache file path
         self.cache_path = "r1_a7_model_cache.pkl"
@@ -1768,7 +1773,8 @@ class R1_A7_ArmIK:
             self.model_dir = '../../assets/r1/'
 
         # Try loading cache first
-        if os.path.exists(self.cache_path) and (not self.Visualization):
+        cache_compatible = self.waist_yaw is None
+        if os.path.exists(self.cache_path) and cache_compatible and not self.Visualization:
             logger_mp.info(f"[R1_A7_ArmIK] >>> Loading cached robot model: {self.cache_path}")
             self.robot, self.reduced_robot = self.load_cache()
         else:
@@ -1781,9 +1787,16 @@ class R1_A7_ArmIK:
                                             "head_yaw_joint" ,
                                         ]
 
+            reference_configuration = np.zeros(self.robot.model.nq)
+            if self.waist_yaw is not None:
+                waist_joint_id = self.robot.model.getJointId("waist_yaw_joint")
+                reference_configuration[
+                    self.robot.model.joints[waist_joint_id].idx_q
+                ] = self.waist_yaw
+
             self.reduced_robot = self.robot.buildReducedRobot(
                 list_of_joints_to_lock=self.mixed_jointsToLockIDs,
-                reference_configuration=np.array([0.0] * self.robot.model.nq),
+                reference_configuration=reference_configuration,
             )
 
             self.reduced_robot.model.addFrame(
@@ -1802,9 +1815,11 @@ class R1_A7_ArmIK:
             )
 
             # Save cache (only after everything is built)
-            if not os.path.exists(self.cache_path):
+            if cache_compatible and not os.path.exists(self.cache_path):
                 self.save_cache()
                 logger_mp.info(f">>> Cache saved to {self.cache_path}")
+
+        self.reduced_robot.data = self.reduced_robot.model.createData()
 
         # Creating Casadi models and data for symbolic computing
         self.cmodel = cpin.Model(self.reduced_robot.model)
@@ -1849,7 +1864,7 @@ class R1_A7_ArmIK:
         self.param_tf_r = self.opti.parameter(4, 4)
         self.translational_cost = casadi.sumsqr(self.translational_error(self.var_q, self.param_tf_l, self.param_tf_r))
         self.rotation_cost = casadi.sumsqr(self.rotational_error(self.var_q, self.param_tf_l, self.param_tf_r))
-        self.regularization_cost = casadi.sumsqr(self.var_q)
+        self.regularization_cost = casadi.sumsqr(self.var_q - self.var_q_last)
         self.smooth_cost = casadi.sumsqr(self.var_q - self.var_q_last)
 
         # Setting optimization constraints and goals
@@ -1858,7 +1873,40 @@ class R1_A7_ArmIK:
             self.var_q,
             self.reduced_robot.model.upperPositionLimit)
         )
-        self.opti.minimize(50 * self.translational_cost + self.rotation_cost + 0.02 * self.regularization_cost + 0.1 * self.smooth_cost)
+        # Redundancy handling for the teleoperation posture. `var_q` holds only the
+        # two 7-DoF arms, so these terms never touch the locked waist/head joints.
+        #
+        # `bounded` above is a hard constraint, so the solver is free to drive a joint
+        # all the way onto a limit and keep it there. That is what makes the wrist feel
+        # locked during long sessions. The quartic barrier below grows steeply only near
+        # the limits and is normalised per joint by its half-range, so a joint sitting
+        # mid-range contributes almost nothing while an edge-riding joint is pushed back.
+        joint_lower = np.asarray(self.reduced_robot.model.lowerPositionLimit, dtype=np.float64)
+        joint_upper = np.asarray(self.reduced_robot.model.upperPositionLimit, dtype=np.float64)
+        self.joint_middle = 0.5 * (joint_lower + joint_upper)
+        self.joint_half_range = 0.5 * (joint_upper - joint_lower)
+        self._nominal_arm_q = self.joint_middle.copy()
+        self.param_nominal_q = self.opti.parameter(self.reduced_robot.model.nq)
+        self.posture_weights = casadi.DM.ones(self.reduced_robot.model.nq)
+        normalised_offset = (self.var_q - self.joint_middle) / self.joint_half_range
+        self.limit_cost = casadi.sumsqr(normalised_offset ** 2)
+        self.posture_cost = casadi.sumsqr(
+            self.posture_weights * (self.var_q - self.param_nominal_q)
+        )
+        # Weights are parameters, because opti.minimize() can only be called once.
+        self.param_posture_weight = self.opti.parameter(1)
+        self.param_limit_weight = self.opti.parameter(1)
+        self.posture_weight = 0.0
+        self.limit_weight = 0.0
+        self.opti.set_value(self.param_nominal_q, self._nominal_arm_q)
+        self.opti.set_value(self.param_posture_weight, self.posture_weight)
+        self.opti.set_value(self.param_limit_weight, self.limit_weight)
+        self.opti.minimize(
+            50 * self.translational_cost + self.rotation_cost
+            + 0.02 * self.regularization_cost + 0.1 * self.smooth_cost
+            + self.param_posture_weight * self.posture_cost
+            + self.param_limit_weight * self.limit_cost
+        )
 
         opts = {
             # CasADi-level options
@@ -1881,7 +1929,7 @@ class R1_A7_ArmIK:
         self.opti.solver("ipopt", opts)
 
         self.init_data = np.zeros(self.reduced_robot.model.nq)
-        self.smooth_filter = WeightedMovingFilter(np.array([0.4, 0.3, 0.2, 0.1]), 14)
+        self.smooth_filters = [OneEuroFilter(), OneEuroFilter()]
         self.vis = None
 
         if self.Visualization:
@@ -1920,6 +1968,33 @@ class R1_A7_ArmIK:
                     )
                 )
 
+    def set_redundancy_weights(self, posture_weight=None, limit_weight=None,
+                               nominal_arm_q=None):
+        '''Tune the redundancy terms and the preferred arm posture.
+
+        ``posture_weight`` pulls the arm toward ``nominal_arm_q`` (default: the middle
+        of every joint range). ``limit_weight`` is the soft joint-limit barrier. Both
+        default to zero, so an unconfigured solver behaves exactly as before.
+        '''
+        for name, value in (("posture_weight", posture_weight), ("limit_weight", limit_weight)):
+            if value is None:
+                continue
+            value = float(value)
+            if not np.isfinite(value) or value < 0.0:
+                raise ValueError(f"{name} must be finite and non-negative.")
+            setattr(self, name, value)
+        if nominal_arm_q is not None:
+            nominal = np.asarray(nominal_arm_q, dtype=np.float64)
+            if nominal.shape != self._nominal_arm_q.shape or not np.isfinite(nominal).all():
+                raise ValueError(
+                    f"nominal_arm_q must be a finite array of shape {self._nominal_arm_q.shape}."
+                )
+            self._nominal_arm_q = nominal.copy()
+        self.opti.set_value(self.param_nominal_q, self._nominal_arm_q)
+        self.opti.set_value(self.param_posture_weight, self.posture_weight)
+        self.opti.set_value(self.param_limit_weight, self.limit_weight)
+
+
     # Save both robot.model and reduced_robot.model
     def save_cache(self):
         data = {
@@ -1954,7 +2029,40 @@ class R1_A7_ArmIK:
         robot_right_pose[:3, 3] *= scale_factor
         return robot_left_pose, robot_right_pose
 
-    def solve_ik(self, left_wrist, right_wrist, current_lr_arm_motor_q = None, current_lr_arm_motor_dq = None):
+    def forward_wrist_poses(self, arm_q):
+        arm_q = np.asarray(arm_q, dtype=np.float64)
+        if arm_q.shape != (self.reduced_robot.model.nq,):
+            raise ValueError(
+                f"arm_q must have shape ({self.reduced_robot.model.nq},)."
+            )
+        pin.framesForwardKinematics(
+            self.reduced_robot.model,
+            self.reduced_robot.data,
+            arm_q,
+        )
+        return (
+            self.reduced_robot.data.oMf[self.L_hand_id].homogeneous.copy(),
+            self.reduced_robot.data.oMf[self.R_hand_id].homogeneous.copy(),
+        )
+
+    def reset_smoothing(self, side=None, reference_q=None):
+        sides = range(2) if side is None else (side,)
+        timestamp = time.monotonic()
+        for index in sides:
+            smoothing = self.smooth_filters[index]
+            smoothing.reset()
+            if reference_q is not None:
+                arm_q = np.asarray(reference_q)[index * 7:(index + 1) * 7]
+                smoothing.filter(arm_q, timestamp, arm_q)
+
+    def solve_ik(
+        self,
+        left_wrist,
+        right_wrist,
+        current_lr_arm_motor_q = None,
+        current_lr_arm_motor_dq = None,
+        raise_on_failure = False,
+    ):
         if current_lr_arm_motor_q is not None:
             self.init_data = current_lr_arm_motor_q
         self.opti.set_initial(self.var_q, self.init_data)
@@ -1973,8 +2081,12 @@ class R1_A7_ArmIK:
             # sol = self.opti.solve_limited()
 
             sol_q = self.opti.value(self.var_q)
-            self.smooth_filter.add_data(sol_q)
-            sol_q = self.smooth_filter.filtered_data
+            timestamp = time.monotonic()
+            for side, smoothing in enumerate(self.smooth_filters):
+                arm_slice = slice(side * 7, (side + 1) * 7)
+                sol_q[arm_slice] = smoothing.filter(
+                    sol_q[arm_slice], timestamp, self.init_data[arm_slice],
+                )
 
             if current_lr_arm_motor_dq is not None:
                 v = current_lr_arm_motor_dq * 0.0
@@ -1991,18 +2103,17 @@ class R1_A7_ArmIK:
             return sol_q, sol_tauff
 
         except Exception as e:
+            self.reset_smoothing()
             logger_mp.error(f"ERROR in convergence, plotting debug info.{e}")
+            if raise_on_failure:
+                raise RuntimeError("R1_A7 IK failed to converge.") from e
 
             sol_q = self.opti.debug.value(self.var_q)
-            self.smooth_filter.add_data(sol_q)
-            sol_q = self.smooth_filter.filtered_data
 
             if current_lr_arm_motor_dq is not None:
                 v = current_lr_arm_motor_dq * 0.0
             else:
                 v = (sol_q - self.init_data) * 0.0
-
-            self.init_data = sol_q
 
             sol_tauff = pin.rnea(self.reduced_robot.model, self.reduced_robot.data, sol_q, v, np.zeros(self.reduced_robot.model.nv))
 

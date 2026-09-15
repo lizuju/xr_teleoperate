@@ -1,0 +1,13 @@
+[Unit]
+Description=R1 stereo recording JPEG forwarder (55555)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/socat TCP4-LISTEN:55555,bind=192.168.124.147,reuseaddr,fork TCP4:192.168.123.164:55555
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target

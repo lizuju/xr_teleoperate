@@ -1,0 +1,115 @@
+import ast
+from pathlib import Path
+import sys
+import unittest
+
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+
+IK_PATH = Path(__file__).resolve().parents[1] / "teleop/robot_control/robot_arm_ik.py"
+
+
+class FakeOpti:
+    """Records set_value calls so the setter can be exercised without CasADi."""
+
+    def __init__(self, nq):
+        self.values = {}
+        self.params = {name: object() for name in ("nominal", "posture", "limit")}
+
+    def set_value(self, param, value):
+        for name, token in self.params.items():
+            if param is token:
+                self.values[name] = np.asarray(value, dtype=float)
+                return
+        raise AssertionError("unknown parameter")
+
+
+def load_setter(nq):
+    """Extract R1_A7_ArmIK.set_redundancy_weights from the production source."""
+    tree = ast.parse(IK_PATH.read_text(encoding="utf-8"))
+    target = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef) and node.name == "R1_A7_ArmIK":
+            for child in node.body:
+                if isinstance(child, ast.FunctionDef) and child.name == "set_redundancy_weights":
+                    target = child
+    if target is None:
+        raise AssertionError("set_redundancy_weights not found in R1_A7_ArmIK")
+    namespace = {"np": np}
+    exec(compile(ast.Module(body=[target], type_ignores=[]), str(IK_PATH), "exec"), namespace)
+    instance = type("Stub", (), {})()
+    instance.opti = FakeOpti(nq)
+    instance._nominal_arm_q = np.zeros(nq)
+    instance.posture_weight = 0.0
+    instance.limit_weight = 0.0
+    instance.param_nominal_q = instance.opti.params["nominal"]
+    instance.param_posture_weight = instance.opti.params["posture"]
+    instance.param_limit_weight = instance.opti.params["limit"]
+    instance.set_redundancy_weights = namespace["set_redundancy_weights"].__get__(instance)
+    return instance
+
+
+class RedundancyWeightsTest(unittest.TestCase):
+    def test_weights_and_nominal_are_pushed_to_the_solver(self):
+        ik = load_setter(14)
+        nominal = np.linspace(-0.3, 0.3, 14)
+        ik.set_redundancy_weights(posture_weight=0.05, limit_weight=0.2, nominal_arm_q=nominal)
+        self.assertEqual(ik.posture_weight, 0.05)
+        self.assertEqual(ik.limit_weight, 0.2)
+        np.testing.assert_allclose(ik.opti.values["posture"], [0.05])
+        np.testing.assert_allclose(ik.opti.values["limit"], [0.2])
+        np.testing.assert_allclose(ik.opti.values["nominal"], nominal)
+
+    def test_omitted_arguments_leave_current_values_untouched(self):
+        ik = load_setter(14)
+        ik.set_redundancy_weights(posture_weight=0.03, limit_weight=0.4)
+        ik.set_redundancy_weights(limit_weight=0.1)
+        self.assertEqual(ik.posture_weight, 0.03)
+        self.assertEqual(ik.limit_weight, 0.1)
+        np.testing.assert_allclose(ik.opti.values["nominal"], np.zeros(14))
+
+    def test_negative_or_non_finite_weights_are_rejected(self):
+        for kwargs in ({"posture_weight": -0.1}, {"limit_weight": -1.0},
+                       {"posture_weight": float("nan")}, {"limit_weight": float("inf")}):
+            with self.subTest(**kwargs):
+                ik = load_setter(14)
+                with self.assertRaises(ValueError):
+                    ik.set_redundancy_weights(**kwargs)
+
+    def test_wrong_shaped_or_non_finite_nominal_is_rejected(self):
+        ik = load_setter(14)
+        for bad in (np.zeros(7), np.full(14, np.nan), np.zeros((2, 7))):
+            with self.subTest(shape=np.shape(bad)):
+                with self.assertRaises(ValueError):
+                    ik.set_redundancy_weights(nominal_arm_q=bad)
+
+    def test_rejected_call_does_not_change_state(self):
+        ik = load_setter(14)
+        ik.set_redundancy_weights(posture_weight=0.02)
+        with self.assertRaises(ValueError):
+            ik.set_redundancy_weights(limit_weight=-1.0)
+        self.assertEqual(ik.posture_weight, 0.02)
+        self.assertEqual(ik.limit_weight, 0.0)
+
+
+class ObjectiveTermsTest(unittest.TestCase):
+    def test_limit_and_posture_costs_are_distinct_from_smooth(self):
+        # Regression guard: the barrier must be a range-normalised quartic offset,
+        # and the posture cost must reference the nominal parameter, so none of the
+        # three terms collapse into another.
+        source = IK_PATH.read_text(encoding="utf-8")
+        self.assertIn("normalised_offset ** 2", source)
+        self.assertIn("self.joint_middle", source)
+        self.assertIn("self.joint_half_range", source)
+        self.assertIn("self.param_nominal_q", source)
+        self.assertIn("self.param_limit_weight * self.limit_cost", source)
+        self.assertIn("self.param_posture_weight * self.posture_cost", source)
+        # The objective is built exactly once (opti.minimize may not be called twice
+        # for one Opti instance), so the weights have to travel as parameters.
+        self.assertEqual(source.count("self.opti.minimize("), 7)
+
+
+if __name__ == "__main__":
+    unittest.main()

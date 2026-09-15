@@ -24,3 +24,5 @@ teleop/utils/data/
 episode_0*
 .vscode/
 *.pkl
+# deployment backups (must never be published)
+*.pre-*
