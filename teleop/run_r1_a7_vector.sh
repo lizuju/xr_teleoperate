@@ -16,6 +16,10 @@
 #                       4.0 跟得上正常手速（稳态约 0.8、峰值约 2 rad/s），只把「追赶」拉长。
 #                       更跟手就调大（6-8），更顺就调小（2-3），0 = 关闭整形、恢复原始目标。
 #   ARM_TARGET_ACCEL_LIMIT     参考速度变化率上限，默认 40.0 rad/s^2（0 = 只限速不限加速度）
+#   ARM_TRANSLATION_SCALE      手部位移比例，默认 0.87。机器人手臂比人臂短，按比例映射就是两者之比：
+#                       R1_A7 肩到腕约 0.65 m，成人手臂约 0.75 m → 65/75 = 0.87。旋转不缩放。
+#                       1.0 会让手臂去够比操作者远 15% 的位置，腕部更容易顶到工作空间边界；
+#                       0.7 少走 19%，手要划得比机器人动得还多，手感发涩。
 #   ARM_DIAG_HZ         设了就按该频率记录诊断（复测大臂问题建议 40）
 #   ARM_DIAG_DIR        设了就把诊断 JSONL 写进该目录
 #   WAIST_FOLLOW                on/off，默认 **off**（腰跟随会废掉手臂可达空间，见下）
@@ -91,6 +95,7 @@ exec "$python" -u teleop_hand_and_arm.py \
   --linker-o6-method vector \
   --linker-o6-urdf-root "${dev_root}/linkerhand-urdf/O6" \
   "${waist[@]}" \
+  --arm-translation-scale "${ARM_TRANSLATION_SCALE:-0.87}" \
   --arm-velocity-limit "${ARM_VELOCITY_LIMIT:-30.0}" \
   --arm-dq-feedforward "${ARM_DQ_FEEDFORWARD:-on}" \
   --arm-dq-limit "${ARM_DQ_LIMIT:-6.0}" \

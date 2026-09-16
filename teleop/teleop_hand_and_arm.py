@@ -378,8 +378,10 @@ if __name__ == '__main__':
     parser.add_argument('--linker-o6-urdf-root', type=str, default='/home/hnh/unitree_r1_dev/linkerhand-urdf/O6', help='Official Linker O6 URDF root')
     parser.add_argument('--linker-o6-method', choices=['vector', 'position', 'dexpilot'], default='vector', help='dex-retargeting optimizer for Linker O6')
     parser.add_argument('--linker-o6-live-state', type=str, default=None, help='Atomic JSON target snapshot for isolated Linker O6 simulation')
-    parser.add_argument('--arm-translation-scale', type=float, default=1.0, help='R1_A7 Cartesian translation scale relative to Vision Pro motion; 1.0 keeps the '
-                        'operator motion 1:1, higher values amplify it and reach the workspace edge sooner')
+    parser.add_argument('--arm-translation-scale', type=float, default=0.87, help='R1_A7 Cartesian translation scale for the hand displacement, measured from the '
+                        'activation anchor. Rotations are never scaled. The robot arm is shorter than the operator arm, so a proportional mapping is the ratio of the '
+                        'two: the R1_A7 shoulder-to-wrist chain is ~0.65 m against ~0.75 m for an adult arm, giving 0.87 (default). 1.0 asks the arm to reach 15%% '
+                        'further than the operator and saturates the wrist more often; 0.7 under-reaches by 19%%, so the operator has to move further than the robot does.')
     parser.add_argument('--arm-diagnostic-dir', type=str, default=None, help='Directory for R1_A7 alignment JSONL diagnostics')
     parser.add_argument('--waist-follow', action='store_true', help='R1_A7: sustained head turns drive waist yaw with feedback-based head and arm compensation')
     parser.add_argument('--waist-follow-threshold-deg', type=float, default=12.0, help='Head yaw needed to engage waist following (degrees)')
@@ -1816,6 +1818,12 @@ if __name__ == '__main__':
                     "q_actual": current_lr_arm_q.tolist(),
                     "dq_actual": current_lr_arm_dq.tolist(),
                     "q_ik_command": sol_q.tolist(),
+                    # What the servos were actually given, after the reference shaper;
+                    # comparing the two is the only way to see the shaper working on-robot.
+                    "q_reference_command": (
+                        arm_ctrl.get_reference_q().tolist()
+                        if hasattr(arm_ctrl, "get_reference_q") else sol_q.tolist()
+                    ),
                     "arm_target_shaper": getattr(arm_ctrl, "get_target_shaper_snapshot", lambda: None)(),
                     "tau_ik_command": sol_tauff.tolist(),
                     "tau_actual": arm_tau_actual.tolist() if arm_tau_actual is not None else None,

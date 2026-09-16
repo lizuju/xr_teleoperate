@@ -195,3 +195,16 @@ class ArmControllerShaperTest(unittest.TestCase):
         self.controller.reset_target_shaper()
         np.testing.assert_allclose(self.controller.target_shaper.reference, reached)
         np.testing.assert_allclose(self.controller.target_shaper.velocity, np.zeros(14))
+
+    def test_reference_getter_reports_what_the_servos_got(self):
+        self.submit(0.0)
+        self.now += 0.025
+        self.submit(1.0)
+        reference = self.controller.get_reference_q()
+        self.assertEqual(reference.shape, (14,))
+        self.assertLess(float(np.max(reference)), 1.0)
+
+    def test_feedback_age_is_readable(self):
+        self.controller.lowstate_buffer.SetData(self.state)
+        self.state.monotonic_timestamp = self.now - 0.05
+        self.assertAlmostEqual(self.controller.get_feedback_age(), 0.05, places=3)

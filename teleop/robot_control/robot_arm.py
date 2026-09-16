@@ -2405,7 +2405,8 @@ class R1_A7_ArmController:
                     # than stopping output for the rest of the session; _write_command below
                     # still refuses to publish while feedback is stale.
                     logger_mp.warning(
-                        "R1-A7 clip step skipped (feedback unavailable): %s", error,
+                        "R1-A7 clip step skipped (feedback unavailable, last sample %.0f ms ago): %s",
+                        float(self.get_feedback_age() or -1.0) * 1000.0, error,
                     )
                     cliped_arm_q_target = np.array(
                         [self.msg.motor_cmd[id].q for id in R1_A7_JointArmIndex],
@@ -2543,6 +2544,20 @@ class R1_A7_ArmController:
             return None
         with self.ctrl_lock:
             return shaper.snapshot()
+
+    def get_reference_q(self):
+        """The joint reference the servos were actually given, after shaping."""
+        with self.ctrl_lock:
+            return np.array(self.q_target, dtype=np.float64, copy=True)
+
+    def get_feedback_age(self):
+        """Seconds since the last motor-feedback sample, or None before the first."""
+        lowstate = self.lowstate_buffer.GetData()
+        timestamp = getattr(lowstate, "monotonic_timestamp", None)
+        if timestamp is None:
+            return None
+        age = time.monotonic() - timestamp
+        return age if np.isfinite(age) else None
 
     def ctrl_dual_arm_and_head(self, q_target, tauff_target, head_q_target, waist_yaw_target=None):
         '''Set arm, head, and optional waist targets from one tracking sample.'''
