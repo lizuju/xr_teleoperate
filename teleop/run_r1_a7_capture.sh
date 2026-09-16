@@ -28,6 +28,21 @@ fi
 
 export XR_TELEOP_CERT="${HOME}/.config/xr_teleoperate/cert.pem"
 export XR_TELEOP_KEY="${HOME}/.config/xr_teleoperate/key.pem"
+# Waist following is OFF by default. It turns the torso to follow head yaw, but
+# the wrist targets are compensated to stay in world space, so rotating the waist
+# drags the arms across their envelope and out of it. Measured 2026-09-16:
+# workspace saturation is 42.6% while the waist sits within 5 deg of its
+# reference, 90% at 5-10 deg, and 100% beyond 10 deg -- and saturated targets are
+# exactly what the operator feels as the upper arm catching. The head still
+# points where you look: head_q_target is computed independently and the head
+# joint has roughly +-115 deg of travel of its own.
+#   Set WAIST_FOLLOW=on to bring it back.
+waist=()
+if [[ "${WAIST_FOLLOW:-off}" != "off" ]]; then
+  waist+=(--waist-follow)
+  waist+=(--waist-follow-threshold-deg "${WAIST_FOLLOW_THRESHOLD_DEG:-15}")
+  waist+=(--waist-follow-dwell "${WAIST_FOLLOW_DWELL:-0.3}")
+fi
 diagnostics=()
 if [[ -n "${ARM_DIAG_HZ:-}" ]]; then
   diagnostics+=(--arm-diagnostic-hz "${ARM_DIAG_HZ}")
@@ -45,9 +60,7 @@ exec "${dev_root}/.venv-xr/bin/python" -u teleop_hand_and_arm.py \
   --ee linker_o6 \
   --linker-o6-method vector \
   --linker-o6-urdf-root "${dev_root}/linkerhand-urdf/O6" \
-  --waist-follow \
-  --waist-follow-threshold-deg "${WAIST_FOLLOW_THRESHOLD_DEG:-15}" \
-  --waist-follow-dwell "${WAIST_FOLLOW_DWELL:-0.3}" \
+  "${waist[@]}" \
   --arm-velocity-limit "${ARM_VELOCITY_LIMIT:-30.0}" \
   --arm-dq-feedforward "${ARM_DQ_FEEDFORWARD:-on}" \
   --arm-dq-limit "${ARM_DQ_LIMIT:-6.0}" \
