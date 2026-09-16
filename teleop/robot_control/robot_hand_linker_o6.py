@@ -88,8 +88,22 @@ class LinkerO6Controller:
                 result.append(None if value is None else float(value))
             return result
 
+        def error_channel():
+            # PC2 reserves reserve[0] for the per-joint fault code; the field
+            # defaults to zero, which reads as "no fault reported".
+            result = []
+            for state in message.states:
+                try:
+                    reserve = getattr(state, "reserve", None)
+                    result.append(None if not reserve else int(reserve[0]))
+                except Exception:
+                    result.append(None)
+            return result
+
+        errors = error_channel()
         aux = {"qvel": channel("dq"), "torque": channel("tau_est"),
-               "temperature": channel("temperature")}
+               "temperature": channel("temperature"),
+               "errors": errors if any(value is not None for value in errors) else None}
         return values, aux, modes.pop()
 
     def _on_left_state(self, message):
@@ -343,6 +357,7 @@ class LinkerO6Controller:
                     "sequence": sequence, "mode": mode,
                     "qvel": aux.get("qvel"), "torque": aux.get("torque"),
                     "temperature": aux.get("temperature"),
+                    "errors": aux.get("errors"),
                 }
             return {
                 "state": states,

@@ -101,7 +101,10 @@ def capture_metadata(args, camera_config, retargeter, calibration=None):
                   "hand_qvel": "normalized_0_to_1 relative joint speed, not rad/s",
                   "hand_torque": ("normalized_0_to_1 relative joint torque from the O6 "
                                   "telemetry block, not N*m"),
-                  "hand_temperature": "raw device register value"},
+                  "hand_temperature": "raw device register value",
+                  "hand_errors": ("per-joint O6 fault code; all zeros means no fault was "
+                                  "reported. PC2 only fills reserve[0] once hand_dds_service "
+                                  "forwards hand_state.errors")},
         "hand_axis_normalization": {
             side: {"lower_rad": hand.hardware_lower.tolist(), "upper_rad": hand.hardware_upper.tolist(),
                    "formula": "q_normalized = (q_rad - lower_rad) / (upper_rad - lower_rad)"}
@@ -157,7 +160,8 @@ def _end_effector_state(entry):
             return []
         return [float(value) for value in values]
     return {"qpos": entry["q"], "qvel": channel("qvel"),
-            "torque": channel("torque"), "temperature": channel("temperature")}
+            "torque": channel("torque"), "temperature": channel("temperature"),
+            "errors": channel("errors")}
 
 
 class R1Capture:
