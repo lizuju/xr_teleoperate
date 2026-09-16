@@ -66,7 +66,7 @@ exec "${dev_root}/.venv-xr/bin/python" -u teleop_hand_and_arm.py \
   --arm-velocity-limit "${ARM_VELOCITY_LIMIT:-30.0}" \
   --arm-dq-feedforward "${ARM_DQ_FEEDFORWARD:-on}" \
   --arm-dq-limit "${ARM_DQ_LIMIT:-6.0}" \
-  --arm-target-velocity-limit "${ARM_TARGET_VELOCITY_LIMIT:-5.0}" \
+  --arm-target-velocity-limit "${ARM_TARGET_VELOCITY_LIMIT:-4.0}" \
   --arm-target-accel-limit "${ARM_TARGET_ACCEL_LIMIT:-40.0}" \
   --camera-calibration "${CAMERA_CALIBRATION:-}" \
   --network-interface eno1 \

@@ -19,8 +19,9 @@
 #                       最大 84.5 度关节位移，隐含 46 rad/s，而关节实测只有 5-7 rad/s 的能力。
 #                       伺服因此长期落后 0.25-0.45 rad 再猛追，这就是卡顿。
 #                       4.0 跟得上正常手速（稳态约 0.8、峰值约 2 rad/s），只把「追赶」拉长。
-                       默认已提到 5.0：队列 + 整形把实测关节峰值压到 5.01 rad/s，而能力上限是 7.19，
-                       有余量换回更小的滞后。
+                       2026-09-16 实测：4.0 时操作者反馈手感好；提到 5.0 后紧接着两次都变回「一顿一顿」，
+                       所以默认退回 4.0。当初提上去的理由（峰值 5.01 对能力 7.19）是错的 —— 7.19 是
+                       没有整形器时、在猛烈追赶中测到的，不是「手感平滑」的速度。
 #                       更跟手就调大（6-8），更顺就调小（2-3），0 = 关闭整形、恢复原始目标。
 #   ARM_TARGET_ACCEL_LIMIT     参考速度变化率上限，默认 40.0 rad/s^2（0 = 只限速不限加速度）
 #   ARM_TRANSLATION_SCALE      手部位移比例，默认 0.87。机器人手臂比人臂短，按比例映射就是两者之比：
@@ -107,7 +108,7 @@ exec "$python" -u teleop_hand_and_arm.py \
   --arm-velocity-limit "${ARM_VELOCITY_LIMIT:-30.0}" \
   --arm-dq-feedforward "${ARM_DQ_FEEDFORWARD:-on}" \
   --arm-dq-limit "${ARM_DQ_LIMIT:-6.0}" \
-  --arm-target-velocity-limit "${ARM_TARGET_VELOCITY_LIMIT:-5.0}" \
+  --arm-target-velocity-limit "${ARM_TARGET_VELOCITY_LIMIT:-4.0}" \
   --arm-target-accel-limit "${ARM_TARGET_ACCEL_LIMIT:-40.0}" \
   --camera-calibration "${CAMERA_CALIBRATION:-}" \
   --network-interface eno1 \
