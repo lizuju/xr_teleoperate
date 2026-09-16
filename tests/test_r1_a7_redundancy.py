@@ -113,3 +113,39 @@ class ObjectiveTermsTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ElbowDriftGuardDefaultTest(unittest.TestCase):
+    """The nominal-posture term is the only thing anchoring the 7-DoF null space.
+
+    It was introduced with a default weight of 0.0, which silently disabled it:
+    the flag existed, the IK term existed, and the elbow still drifted.
+    """
+
+    def setUp(self):
+        from pathlib import Path
+        self.source = (Path(__file__).resolve().parents[1]
+                       / "teleop" / "teleop_hand_and_arm.py").read_text(encoding="utf-8")
+
+    def test_the_nominal_posture_term_is_enabled_by_default(self):
+        self.assertIn("--arm-posture-weight', type=float, default=0.02", self.source)
+
+    def test_the_soft_limit_barrier_stays_on(self):
+        self.assertIn("--arm-limit-softness', type=float, default=0.1", self.source)
+
+    def test_the_effective_weights_are_always_logged(self):
+        # A silent zero here is how the protection went missing the first time.
+        self.assertIn("[R1 IK] redundancy terms", self.source)
+        self.assertIn("elbow drift protection OFF", self.source)
+
+    def test_both_weights_reach_the_solver(self):
+        self.assertIn("posture_weight=args.arm_posture_weight", self.source)
+        self.assertIn("limit_weight=args.arm_limit_softness", self.source)
+        self.assertIn("nominal_arm_q=post_recenter_motor_q[:14]", self.source)
+
+    def test_the_wrappers_pass_both_weights(self):
+        from pathlib import Path
+        for name in ("run_r1_a7_vector.sh", "run_r1_a7_capture.sh"):
+            script = (Path(__file__).resolve().parents[1] / "teleop" / name).read_text(encoding="utf-8")
+            self.assertIn('--arm-posture-weight "${ARM_POSTURE_WEIGHT:-0.02}"', script)
+            self.assertIn('--arm-limit-softness "${ARM_LIMIT_SOFTNESS:-0.1}"', script)

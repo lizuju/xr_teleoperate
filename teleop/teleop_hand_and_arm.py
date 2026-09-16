@@ -367,7 +367,7 @@ if __name__ == '__main__':
     parser.add_argument('--workspace-position-tolerance-m', type=float, default=0.05, help='R1_A7: IK position shortfall above which a target counts as outside the reachable workspace')
     parser.add_argument('--workspace-rotation-tolerance-rad', type=float, default=0.15, help='R1_A7: IK rotation shortfall above which a target counts as outside the reachable workspace')
     parser.add_argument('--arm-limit-softness', type=float, default=0.1, help='R1_A7: weight of the soft joint-limit barrier that discourages the arm from riding its limits; 0 disables')
-    parser.add_argument('--arm-posture-weight', type=float, default=0.0, help='R1_A7: weight pulling the arm posture toward the activation posture; 0 disables')
+    parser.add_argument('--arm-posture-weight', type=float, default=0.02, help='R1_A7: weight pulling the arm posture toward the activation posture. This is the term that stops the elbow from drifting into a twisted pose over a session: with 7 DoF and only a wrist pose target there is a free null space and nothing else anchors it. Measured on the real URDF over a 120-frame reach sweep (validate_redundancy.py): 0.0 leaves the elbow travelling 0.685 rad, 0.02 cuts that to 0.629 with position tracking unchanged (+8%%) and wrist orientation error 0.089 -> 0.131 rad, 0.05 cuts it to 0.575 but costs 0.187 rad and starts riding joint limits. 0.02 is the knee of that curve; 0 disables')
     parser.add_argument('--arm-velocity-limit', type=float, default=30.0, help='R1_A7: safety cap on how fast the published arm POSITION target may move, in rad/s. 30 ~= off; set 3.0 to run in the conservative capped mode instead of the dq feed-forward.')
     parser.add_argument('--arm-dq-feedforward', choices=['on', 'off'], default='on', help='R1_A7: feed the target velocity into the servo dq field so the arm follows the commanded motion instead of chasing it with start-stop bursts (default on).')
     parser.add_argument('--arm-dq-limit', type=float, default=6.0, help='R1_A7: clamp on the feed-forward velocity in rad/s (safety net, not a tracking limit).')
@@ -1087,12 +1087,16 @@ if __name__ == '__main__':
                         limit_weight=args.arm_limit_softness,
                         nominal_arm_q=post_recenter_motor_q[:14],
                     )
-                    if args.arm_limit_softness > 0.0:
-                        logger_mp.info(
-                            "[R1 IK] redundancy terms: limit_softness=%.3g posture_weight=%.3g "
-                            "nominal=activation posture",
-                            args.arm_limit_softness, args.arm_posture_weight,
-                        )
+                    # Always reported: these two weights are what keep the elbow from
+                    # drifting into a twisted pose, and a silent zero here is exactly
+                    # how that protection went missing before.
+                    logger_mp.info(
+                        "[R1 IK] redundancy terms: limit_softness=%.3g posture_weight=%.3g "
+                        "(%s) nominal=activation posture",
+                        args.arm_limit_softness, args.arm_posture_weight,
+                        "elbow drift protection on" if args.arm_posture_weight > 0.0
+                        else "elbow drift protection OFF",
+                    )
                     arm_ctrl.start_publishing()
                     r1_waist_to_root = np.array([
                         [math.cos(r1_waist_yaw_reference), -math.sin(r1_waist_yaw_reference), 0.0],

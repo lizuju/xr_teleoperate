@@ -2,6 +2,12 @@
 # R1_A7 实机遥操（Vector）— 2026-09-15
 #
 # 这里固定了 R1_A7 的启动参数，并把「大臂限速」做成默认值：
+#   ARM_POSTURE_WEIGHT  把手臂姿态拉回激活时姿态的权重，默认 0.02 —— 这是防「手肘扭住」的那一项。
+#                       7 自由度只有腕部位姿目标，存在一个自由的零空间，不锚住它肘就会慢慢漂到怪角度。
+#                       实测（validate_redundancy.py，真实 URDF，120 帧扫掠）：0.0 时肘行程 0.685 rad，
+#                       0.02 降到 0.629 而位置跟踪基本不变（+8%）、腕部姿态误差 0.089→0.131 rad；
+#                       0.05 能降到 0.575 但姿态误差到 0.187 且开始贴关节限位。0 = 关闭。
+#   ARM_LIMIT_SOFTNESS  软关节限位壁垒的权重，默认 0.1（0 = 关闭）。
 #   ARM_DQ_FEEDFORWARD  默认 off —— 与 2026-09-14 的生产行为一致：dq 恒为 0，纯位置控制。
 #                       设 on 则把目标速度作为速度前馈下发给电机（原来 dq 恒为 0，
 #                       纯位置控制，所以手臂追不上快速的手部动作，表现为一卡一卡）。
@@ -58,6 +64,8 @@ exec "$python" -u teleop_hand_and_arm.py \
   --linker-o6-method vector \
   --linker-o6-urdf-root "${dev_root}/linkerhand-urdf/O6" \
   --waist-follow \
+  --arm-limit-softness "${ARM_LIMIT_SOFTNESS:-0.1}" \
+  --arm-posture-weight "${ARM_POSTURE_WEIGHT:-0.02}" \
   --arm-velocity-limit "${ARM_VELOCITY_LIMIT:-30.0}" \
   --arm-dq-feedforward "${ARM_DQ_FEEDFORWARD:-off}" \
   --arm-dq-limit "${ARM_DQ_LIMIT:-6.0}" \
