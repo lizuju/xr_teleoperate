@@ -1758,6 +1758,7 @@ if __name__ == '__main__':
                     "left_ik_target": left_ik_target.tolist(),
                     "right_ik_target": right_ik_target.tolist(),
                     "waist_yaw_actual_rad": waist_yaw_actual,
+                    "waist_follow": (lambda _s: _s if isinstance(_s, dict) else None)(getattr(globals().get("waist_follower"), "last_state", None)),
                     "waist_yaw_target_rad": waist_yaw_target,
                     "head_q_target": head_q_target.tolist(),
                     "q_actual": current_lr_arm_q.tolist(),
