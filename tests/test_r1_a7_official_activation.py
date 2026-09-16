@@ -148,9 +148,7 @@ class R1A7OfficialActivationTest(unittest.TestCase):
 
     def test_deferred_controller_emits_nothing_until_activation_then_recenters_head_and_waist(self):
         namespace = load_r1_controller_namespace()
-        controller = namespace["R1_A7_ArmController"](
-            deferred_activation=True, target_velocity_limit=0.0,
-        )
+        controller = namespace["R1_A7_ArmController"](deferred_activation=True)
         self.assertEqual(FakePublisher.instances, [])
         self.assertFalse(controller.active)
 

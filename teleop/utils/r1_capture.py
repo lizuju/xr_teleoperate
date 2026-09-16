@@ -97,14 +97,7 @@ def capture_metadata(args, camera_config, retargeter, calibration=None):
         "units": {"arm_and_body_qpos": "rad", "arm_qvel": "rad/s",
                   "arm_torque": "N*m measured at the joint (DDS tau_est)",
                   "arm_torque_command": "N*m requested feed-forward (arm_tau)",
-                  "hand_qpos": "normalized_vendor_axis_0_to_1", "hand_points": "m",
-                  "hand_qvel": "normalized_0_to_1 relative joint speed, not rad/s",
-                  "hand_torque": ("normalized_0_to_1 relative joint torque from the O6 "
-                                  "telemetry block, not N*m"),
-                  "hand_temperature": "raw device register value",
-                  "hand_errors": ("per-joint O6 fault code; all zeros means no fault was "
-                                  "reported. PC2 only fills reserve[0] once hand_dds_service "
-                                  "forwards hand_state.errors")},
+                  "hand_qpos": "normalized_vendor_axis_0_to_1", "hand_points": "m"},
         "hand_axis_normalization": {
             side: {"lower_rad": hand.hardware_lower.tolist(), "upper_rad": hand.hardware_upper.tolist(),
                    "formula": "q_normalized = (q_rad - lower_rad) / (upper_rad - lower_rad)"}
@@ -142,26 +135,6 @@ def capture_metadata(args, camera_config, retargeter, calibration=None):
         "models": {name: {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
                    for name, path in models.items()},
     }
-
-
-def _end_effector_state(entry):
-    """One hand's recorded state.
-
-    The O6 reports joint speed, torque and temperature alongside position. Those
-    reach us normalised to 0..1 (the device register is one byte), so they are
-    logged as the relative measures they are and never as N*m or rad/s. A
-    channel the firmware did not send stays an empty list, which the offline
-    checker reads as "absent", not as zero.
-    """
-    def channel(name):
-        values = entry.get(name)
-        if not values or any(value is None for value in values):
-            # A channel the firmware did not send is absent, never a zero reading.
-            return []
-        return [float(value) for value in values]
-    return {"qpos": entry["q"], "qvel": channel("qvel"),
-            "torque": channel("torque"), "temperature": channel("temperature"),
-            "errors": channel("errors")}
 
 
 class R1Capture:
@@ -260,8 +233,8 @@ class R1Capture:
                          "torque": [] if torque is None else [float(value) for value in torque[:7]]},
             "right_arm": {"qpos": state["q"][7:], "qvel": state["dq"][7:],
                           "torque": [] if torque is None else [float(value) for value in torque[7:]]},
-            "left_ee": _end_effector_state(hand["state"]["left"]),
-            "right_ee": _end_effector_state(hand["state"]["right"]),
+            "left_ee": {"qpos": hand["state"]["left"]["q"], "qvel": [], "torque": []},
+            "right_ee": {"qpos": hand["state"]["right"]["q"], "qvel": [], "torque": []},
             "body": {"qpos": [state["waist_q"], *state["head_q"]]},
         }
         actions = {

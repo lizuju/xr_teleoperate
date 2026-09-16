@@ -68,9 +68,6 @@ class R1HeadWaistFollower:
         self._trigger_sign = 0.0
         self._velocity = 0.0
         self._goal = waist_actual
-        # Published for the alignment diagnostic; see update().
-        self.residual = 0.0
-        self.last_state = None
 
     def update(self, current_head_pose, reference_head_pose, waist_actual, now):
         current = _finite_pose(current_head_pose, "current_head_pose")
@@ -172,23 +169,4 @@ class R1HeadWaistFollower:
         head_target = np.clip(
             [pitch, yaw], [-0.62832, -2.0071], [0.62832, 2.0071],
         )
-        # Plain-data snapshot of this update, so a standing oscillation can be
-        # attributed instead of guessed at. Head-tracking noise shows up in
-        # total_head_yaw_rad, deadband cycling in following/residual_rad, and a
-        # waist servo that cannot hold its command in target_rad against the
-        # waist_actual_rad the caller feeds back on the next update.
-        self.residual = float(residual)
-        self.last_state = {
-            "following": bool(self.following),
-            "total_head_yaw_rad": float(self.total_yaw),
-            "residual_rad": float(residual),
-            "goal_rad": float(self._goal),
-            "target_rad": float(self.waist_target),
-            "velocity_rad_s": float(self._velocity),
-            "engage_threshold_rad": float(self.engage_threshold),
-            "waist_reference_rad": float(self.waist_reference),
-            "waist_actual_rad": float(waist_actual),
-            "heading_valid": bool(heading_is_valid),
-            "tracking_timed_out": bool(timed_out),
-        }
         return head_target, self.waist_target

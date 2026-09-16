@@ -33,9 +33,6 @@ class LinkerO6Controller:
         self.right_state_time = None
         self.left_gate_mode = None
         self.right_gate_mode = None
-        # Speeds, joint torque and temperature the O6 reports next to position.
-        self.left_aux = None
-        self.right_aux = None
         self.release_times = [None, None]
         self.left_action = None
         self.right_action = None
@@ -72,43 +69,11 @@ class LinkerO6Controller:
         modes = {state.mode for state in message.states}
         if len(modes) != 1 or not modes.issubset({GATE_REQUIRE_RELEASE, GATE_READY, GATE_ARMED}):
             raise RuntimeError(f"{name} command gate state is invalid")
-        values = cls._values([state.q for state in message.states], f"{name} state")
-
-        def channel(attribute):
-            # The O6 exposes speeds, joint torque and temperature in the same
-            # register block as position. The DDS layer forwards them normalised
-            # to 0..1 because the device register is a single byte, so these are
-            # relative measures, not calibrated rad/s, N*m or degrees C.
-            result = []
-            for state in message.states:
-                try:
-                    value = getattr(state, attribute, None)
-                except Exception:
-                    value = None
-                result.append(None if value is None else float(value))
-            return result
-
-        def error_channel():
-            # PC2 reserves reserve[0] for the per-joint fault code; the field
-            # defaults to zero, which reads as "no fault reported".
-            result = []
-            for state in message.states:
-                try:
-                    reserve = getattr(state, "reserve", None)
-                    result.append(None if not reserve else int(reserve[0]))
-                except Exception:
-                    result.append(None)
-            return result
-
-        errors = error_channel()
-        aux = {"qvel": channel("dq"), "torque": channel("tau_est"),
-               "temperature": channel("temperature"),
-               "errors": errors if any(value is not None for value in errors) else None}
-        return values, aux, modes.pop()
+        return cls._values([state.q for state in message.states], f"{name} state"), modes.pop()
 
     def _on_left_state(self, message):
         try:
-            state, aux, gate_mode = self._state_values(message, "left")
+            state, gate_mode = self._state_values(message, "left")
         except (ValueError, RuntimeError) as error:
             with self.state_lock:
                 self.left_state_error = error
@@ -117,7 +82,6 @@ class LinkerO6Controller:
             now = time.monotonic()
             gap = None if self.left_state_time is None else now - self.left_state_time
             self.left_state = state
-            self.left_aux = aux
             self.left_gate_mode = gate_mode
             self.left_state_count += 1
             self.left_state_time = now
@@ -128,7 +92,7 @@ class LinkerO6Controller:
 
     def _on_right_state(self, message):
         try:
-            state, aux, gate_mode = self._state_values(message, "right")
+            state, gate_mode = self._state_values(message, "right")
         except (ValueError, RuntimeError) as error:
             with self.state_lock:
                 self.right_state_error = error
@@ -137,7 +101,6 @@ class LinkerO6Controller:
             now = time.monotonic()
             gap = None if self.right_state_time is None else now - self.right_state_time
             self.right_state = state
-            self.right_aux = aux
             self.right_gate_mode = gate_mode
             self.right_state_count += 1
             self.right_state_time = now
@@ -345,19 +308,13 @@ class LinkerO6Controller:
             if self.left_state is None or self.right_state is None:
                 raise RuntimeError("Linker O6 state is not ready")
             states = {}
-            for side, values, aux, timestamp, sequence, mode in (
-                ("left", self.left_state, self.left_aux, self.left_state_time,
-                 self.left_state_count, self.left_gate_mode),
-                ("right", self.right_state, self.right_aux, self.right_state_time,
-                 self.right_state_count, self.right_gate_mode),
+            for side, values, timestamp, sequence, mode in (
+                ("left", self.left_state, self.left_state_time, self.left_state_count, self.left_gate_mode),
+                ("right", self.right_state, self.right_state_time, self.right_state_count, self.right_gate_mode),
             ):
-                aux = aux or {}
                 states[side] = {
                     "q": values.tolist(), "monotonic_ns": int(timestamp * 1e9),
                     "sequence": sequence, "mode": mode,
-                    "qvel": aux.get("qvel"), "torque": aux.get("torque"),
-                    "temperature": aux.get("temperature"),
-                    "errors": aux.get("errors"),
                 }
             return {
                 "state": states,

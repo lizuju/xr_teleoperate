@@ -90,10 +90,7 @@ class SideIndependenceTest(unittest.TestCase):
             "hand_tracking_freshness": hand_tracking_freshness,
             "held_head_q_target": np.array([0.1, 0.2]),
             "last_fresh_tele_data": sample, "tracking_hold_active": False,
-            # The arm loop consumes the ordered motion queue; the hand loop still
-            # reads the newest frame, so both entry points are stubbed.
-            "tv_wrapper": Mock(get_tele_data=Mock(return_value=sample),
-                              get_arm_tele_data=Mock(return_value=sample)),
+            "tv_wrapper": Mock(get_tele_data=Mock(return_value=sample)),
             "is_fresh_motion_data": Mock(return_value=True),
             "logger_mp": Mock(), "arm_ctrl": controller, "arm_ik": ik,
             "waist_follower": follower, "linker_o6_loop": None,

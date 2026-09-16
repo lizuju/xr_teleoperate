@@ -302,35 +302,6 @@ def acquire_live_writer_lock(live_state_path: Path):
     lock_file.flush()
     return lock_file
 
-class PalmFrame:
-    """A palm camera frame with its red and blue channels put back.
-
-    The two O6 palm cameras are UVC modules that hand us MJPG with red and blue
-    transposed relative to every other JPEG in this pipeline, so red arrives as
-    blue and yellow as green. The head stereo comes off a different path
-    (GStreamer H.264) and is already correct, which is why the correction is
-    applied here at the palm entry point rather than globally.
-
-    A new object is returned instead of swapping the pixels in place: the image
-    client's ring buffer hands back the same TeleImage until a new frame lands,
-    so an in-place swap would be applied twice.
-    """
-
-    __slots__ = ("bgr", "sequence", "received_monotonic_ns")
-
-    def __init__(self, frame):
-        self.bgr = np.ascontiguousarray(frame.bgr[:, :, ::-1])
-        self.sequence = frame.sequence
-        self.received_monotonic_ns = frame.received_monotonic_ns
-
-
-def correct_palm_frame(frame):
-    """Wrap a palm frame so red and blue are the right way round."""
-    if frame is None or frame.bgr is None:
-        return frame
-    return PalmFrame(frame)
-
-
 def resolve_run_camera_calibration(args, root):
     """Resolve the camera calibration for this run, or stop before touching robot state.
 
@@ -357,7 +328,7 @@ def resolve_run_camera_calibration(args, root):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     # basic control parameters
-    parser.add_argument('--frequency', type = float, default = 40.0, help = 'control loop and record frequency. The arm consumes one queued hand sample per tick, so a sample waits on average half a tick before it is used, and raising this shortens that wait (40 -> 60 Hz is ~12 ms -> ~8 ms) at the cost of more IK solves per second. 40 is the default because it is the rate the loop demonstrably holds: at 60 Hz the measured body_max reached 21.3 ms against a 16.7 ms budget, so the loop had no slack, and the 4 ms it buys is noise next to the 196 ms median sample age seen in the same session. Read body_max in the exit summary before raising it.')
+    parser.add_argument('--frequency', type = float, default = 40.0, help = 'control and record \'s frequency')
     parser.add_argument('--input-mode', type=str, choices=['hand', 'controller'], default='hand', help='Select XR device input tracking source')
     parser.add_argument('--display-mode', type=str, choices=['immersive', 'ego', 'pass-through'], default='immersive', help='Select XR device display mode')
     parser.add_argument('--arm', type=str, choices=['G1_29', 'G1_23', 'H1_2', 'H1', 'H2', 'R1_A5', 'R1_A7'], default='G1_29', help='Select arm controller')
@@ -378,10 +349,8 @@ if __name__ == '__main__':
     parser.add_argument('--linker-o6-urdf-root', type=str, default='/home/hnh/unitree_r1_dev/linkerhand-urdf/O6', help='Official Linker O6 URDF root')
     parser.add_argument('--linker-o6-method', choices=['vector', 'position', 'dexpilot'], default='vector', help='dex-retargeting optimizer for Linker O6')
     parser.add_argument('--linker-o6-live-state', type=str, default=None, help='Atomic JSON target snapshot for isolated Linker O6 simulation')
-    parser.add_argument('--arm-translation-scale', type=float, default=0.87, help='R1_A7 Cartesian translation scale for the hand displacement, measured from the '
-                        'activation anchor. Rotations are never scaled. The robot arm is shorter than the operator arm, so a proportional mapping is the ratio of the '
-                        'two: the R1_A7 shoulder-to-wrist chain is ~0.65 m against ~0.75 m for an adult arm, giving 0.87 (default). 1.0 asks the arm to reach 15%% '
-                        'further than the operator and saturates the wrist more often; 0.7 under-reaches by 19%%, so the operator has to move further than the robot does.')
+    parser.add_argument('--arm-translation-scale', type=float, default=1.0, help='R1_A7 Cartesian translation scale relative to Vision Pro motion; 1.0 keeps the '
+                        'operator motion 1:1, higher values amplify it and reach the workspace edge sooner')
     parser.add_argument('--arm-diagnostic-dir', type=str, default=None, help='Directory for R1_A7 alignment JSONL diagnostics')
     parser.add_argument('--waist-follow', action='store_true', help='R1_A7: sustained head turns drive waist yaw with feedback-based head and arm compensation')
     parser.add_argument('--waist-follow-threshold-deg', type=float, default=12.0, help='Head yaw needed to engage waist following (degrees)')
@@ -403,8 +372,6 @@ if __name__ == '__main__':
     parser.add_argument('--arm-dq-feedforward', choices=['on', 'off'], default='on', help='R1_A7: feed the target velocity into the servo dq field so the arm follows the commanded motion instead of chasing it with start-stop bursts (default on).')
     parser.add_argument('--arm-dq-limit', type=float, default=6.0, help='R1_A7: clamp on the feed-forward velocity in rad/s (safety net, not a tracking limit).')
     parser.add_argument('--arm-dq-filter', type=float, default=0.5, help='R1_A7: low-pass factor for the feed-forward velocity derivative, 1.0 = unfiltered.')
-    parser.add_argument('--arm-target-velocity-limit', type=float, default=4.0, help='R1_A7: how fast the arm joint REFERENCE may move, in rad/s. The hand stream reaches the loop unevenly (measured 11 fresh samples/s, worst sample age 446 ms), so one stale sample turns into a step of up to 84 deg of joint motion in a single 25 ms tick while the joints saturate near 5-7 rad/s; that mismatch is the start-stop stutter. 4.0 keeps up with ordinary hand motion (~0.8 rad/s sustained, ~2 rad/s peaks) and stretches only the catch-up. 4.0 is the default because that is the value the operator reported as smooth; raising it to 5.0 on 2026-09-16 made the arm stutter again on the very next sessions. The earlier argument for 5.0 -- peak joint speed 5.01 rad/s against a 7.19 rad/s measured capability -- was wrong: 7.19 was measured without the shaper, during the wild catch-ups, and is not a speed that feels smooth. 0 disables the shaper and restores the raw target.')
-    parser.add_argument('--arm-target-accel-limit', type=float, default=40.0, help='R1_A7: how fast the shaper may change the reference speed, in rad/s^2; 0 removes the ramp and leaves a pure speed limit.')
     parser.add_argument('--wrist-display', type=str, choices=['auto', 'both', 'left', 'right', 'off'], default='auto', help='Vision Pro wrist camera panels: auto/both show both sides, left/right show one, off disables them (panels also need the wrist cameras to publish WebRTC on PC2)')
     parser.add_argument('--wrist-panel-distance', type=float, default=1.2, help='Distance of the wrist panels in front of the eyes, in meters')
     parser.add_argument('--wrist-panel-offset', type=float, nargs=2, default=[0.40, 0.40], metavar=('X', 'Y'), help='Wrist panel centre offset in meters; X is mirrored per side, Y is downwards')
@@ -492,10 +459,8 @@ if __name__ == '__main__':
     # Per-iteration loop-jitter accounting. The 10 Hz JSONL sample cannot show a
     # stall that lasts a few iterations, which is exactly what a stop-and-go arm
     # feels like, so every iteration feeds this and the summary reports the tail.
-    # max_body_ms is the iteration cost with the sleep removed: it is what decides
-    # whether --frequency is actually reachable on this machine.
     loop_jitter = {"iterations": 0, "max_ms": 0.0, "over_40ms": 0, "over_80ms": 0,
-                   "worst_at_s": None, "max_body_ms": 0.0}
+                   "worst_at_s": None}
     loop_jitter_started = None
     workspace_diagnostic_next_time = 0.0
     workspace_saturation_events = 0
@@ -581,11 +546,7 @@ if __name__ == '__main__':
                 if wrist_cfg.get('enable_zmq'):
                     wrist_panels.append(side)
         wrist_image_shape = (camera_config.get('left_wrist_camera') or {}).get('image_shape') or [480, 640]
-        # Both palm frames are quarter-turned on their way to the panels (see
-        # TeleVuerWrapper.WRIST_PANEL_ROTATION), so the panel takes the camera's
-        # portrait shape and aspect rather than its native landscape one.
-        wrist_panel_shape = (int(wrist_image_shape[1] * 0.5), int(wrist_image_shape[0] * 0.5))
-        wrist_panel_aspect = float(wrist_panel_shape[1]) / float(wrist_panel_shape[0])
+        wrist_panel_aspect = float(wrist_image_shape[1]) / float(wrist_image_shape[0])
         if wrist_panels:
             logger_mp.info(
                 f"[XR WRIST PANELS] sides={wrist_panels} "
@@ -614,7 +575,6 @@ if __name__ == '__main__':
                                      wrist_panel_distance=args.wrist_panel_distance,
                                      wrist_panel_offset=tuple(args.wrist_panel_offset),
                                      wrist_panel_aspect=wrist_panel_aspect,
-                                     wrist_panel_shape=wrist_panel_shape,
                                      arm_reference_mode="head_yaw"
                                      )
 
@@ -627,13 +587,13 @@ if __name__ == '__main__':
             """
             left_frame = right_frame = None
             if camera_config['left_wrist_camera']['enable_zmq'] and (args.record or 'left' in wrist_panels):
-                left_frame = correct_palm_frame(img_client.get_left_wrist_frame())
+                left_frame = img_client.get_left_wrist_frame()
                 if left_frame is not None and 'left' in wrist_panels:
-                    tv_wrapper.render_wrist_to_xr('left', left_frame.bgr, left_frame.sequence)
+                    tv_wrapper.render_wrist_to_xr('left', left_frame.bgr)
             if camera_config['right_wrist_camera']['enable_zmq'] and (args.record or 'right' in wrist_panels):
-                right_frame = correct_palm_frame(img_client.get_right_wrist_frame())
+                right_frame = img_client.get_right_wrist_frame()
                 if right_frame is not None and 'right' in wrist_panels:
-                    tv_wrapper.render_wrist_to_xr('right', right_frame.bgr, right_frame.sequence)
+                    tv_wrapper.render_wrist_to_xr('right', right_frame.bgr)
             return left_frame, right_frame
 
         if args.ee == "linker_o6":
@@ -873,8 +833,6 @@ if __name__ == '__main__':
                         dq_feedforward=args.arm_dq_feedforward == 'on',
                         dq_feedforward_limit=args.arm_dq_limit,
                         dq_feedforward_filter=args.arm_dq_filter,
-                        target_velocity_limit=args.arm_target_velocity_limit,
-                        target_accel_limit=args.arm_target_accel_limit,
                     )
                     arm_ik = None
                 else:
@@ -885,8 +843,6 @@ if __name__ == '__main__':
                         dq_feedforward=args.arm_dq_feedforward == 'on',
                         dq_feedforward_limit=args.arm_dq_limit,
                         dq_feedforward_filter=args.arm_dq_filter,
-                        target_velocity_limit=args.arm_target_velocity_limit,
-                        target_accel_limit=args.arm_target_accel_limit,
                     )
 
         # end-effector
@@ -1168,8 +1124,6 @@ if __name__ == '__main__':
                         left_align_target[:3, :3] = left_initial_pose[:3, :3]
                         right_align_target[:3, :3] = right_initial_pose[:3, :3]
                         arm_ik.reset_smoothing(reference_q=current_q)
-                        if hasattr(arm_ctrl, "reset_target_shaper"):
-                            arm_ctrl.reset_target_shaper(current_q)
                         align_q, align_tau = arm_ik.solve_ik(
                             left_align_target,
                             right_align_target,
@@ -1398,9 +1352,7 @@ if __name__ == '__main__':
                 if args.record or xr_need_local_img:
                     head_img = img_client.get_head_frame()
                 if xr_need_local_img and head_img.bgr is not None:
-                    # The camera sequence lets the render path skip a repeated frame:
-                    # the head camera runs near 7.5 Hz while the XR scene ticks at 30.
-                    tv_wrapper.render_to_xr(head_img.bgr, head_img.sequence)
+                    tv_wrapper.render_to_xr(head_img.bgr)
             # The panels need the frames even when recording is off; the fetch is a
             # cached ring-buffer read (measured 0.002 ms) plus one resize.
             left_wrist_img, right_wrist_img = grab_wrist_frames()
@@ -1430,9 +1382,7 @@ if __name__ == '__main__':
                         publish_reset_category(1, reset_pose_publisher)
 
             # get xr's tele data
-            # One queued hand sample per tick, so a burst advances the arm
-            # reference in steps instead of collapsing to its last frame.
-            tele_data = tv_wrapper.get_arm_tele_data()
+            tele_data = tv_wrapper.get_tele_data()
             capture_mode = "following"
             run_motion = True
             if R1_PAUSE is not None and R1_PAUSE.paused:
@@ -1476,8 +1426,6 @@ if __name__ == '__main__':
                     held_head_q_target = r1_head_q_offset.copy()
                     wrist_holds = (R1WristHold(r1_robot_left_reference), R1WristHold(r1_robot_right_reference))
                     arm_ik.reset_smoothing(reference_q=held_q)
-                    if hasattr(arm_ctrl, "reset_target_shaper"):
-                        arm_ctrl.reset_target_shaper(held_q)
                     last_fresh_tele_data = tele_data
                     tracking_hold_active = False
                     if (
@@ -1512,8 +1460,6 @@ if __name__ == '__main__':
                     last_fresh_tele_data = tele_data
                     if tracking_hold_active:
                         arm_ik.reset_smoothing()
-                        if hasattr(arm_ctrl, "reset_target_shaper"):
-                            arm_ctrl.reset_target_shaper()
                         if args.waist_follow:
                             waist_follower.reset(arm_ctrl.get_current_waist_yaw(), time.monotonic())
                         logger_mp.info("R1_A7 Vision tracking resumed.")
@@ -1522,8 +1468,6 @@ if __name__ == '__main__':
                     tele_data = last_fresh_tele_data
                     if not tracking_hold_active:
                         arm_ik.reset_smoothing()
-                        if hasattr(arm_ctrl, "reset_target_shaper"):
-                            arm_ctrl.reset_target_shaper()
                         logger_mp.warning(
                             "R1_A7 Vision tracking is stale; holding the last tracked pose until tracking resumes."
                         )
@@ -1673,8 +1617,6 @@ if __name__ == '__main__':
                 fresh_after_ik = hand_tracking_freshness(tele_data, args.tracking_timeout, time.monotonic())
                 if any(before and not after for before, after in zip(hand_fresh, fresh_after_ik)):
                     arm_ik.reset_smoothing()
-                    if hasattr(arm_ctrl, "reset_target_shaper"):
-                        arm_ctrl.reset_target_shaper()
                     for hold, fresh in zip(wrist_holds, fresh_after_ik):
                         if not fresh:
                             hold.hold()
@@ -1685,8 +1627,6 @@ if __name__ == '__main__':
                     run_motion = False
             elif run_motion and args.waist_follow and not is_fresh_motion_data(tele_data, args.tracking_timeout):
                 arm_ik.reset_smoothing()
-                if hasattr(arm_ctrl, "reset_target_shaper"):
-                    arm_ctrl.reset_target_shaper()
                 arm_ctrl.hold_waist()
                 tracking_hold_active = True
                 capture_mode = "tracking_hold"
@@ -1818,22 +1758,11 @@ if __name__ == '__main__':
                     "left_ik_target": left_ik_target.tolist(),
                     "right_ik_target": right_ik_target.tolist(),
                     "waist_yaw_actual_rad": waist_yaw_actual,
-                    "waist_follow": (lambda _s: _s if isinstance(_s, dict) else None)(getattr(globals().get("waist_follower"), "last_state", None)),
                     "waist_yaw_target_rad": waist_yaw_target,
                     "head_q_target": head_q_target.tolist(),
                     "q_actual": current_lr_arm_q.tolist(),
                     "dq_actual": current_lr_arm_dq.tolist(),
                     "q_ik_command": sol_q.tolist(),
-                    # What the servos were actually given, after the reference shaper;
-                    # comparing the two is the only way to see the shaper working on-robot.
-                    "q_reference_command": (
-                        arm_ctrl.get_reference_q().tolist()
-                        if hasattr(arm_ctrl, "get_reference_q") else sol_q.tolist()
-                    ),
-                    "arm_target_shaper": getattr(arm_ctrl, "get_target_shaper_snapshot", lambda: None)(),
-                    # Lowest bus voltage so far: the robot lost power twice on
-                    # 2026-09-16 and this is the only forward-looking signal.
-                    "power": getattr(arm_ctrl, "get_power_snapshot", lambda: None)(),
                     "tau_ik_command": sol_tauff.tolist(),
                     "tau_actual": arm_tau_actual.tolist() if arm_tau_actual is not None else None,
                     "workspace": workspace_saturation,
@@ -2016,8 +1945,6 @@ if __name__ == '__main__':
 
             current_time = time.time()
             time_elapsed = current_time - start_time
-            if time_elapsed * 1000.0 > loop_jitter["max_body_ms"]:
-                loop_jitter["max_body_ms"] = time_elapsed * 1000.0
             sleep_time = max(0, (1 / args.frequency) - time_elapsed)
             time.sleep(sleep_time)
             logger_mp.debug(f"main process sleep: {sleep_time}")
@@ -2043,31 +1970,15 @@ if __name__ == '__main__':
                     "the arm kept its last pose until tracking returned.",
                     tracking_hold_events, workspace_saturation_events, arm_diagnostic_sequence,
                 )
-                # limited_ticks is how often the raw IK target asked for more speed than
-                # the servos can deliver; max_residual_deg is the lag traded for smoothness.
-                # Raise --arm-target-velocity-limit if the lag can be felt.
-                if hasattr(arm_ctrl, "get_target_shaper_snapshot"):
-                    logger_mp.info(
-                        "[R1 ARM SHAPER] %s",
-                        json.dumps(arm_ctrl.get_target_shaper_snapshot()),
-                    )
-                # Reported even when the session aborted, which is exactly when the
-                # robot cut power: a sagging minimum against the resting voltage is
-                # what separates an electrical stop from a commanded one.
-                if hasattr(arm_ctrl, "get_power_snapshot"):
-                    logger_mp.info(
-                        "[R1 POWER] %s", json.dumps(arm_ctrl.get_power_snapshot())
-                    )
                 # A stop-and-go arm shows up here as iterations that missed the loop
                 # budget, not as a change in the 10 Hz diagnostic averages.
                 logger_mp.info(
-                    "[R1 LOOP JITTER] budget=%.1fms max=%.1fms body_max=%.1fms over_40ms=%d "
-                    "over_80ms=%d worst_at=%.1fs of %d iterations. body_max is the iteration cost "
-                    "without the sleep; if it approaches the budget the loop cannot hold %g Hz.",
-                    1000.0 / args.frequency, loop_jitter["max_ms"], loop_jitter["max_body_ms"],
+                    "[R1 LOOP JITTER] budget=%.1fms max=%.1fms over_40ms=%d over_80ms=%d "
+                    "worst_at=%.1fs of %d iterations",
+                    1000.0 / args.frequency, loop_jitter["max_ms"],
                     loop_jitter["over_40ms"], loop_jitter["over_80ms"],
                     loop_jitter["worst_at_s"] if loop_jitter["worst_at_s"] is not None else -1.0,
-                    loop_jitter["iterations"], args.frequency,
+                    loop_jitter["iterations"],
                 )
         except Exception as e:
             logger_mp.warning(f"Failed to write session summary: {e}")

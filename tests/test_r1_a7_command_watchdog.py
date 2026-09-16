@@ -15,9 +15,6 @@ class R1A7CommandWatchdogTest(unittest.TestCase):
         self.namespace = load_r1_controller_namespace()
         self.controller = self.namespace["R1_A7_ArmController"](
             deferred_activation=True, simulation_mode=True,
-            # These tests are about the command watchdog and the velocity feed-forward,
-            # so the reference shaper is pinned to a pass-through.
-            target_velocity_limit=0.0,
         )
         self.controller.lowstate_subscriber.Close()
         self.now = 10.0
@@ -185,9 +182,7 @@ class R1A7CancelableActivationTest(unittest.TestCase):
     def setUp(self):
         FakePublisher.instances.clear()
         self.namespace = load_r1_controller_namespace()
-        self.controller = self.namespace["R1_A7_ArmController"](
-            deferred_activation=True, target_velocity_limit=0.0,
-        )
+        self.controller = self.namespace["R1_A7_ArmController"](deferred_activation=True)
 
     def tearDown(self):
         self.controller.stop()
@@ -270,9 +265,6 @@ class R1A7VelocityFeedforwardTest(unittest.TestCase):
         self.namespace = load_r1_controller_namespace()
         self.controller = self.namespace["R1_A7_ArmController"](
             deferred_activation=True, simulation_mode=True,
-            # These tests are about the command watchdog and the velocity feed-forward,
-            # so the reference shaper is pinned to a pass-through.
-            target_velocity_limit=0.0,
         )
         self.controller.lowstate_subscriber.Close()
         self.now = 10.0
@@ -343,7 +335,6 @@ class R1A7VelocityFeedforwardTest(unittest.TestCase):
         """--arm-dq-feedforward off must restore the old dq=0 command exactly."""
         controller = self.namespace["R1_A7_ArmController"](
             deferred_activation=True, simulation_mode=True, dq_feedforward=False,
-            target_velocity_limit=0.0,
         )
         controller.lowstate_subscriber.Close()
         controller.msg = FakeLowCmd()

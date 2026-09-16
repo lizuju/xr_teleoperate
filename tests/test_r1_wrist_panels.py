@@ -182,12 +182,8 @@ class WristPanelWiringTest(unittest.TestCase):
         self.assertIn("def grab_wrist_frames():", self.source)
         self.assertIn("(args.record or 'left' in wrist_panels):", self.source)
         self.assertIn("(args.record or 'right' in wrist_panels):", self.source)
-        # The call stays unconditional; the camera sequence it carries is what lets
-        # render_wrist_to_xr drop a repeated frame without the caller gating it.
-        self.assertIn("tv_wrapper.render_wrist_to_xr('left', left_frame.bgr, left_frame.sequence)",
-                      self.source)
-        self.assertIn("tv_wrapper.render_wrist_to_xr('right', right_frame.bgr, right_frame.sequence)",
-                      self.source)
+        self.assertIn("tv_wrapper.render_wrist_to_xr('left', left_frame.bgr)", self.source)
+        self.assertIn("tv_wrapper.render_wrist_to_xr('right', right_frame.bgr)", self.source)
 
     def test_panels_are_fed_before_the_operator_arms_the_robot(self):
         """The pre-start waiting loop must publish frames too.
@@ -261,93 +257,3 @@ class WristPanelRenderLoopTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
-
-class HeadPlaneDedupTest(unittest.TestCase):
-    """The head camera runs at ~7.5 Hz while the render loop ticks at 30 Hz."""
-
-    def head_viewer(self, binocular=True, mode="immersive"):
-        from multiprocessing import Value
-
-        tele_vuer_class = load_televuer_module().TeleVuer
-        viewer = tele_vuer_class.__new__(tele_vuer_class)
-        viewer.binocular = binocular
-        viewer.display_mode = mode
-        viewer.img_width = 4
-        viewer.aspect_ratio = 2.0
-        viewer.img2display = np.zeros((2, 8, 3), dtype=np.uint8)
-        viewer.img_height = 2
-        viewer.xr_frame_sequence = Value("L", 0, lock=True)
-        viewer.wrist_panel_sides = ()
-        viewer.wrist_panel_frames = {}
-        viewer.wrist_panel_seq = {}
-        return viewer
-
-    def bump(self, viewer):
-        with viewer.xr_frame_sequence.get_lock():
-            viewer.xr_frame_sequence.value += 1
-
-    def test_first_call_always_draws_something(self):
-        viewer = self.head_viewer()
-        session = mock.Mock()
-        self.assertTrue(viewer._upsert_head_planes(session))
-        session.upsert.assert_called_once()
-
-    def test_a_repeated_frame_is_not_sent_twice(self):
-        viewer = self.head_viewer()
-        session = mock.Mock()
-        viewer._upsert_head_planes(session)
-        for _ in range(3):                       # 30 Hz loop, 7.5 Hz camera
-            self.assertFalse(viewer._upsert_head_planes(session))
-        session.upsert.assert_called_once()
-
-    def test_a_new_frame_is_sent(self):
-        viewer = self.head_viewer()
-        session = mock.Mock()
-        viewer._upsert_head_planes(session)
-        self.bump(viewer)
-        self.assertTrue(viewer._upsert_head_planes(session))
-        self.assertEqual(session.upsert.call_count, 2)
-
-    def test_force_republishes_without_a_new_frame(self):
-        viewer = self.head_viewer()
-        session = mock.Mock()
-        viewer._upsert_head_planes(session)
-        self.assertTrue(viewer._upsert_head_planes(session, force=True))
-
-    def test_binocular_draws_two_eye_planes_and_monocular_one(self):
-        stereo = self.head_viewer(binocular=True)
-        self.assertEqual([p.kwargs["key"] for p in stereo._head_plane_elements()],
-                         ["background-left", "background-right"])
-        mono = self.head_viewer(binocular=False)
-        self.assertEqual([p.kwargs["key"] for p in mono._head_plane_elements()],
-                         ["background-mono"])
-
-    def test_ego_mode_places_the_plane_further_and_smaller(self):
-        immersive = self.head_viewer(mode="immersive")._head_plane_elements()[0].kwargs
-        ego = self.head_viewer(mode="ego")._head_plane_elements()[0].kwargs
-        self.assertEqual((immersive["height"], immersive["distanceToCamera"]), (1, 1))
-        self.assertEqual((ego["height"], ego["distanceToCamera"]), (0.75, 2))
-
-    def test_a_repeated_wrist_frame_leaves_the_panel_sequence_alone(self):
-        viewer = panel_viewer(["left"])
-        viewer.render_wrist_to_xr("left", np.zeros((480, 640, 3), dtype=np.uint8), 7)
-        with viewer.wrist_panel_seq["left"].get_lock():
-            first = viewer.wrist_panel_seq["left"].value
-        viewer.render_wrist_to_xr("left", np.zeros((480, 640, 3), dtype=np.uint8), 7)
-        with viewer.wrist_panel_seq["left"].get_lock():
-            self.assertEqual(viewer.wrist_panel_seq["left"].value, first)
-        viewer.render_wrist_to_xr("left", np.zeros((480, 640, 3), dtype=np.uint8), 8)
-        with viewer.wrist_panel_seq["left"].get_lock():
-            self.assertEqual(viewer.wrist_panel_seq["left"].value, first + 1)
-
-    def test_panels_are_not_resent_while_their_frames_are_unchanged(self):
-        viewer = panel_viewer(["left"])
-        viewer.render_wrist_to_xr("left", np.zeros((480, 640, 3), dtype=np.uint8), 1)
-        session = mock.Mock()
-        self.assertTrue(viewer._upsert_wrist_panels(session))
-        self.assertFalse(viewer._upsert_wrist_panels(session))
-        session.upsert.assert_called_once()
-        viewer.render_wrist_to_xr("left", np.zeros((480, 640, 3), dtype=np.uint8), 2)
-        self.assertTrue(viewer._upsert_wrist_panels(session))
-        self.assertEqual(session.upsert.call_count, 2)

@@ -114,7 +114,6 @@ class R1HeadWaistIntegrationTest(unittest.TestCase):
                 workspace_position_tolerance_m=0.05, workspace_rotation_tolerance_rad=0.15,
                 arm_limit_softness=0.0, arm_posture_weight=0.0, arm_velocity_limit=30.0,
                 arm_dq_feedforward="on", arm_dq_limit=6.0, arm_dq_filter=0.5,
-                arm_target_velocity_limit=4.0, arm_target_accel_limit=40.0,
             ),
             "r1_a7_anchored": True, "r1_a7_deferred_real": True,
             "r1_independent_hands": False,
@@ -127,10 +126,7 @@ class R1HeadWaistIntegrationTest(unittest.TestCase):
             "workspace_diagnostic_next_time": 0.0, "workspace_warned_side": None,
             "workspace_saturation_events": 0,
             "r1_workspace_saturation": self.workspace_saturation,
-            # The arm loop consumes the ordered motion queue; the hand loop still
-            # reads the newest frame, so both entry points are stubbed.
-            "tv_wrapper": Mock(get_tele_data=Mock(return_value=tele_data),
-                              get_arm_tele_data=Mock(return_value=tele_data)),
+            "tv_wrapper": Mock(get_tele_data=Mock(return_value=tele_data)),
             "is_fresh_motion_data": Mock(side_effect=freshness),
             "logger_mp": Mock(), "arm_ctrl": controller, "arm_ik": ik,
             "waist_follower": follower, "linker_o6_loop": None,
@@ -556,8 +552,7 @@ class R1HeadWaistIntegrationTest(unittest.TestCase):
     def test_waist_simulation_uses_deferred_activation_and_no_real_mode_switch(self):
         settings = SimpleNamespace(arm="R1_A7", sim=True, motion=False, hand_only=False,
                                    arm_velocity_limit=30.0, arm_dq_feedforward="on",
-                                   arm_dq_limit=6.0, arm_dq_filter=0.5,
-                                   arm_target_velocity_limit=4.0, arm_target_accel_limit=40.0)
+                                   arm_dq_limit=6.0, arm_dq_filter=0.5)
         controller_branch = next(
             node for node in ast.walk(self.tree) if isinstance(node, ast.If)
             and ast.unparse(node.test) == "args.arm == 'R1_A7'"
@@ -572,7 +567,6 @@ class R1HeadWaistIntegrationTest(unittest.TestCase):
             motion_mode=False, simulation_mode=True, deferred_activation=True,
             arm_velocity_limit=30.0, dq_feedforward=True,
             dq_feedforward_limit=6.0, dq_feedforward_filter=0.5,
-            target_velocity_limit=4.0, target_accel_limit=40.0,
         )
         ik_constructor.assert_not_called()
         switches = [
