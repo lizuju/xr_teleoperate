@@ -402,3 +402,31 @@ class TeleVuerMotionDiagnosticsTest(unittest.TestCase):
         diagnostics = tele_vuer.get_tracking_diagnostics()
         self.assertNotIn("motion_interval_ms", diagnostics)
         tele_vuer._record_motion_interval(100.0)
+
+    def test_bin_labels_match_the_binning(self):
+        module = bare_televuer().get_tracking_diagnostics.__func__.__globals__
+        edges = module["EVENT_LOOP_LAG_EDGES_MS"]
+        labels = module["bin_labels"](edges)
+        index = module["bin_index"]
+        self.assertEqual(len(labels), len(edges))
+        self.assertEqual(index(0.5, edges), 0)
+        self.assertEqual(labels[index(0.5, edges)], "<=1")
+        self.assertEqual(labels[index(3.0, edges)], "2-5")
+        self.assertEqual(labels[index(1e9, edges)], ">=1600")
+        # every edge value lands in the bin that the label names
+        for position, edge in enumerate(edges):
+            self.assertEqual(index(edge, edges), min(position + 1, len(edges) - 1))
+
+    def test_event_loop_lag_is_reported_when_the_array_exists(self):
+        module = bare_televuer().get_tracking_diagnostics.__func__.__globals__
+        tele_vuer = bare_televuer()
+        tele_vuer.event_loop_lag_bins_shared = Array(
+            "L", len(module["EVENT_LOOP_LAG_EDGES_MS"]), lock=True)
+        with tele_vuer.event_loop_lag_bins_shared.get_lock():
+            tele_vuer.event_loop_lag_bins_shared[3] = 7
+        self.assertEqual(
+            tele_vuer.get_tracking_diagnostics()["event_loop_lag_ms"], {"5-10": 7})
+
+    def test_heartbeat_is_a_no_op_without_the_array(self):
+        tele_vuer = bare_televuer()
+        self.assertNotIn("event_loop_lag_ms", tele_vuer.get_tracking_diagnostics())
