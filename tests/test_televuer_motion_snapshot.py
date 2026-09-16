@@ -430,3 +430,135 @@ class TeleVuerMotionDiagnosticsTest(unittest.TestCase):
     def test_heartbeat_is_a_no_op_without_the_array(self):
         tele_vuer = bare_televuer()
         self.assertNotIn("event_loop_lag_ms", tele_vuer.get_tracking_diagnostics())
+
+
+class TeleVuerMotionQueueTest(unittest.TestCase):
+    """A burst of hand samples must reach the consumer one tick at a time."""
+
+    def build(self):
+        tele_vuer = bare_televuer()
+        module = tele_vuer.on_hand_move.__func__.__globals__
+        tele_vuer.motion_queue_data_shared = Array(
+            "d", module["MOTION_QUEUE_SLOTS"] * module["MOTION_QUEUE_STRIDE"], lock=True)
+        tele_vuer.motion_queue_marks_shared = Array(
+            "L", module["MOTION_QUEUE_SLOTS"], lock=True)
+        tele_vuer.motion_queue_head_shared = Value("L", 0, lock=True)
+        tele_vuer.motion_queue_tail_shared = Value("L", 0, lock=True)
+        return tele_vuer, module
+
+    def publish(self, tele_vuer, value):
+        with tele_vuer.left_arm_pose_shared.get_lock():
+            tele_vuer.left_arm_pose_shared[:] = [value] * 16
+        with tele_vuer.motion_data_timestamp_shared.get_lock():
+            tele_vuer.motion_data_timestamp_shared.value = value
+        tele_vuer._append_motion_sample()
+
+    def test_samples_come_back_in_order_and_only_once(self):
+        tele_vuer, _ = self.build()
+        for value in (1.0, 2.0, 3.0):
+            self.publish(tele_vuer, value)
+        for value in (1.0, 2.0, 3.0):
+            sample = tele_vuer.pop_hand_motion_sample()
+            self.assertEqual(sample["motion_data_timestamp"], value)
+            np.testing.assert_allclose(sample["left_arm_pose"], np.full((4, 4), value))
+            self.assertEqual(sample["left_hand_positions"].shape, (25, 3))
+            self.assertEqual(sample["left_hand_orientations"].shape, (25, 3, 3))
+        self.assertIsNone(tele_vuer.pop_hand_motion_sample())
+
+    def test_a_burst_is_taken_one_sample_per_call(self):
+        tele_vuer, _ = self.build()
+        for value in (10.0, 10.5, 11.0):        # three frames inside one 5 ms burst
+            self.publish(tele_vuer, value)
+        self.assertEqual(tele_vuer.pop_hand_motion_sample()["motion_data_timestamp"], 10.0)
+        self.assertEqual(tele_vuer.pop_hand_motion_sample()["motion_data_timestamp"], 10.5)
+        self.assertEqual(tele_vuer.pop_hand_motion_sample()["motion_data_timestamp"], 11.0)
+
+    def test_a_consumer_that_falls_behind_is_resynchronised(self):
+        tele_vuer, module = self.build()
+        for value in range(20):
+            self.publish(tele_vuer, float(value))
+        sample = tele_vuer.pop_hand_motion_sample()
+        newest = 19.0
+        self.assertGreaterEqual(sample["motion_data_timestamp"],
+                                newest - module["MOTION_QUEUE_MAX_BACKLOG"])
+
+    def test_ring_overwrite_is_detected_rather_than_served_stale(self):
+        tele_vuer, module = self.build()
+        slots = module["MOTION_QUEUE_SLOTS"]
+        # Fill more than the ring holds without consuming.
+        for value in range(slots + 2):
+            self.publish(tele_vuer, float(value))
+        with tele_vuer.motion_queue_tail_shared.get_lock():
+            tele_vuer.motion_queue_tail_shared.value = 0
+        with tele_vuer.motion_queue_head_shared.get_lock():
+            head = tele_vuer.motion_queue_head_shared.value
+        seen = []
+        while True:
+            sample = tele_vuer.pop_hand_motion_sample()
+            if sample is None:
+                break
+            seen.append(sample["motion_data_timestamp"])
+        self.assertTrue(all(v < head for v in seen))
+
+    def test_queue_is_optional(self):
+        tele_vuer = bare_televuer()
+        self.assertIsNone(tele_vuer.pop_hand_motion_sample())
+        tele_vuer._append_motion_sample()      # must not raise
+
+
+def load_tv_wrapper_module():
+    """Import tv_wrapper.py on its own, with a stub televuer package."""
+    source_dir = TELEVUER_PATH.parent
+    package = types.ModuleType("televuer_queue_test")
+    package.__path__ = [str(source_dir)]
+    module = types.ModuleType("televuer_queue_test.televuer")
+    module.TeleVuer = object
+    name = "televuer_queue_test.tv_wrapper"
+    with mock.patch.dict(sys.modules, {
+        "televuer_queue_test": package,
+        "televuer_queue_test.televuer": module,
+    }):
+        spec = importlib.util.spec_from_file_location(name, source_dir / "tv_wrapper.py")
+        wrapper_module = importlib.util.module_from_spec(spec)
+        with mock.patch.dict(sys.modules, {name: wrapper_module}):
+            spec.loader.exec_module(wrapper_module)
+    return wrapper_module
+
+
+class TeleVuerWrapperQueueTest(unittest.TestCase):
+    """The arm path walks the queue; the hand path must stay on the newest frame."""
+
+    def setUp(self):
+        self.module = load_tv_wrapper_module()
+        self.tele_vuer = TeleVuerMotionQueueTest("test_queue_is_optional").build()[0]
+        self.tele_vuer.head_pose_shared = Array("d", 16, lock=True)
+
+    def wrapper(self):
+        wrapper = self.module.TeleVuerWrapper.__new__(self.module.TeleVuerWrapper)
+        wrapper.use_hand_tracking = True
+        wrapper.return_hand_rot_data = False
+        wrapper.arm_reference_mode = "head_yaw"
+        wrapper.tvuer = self.tele_vuer
+        wrapper._last_hand_motion_snapshot = {}
+        wrapper._last_arm_motion_snapshot = {}
+        wrapper._tele_data_lock = self.module.threading.Lock()
+        return wrapper
+
+    def test_arm_path_takes_oldest_and_hand_path_keeps_the_newest(self):
+        wrapper = self.wrapper()
+        self.tele_vuer.left_arm_pose_shared[:] = [0.0] * 16
+        self.tele_vuer.motion_data_timestamp_shared.value = 1.0
+        self.tele_vuer._append_motion_sample()
+        self.tele_vuer.left_arm_pose_shared[:] = [0.0] * 16
+        self.tele_vuer.motion_data_timestamp_shared.value = 2.0
+        self.tele_vuer._append_motion_sample()
+
+        # The hand path always sees the newest sample and leaves the queue alone.
+        self.assertEqual(wrapper.get_tele_data().motion_data_timestamp, 2.0)
+        # The arm path spends the queue oldest-first, one sample per call.
+        self.assertEqual(wrapper.get_arm_tele_data().motion_data_timestamp, 1.0)
+        self.assertEqual(wrapper.get_arm_tele_data().motion_data_timestamp, 2.0)
+        # Caught up: the arm keeps its last sample rather than rewinding.
+        self.assertEqual(wrapper.get_arm_tele_data().motion_data_timestamp, 2.0)
+        # ...and the hand path was never rewound by the arm's consumption.
+        self.assertEqual(wrapper.get_tele_data().motion_data_timestamp, 2.0)

@@ -127,7 +127,10 @@ class R1HeadWaistIntegrationTest(unittest.TestCase):
             "workspace_diagnostic_next_time": 0.0, "workspace_warned_side": None,
             "workspace_saturation_events": 0,
             "r1_workspace_saturation": self.workspace_saturation,
-            "tv_wrapper": Mock(get_tele_data=Mock(return_value=tele_data)),
+            # The arm loop consumes the ordered motion queue; the hand loop still
+            # reads the newest frame, so both entry points are stubbed.
+            "tv_wrapper": Mock(get_tele_data=Mock(return_value=tele_data),
+                              get_arm_tele_data=Mock(return_value=tele_data)),
             "is_fresh_motion_data": Mock(side_effect=freshness),
             "logger_mp": Mock(), "arm_ctrl": controller, "arm_ik": ik,
             "waist_follower": follower, "linker_o6_loop": None,

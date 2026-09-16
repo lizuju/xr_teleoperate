@@ -1426,7 +1426,9 @@ if __name__ == '__main__':
                         publish_reset_category(1, reset_pose_publisher)
 
             # get xr's tele data
-            tele_data = tv_wrapper.get_tele_data()
+            # One queued hand sample per tick, so a burst advances the arm
+            # reference in steps instead of collapsing to its last frame.
+            tele_data = tv_wrapper.get_arm_tele_data()
             capture_mode = "following"
             run_motion = True
             if R1_PAUSE is not None and R1_PAUSE.paused:
