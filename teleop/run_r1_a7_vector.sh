@@ -9,6 +9,9 @@
 #   ARM_VELOCITY_LIMIT  位置目标的安全限速，默认 30.0 rad/s（约等于不限）
 #   ARM_DIAG_HZ         设了就按该频率记录诊断（复测大臂问题建议 40）
 #   ARM_DIAG_DIR        设了就把诊断 JSONL 写进该目录
+#   WAIST_FOLLOW_THRESHOLD_DEG  腰跟随触发阈值，默认 25 度（原来 12 度太灵敏：
+#                               头轻微一转腰就动）
+#   WAIST_FOLLOW_DWELL          阈值需保持多久才触发，默认 0.5 秒（原来 0.2 秒）
 #   CAMERA_CALIBRATION  相机标定 JSON 路径；留空则用 assets/r1/camera_calibration.json（存在才读）。
 #                       标定结果会写进每个 episode 的 info.camera_calibration，供后面数采/训练使用。
 #
@@ -57,6 +60,8 @@ exec "$python" -u teleop_hand_and_arm.py \
   --linker-o6-method vector \
   --linker-o6-urdf-root "${dev_root}/linkerhand-urdf/O6" \
   --waist-follow \
+  --waist-follow-threshold-deg "${WAIST_FOLLOW_THRESHOLD_DEG:-25}" \
+  --waist-follow-dwell "${WAIST_FOLLOW_DWELL:-0.5}" \
   --arm-velocity-limit "${ARM_VELOCITY_LIMIT:-30.0}" \
   --arm-dq-feedforward "${ARM_DQ_FEEDFORWARD:-on}" \
   --arm-dq-limit "${ARM_DQ_LIMIT:-6.0}" \

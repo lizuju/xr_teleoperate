@@ -46,6 +46,8 @@ exec "${dev_root}/.venv-xr/bin/python" -u teleop_hand_and_arm.py \
   --linker-o6-method vector \
   --linker-o6-urdf-root "${dev_root}/linkerhand-urdf/O6" \
   --waist-follow \
+  --waist-follow-threshold-deg "${WAIST_FOLLOW_THRESHOLD_DEG:-25}" \
+  --waist-follow-dwell "${WAIST_FOLLOW_DWELL:-0.5}" \
   --arm-velocity-limit "${ARM_VELOCITY_LIMIT:-30.0}" \
   --arm-dq-feedforward "${ARM_DQ_FEEDFORWARD:-on}" \
   --arm-dq-limit "${ARM_DQ_LIMIT:-6.0}" \
