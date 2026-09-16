@@ -246,3 +246,50 @@ class R1RecordingSnapshotTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class R1PowerTelemetryTest(unittest.TestCase):
+    """The robot cut power twice mid-session; the bus voltage must be observable."""
+
+    def setUp(self):
+        self.namespace = load_r1_controller_namespace()
+        self.arm = self.namespace["R1_A7_ArmController"](
+            deferred_activation=True, target_velocity_limit=0.0,
+        )
+        self.arm.lowstate_subscriber.Close()
+
+    def tearDown(self):
+        self.arm.stop()
+
+    def test_ingest_keeps_voltage_and_temperature_and_tracks_the_extremes(self):
+        message = SimpleNamespace(
+            mode_machine=0,
+            motor_state=[
+                SimpleNamespace(q=0.1, dq=0.0, tau_est=0.0, vol=voltage, temperature=temperature)
+                for voltage, temperature in [(48.0, 30.0), (44.5, 41.0), (47.0, 35.0)]
+                * 12
+            ],
+        )
+        self.arm._ingest_motor_state(message)
+        snapshot = self.arm.get_power_snapshot()
+        self.assertAlmostEqual(snapshot["min_voltage_v"], 44.5)
+        self.assertAlmostEqual(snapshot["max_temperature_c"], 41.0)
+
+        # A second, healthier frame must not raise the recorded minimum.
+        message.motor_state = [
+            SimpleNamespace(q=0.1, dq=0.0, tau_est=0.0, vol=50.0, temperature=28.0)
+        ] * 35
+        self.arm._ingest_motor_state(message)
+        snapshot = self.arm.get_power_snapshot()
+        self.assertAlmostEqual(snapshot["min_voltage_v"], 44.5)
+        self.assertAlmostEqual(snapshot["max_temperature_c"], 41.0)
+
+    def test_snapshot_is_explicit_when_the_field_is_absent(self):
+        message = SimpleNamespace(
+            mode_machine=0,
+            motor_state=[SimpleNamespace(q=0.0, dq=0.0, tau_est=0.0)] * 35,
+        )
+        self.arm._ingest_motor_state(message)
+        snapshot = self.arm.get_power_snapshot()
+        self.assertIsNone(snapshot["min_voltage_v"])
+        self.assertIsNone(snapshot["max_temperature_c"])

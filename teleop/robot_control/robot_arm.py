@@ -34,6 +34,9 @@ class MotorState:
         self.q = None
         self.dq = None
         self.tau = None
+        # Driver temperature and bus voltage, straight from the DDS MotorState_.
+        self.temperature = None
+        self.vol = None
 
 class G1_29_LowState:
     def __init__(self):
@@ -2124,6 +2127,10 @@ class R1_A7_ArmController:
             raise ValueError("dq_feedforward_limit must be a positive finite value.")
         if not np.isfinite(self.dq_feedforward_filter) or not 0.0 < self.dq_feedforward_filter <= 1.0:
             raise ValueError("dq_feedforward_filter must be inside (0, 1].")
+        # Rusty default: the DDS callback runs on its own thread from the moment the
+        # subscriber is created, so these must exist before it can fire.
+        self.power_min_voltage = None
+        self.power_max_temperature = None
         self._dq_feedforward = np.zeros(14)
         self._dq_feedforward_previous = None
         self._dq_feedforward_previous_at = None
@@ -2336,6 +2343,22 @@ class R1_A7_ArmController:
             # the subscription and timed out ArmController startup.
             # getattr keeps that thread alive on SDK builds without the field.
             lowstate.motor_state[id].tau = getattr(msg.motor_state[id], "tau_est", 0.0)
+            # Bus voltage and driver temperature. Two sessions on 2026-09-16 ended
+            # with the robot losing power and rebooting mid-teleoperation; the
+            # command path only saw the feedback go stale 250 ms later, so the
+            # voltage trend is the only thing that can show it coming.
+            voltage = getattr(msg.motor_state[id], "vol", None)
+            temperature = getattr(msg.motor_state[id], "temperature", None)
+            lowstate.motor_state[id].vol = voltage
+            lowstate.motor_state[id].temperature = temperature
+            if isinstance(voltage, (int, float)) and (
+                self.power_min_voltage is None or voltage < self.power_min_voltage
+            ):
+                self.power_min_voltage = float(voltage)
+            if isinstance(temperature, (int, float)) and (
+                self.power_max_temperature is None or temperature > self.power_max_temperature
+            ):
+                self.power_max_temperature = float(temperature)
         self.lowstate_buffer.SetData(lowstate)
         self.lowstate_sub_ready = True
 
@@ -2549,6 +2572,18 @@ class R1_A7_ArmController:
         """The joint reference the servos were actually given, after shaping."""
         with self.ctrl_lock:
             return np.array(self.q_target, dtype=np.float64, copy=True)
+
+    def get_power_snapshot(self):
+        """Lowest bus voltage and hottest driver seen since the subscriber started.
+
+        Printed even when the session aborts, which is exactly the case where the
+        robot cut power: a sagging minimum against the resting voltage is the
+        evidence that the stop was electrical rather than commanded.
+        """
+        return {
+            "min_voltage_v": getattr(self, "power_min_voltage", None),
+            "max_temperature_c": getattr(self, "power_max_temperature", None),
+        }
 
     def get_feedback_age(self):
         """Seconds since the last motor-feedback sample, or None before the first."""

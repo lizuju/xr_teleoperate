@@ -1831,6 +1831,9 @@ if __name__ == '__main__':
                         if hasattr(arm_ctrl, "get_reference_q") else sol_q.tolist()
                     ),
                     "arm_target_shaper": getattr(arm_ctrl, "get_target_shaper_snapshot", lambda: None)(),
+                    # Lowest bus voltage so far: the robot lost power twice on
+                    # 2026-09-16 and this is the only forward-looking signal.
+                    "power": getattr(arm_ctrl, "get_power_snapshot", lambda: None)(),
                     "tau_ik_command": sol_tauff.tolist(),
                     "tau_actual": arm_tau_actual.tolist() if arm_tau_actual is not None else None,
                     "workspace": workspace_saturation,
@@ -2047,6 +2050,13 @@ if __name__ == '__main__':
                     logger_mp.info(
                         "[R1 ARM SHAPER] %s",
                         json.dumps(arm_ctrl.get_target_shaper_snapshot()),
+                    )
+                # Reported even when the session aborted, which is exactly when the
+                # robot cut power: a sagging minimum against the resting voltage is
+                # what separates an electrical stop from a commanded one.
+                if hasattr(arm_ctrl, "get_power_snapshot"):
+                    logger_mp.info(
+                        "[R1 POWER] %s", json.dumps(arm_ctrl.get_power_snapshot())
                     )
                 # A stop-and-go arm shows up here as iterations that missed the loop
                 # budget, not as a change in the 10 Hz diagnostic averages.
