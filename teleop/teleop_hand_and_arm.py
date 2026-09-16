@@ -302,6 +302,35 @@ def acquire_live_writer_lock(live_state_path: Path):
     lock_file.flush()
     return lock_file
 
+class PalmFrame:
+    """A palm camera frame with its red and blue channels put back.
+
+    The two O6 palm cameras are UVC modules that hand us MJPG with red and blue
+    transposed relative to every other JPEG in this pipeline, so red arrives as
+    blue and yellow as green. The head stereo comes off a different path
+    (GStreamer H.264) and is already correct, which is why the correction is
+    applied here at the palm entry point rather than globally.
+
+    A new object is returned instead of swapping the pixels in place: the image
+    client's ring buffer hands back the same TeleImage until a new frame lands,
+    so an in-place swap would be applied twice.
+    """
+
+    __slots__ = ("bgr", "sequence", "received_monotonic_ns")
+
+    def __init__(self, frame):
+        self.bgr = np.ascontiguousarray(frame.bgr[:, :, ::-1])
+        self.sequence = frame.sequence
+        self.received_monotonic_ns = frame.received_monotonic_ns
+
+
+def correct_palm_frame(frame):
+    """Wrap a palm frame so red and blue are the right way round."""
+    if frame is None or frame.bgr is None:
+        return frame
+    return PalmFrame(frame)
+
+
 def resolve_run_camera_calibration(args, root):
     """Resolve the camera calibration for this run, or stop before touching robot state.
 
@@ -548,7 +577,11 @@ if __name__ == '__main__':
                 if wrist_cfg.get('enable_zmq'):
                     wrist_panels.append(side)
         wrist_image_shape = (camera_config.get('left_wrist_camera') or {}).get('image_shape') or [480, 640]
-        wrist_panel_aspect = float(wrist_image_shape[1]) / float(wrist_image_shape[0])
+        # Both palm frames are quarter-turned on their way to the panels (see
+        # TeleVuerWrapper.WRIST_PANEL_ROTATION), so the panel takes the camera's
+        # portrait shape and aspect rather than its native landscape one.
+        wrist_panel_shape = (int(wrist_image_shape[1] * 0.5), int(wrist_image_shape[0] * 0.5))
+        wrist_panel_aspect = float(wrist_panel_shape[1]) / float(wrist_panel_shape[0])
         if wrist_panels:
             logger_mp.info(
                 f"[XR WRIST PANELS] sides={wrist_panels} "
@@ -577,6 +610,7 @@ if __name__ == '__main__':
                                      wrist_panel_distance=args.wrist_panel_distance,
                                      wrist_panel_offset=tuple(args.wrist_panel_offset),
                                      wrist_panel_aspect=wrist_panel_aspect,
+                                     wrist_panel_shape=wrist_panel_shape,
                                      arm_reference_mode="head_yaw"
                                      )
 
@@ -589,11 +623,11 @@ if __name__ == '__main__':
             """
             left_frame = right_frame = None
             if camera_config['left_wrist_camera']['enable_zmq'] and (args.record or 'left' in wrist_panels):
-                left_frame = img_client.get_left_wrist_frame()
+                left_frame = correct_palm_frame(img_client.get_left_wrist_frame())
                 if left_frame is not None and 'left' in wrist_panels:
                     tv_wrapper.render_wrist_to_xr('left', left_frame.bgr)
             if camera_config['right_wrist_camera']['enable_zmq'] and (args.record or 'right' in wrist_panels):
-                right_frame = img_client.get_right_wrist_frame()
+                right_frame = correct_palm_frame(img_client.get_right_wrist_frame())
                 if right_frame is not None and 'right' in wrist_panels:
                     tv_wrapper.render_wrist_to_xr('right', right_frame.bgr)
             return left_frame, right_frame
