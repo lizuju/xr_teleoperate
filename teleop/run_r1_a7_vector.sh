@@ -7,9 +7,11 @@
 #                       要退回“削命令”的保守方案：ARM_DQ_FEEDFORWARD=off ARM_VELOCITY_LIMIT=3.0
 #   ARM_DQ_LIMIT        前馈速度上限，默认 6.0 rad/s（安全网，不是跟踪上限）
 #   ARM_VELOCITY_LIMIT  位置目标的安全限速，默认 30.0 rad/s（约等于不限）
-#   FREQUENCY           控制环频率，默认 60 Hz（原 40）。手臂每拍消费一个排队样本，样本平均要等半拍；
-#                       40→60 把这段等待从约 12 ms 降到约 8 ms，代价是 IK 每秒多解 50%（每次约 2.5 ms）。
-#                       如果日志里开始报 overruns 就调回 40。
+#   FREQUENCY           控制环频率，默认 40 Hz。手臂每拍消费一个排队样本，样本平均要等半拍，
+#                       40→60 能把这段等待从约 12 ms 降到约 8 ms，代价是 IK 每秒多解 50%（每次约 2.5 ms）。
+#                       2026-09-16 实测：60 Hz 下循环平均确实到了 59.6 Hz，但 body_max=21.3 ms 已经超过
+#                       16.7 ms 的预算，循环没有余量；而同期样本年龄中位数是 196 ms，省 4 ms 是噪声。
+#                       所以默认留在 40。想试就设 60，但先看退出汇总里的 body_max。
 #   ARM_TARGET_VELOCITY_LIMIT  关节「参考轨迹」限速，默认 5.0 rad/s —— 治「一顿一顿」的主开关。
 #                       手部数据到达控制环是不均匀的（2026-09-16 实测：每秒仅 11 个新样本，
 #                       样本年龄中位 45 ms、p95 251 ms、最差 446 ms）。一个过期样本被替换时，
@@ -100,7 +102,7 @@ exec "$python" -u teleop_hand_and_arm.py \
   --linker-o6-method vector \
   --linker-o6-urdf-root "${dev_root}/linkerhand-urdf/O6" \
   "${waist[@]}" \
-  --frequency "${FREQUENCY:-60}" \
+  --frequency "${FREQUENCY:-40}" \
   --arm-translation-scale "${ARM_TRANSLATION_SCALE:-0.87}" \
   --arm-velocity-limit "${ARM_VELOCITY_LIMIT:-30.0}" \
   --arm-dq-feedforward "${ARM_DQ_FEEDFORWARD:-on}" \

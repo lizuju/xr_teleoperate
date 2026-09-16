@@ -61,7 +61,7 @@ exec "${dev_root}/.venv-xr/bin/python" -u teleop_hand_and_arm.py \
   --linker-o6-method vector \
   --linker-o6-urdf-root "${dev_root}/linkerhand-urdf/O6" \
   "${waist[@]}" \
-  --frequency "${FREQUENCY:-60}" \
+  --frequency "${FREQUENCY:-40}" \
   --arm-translation-scale "${ARM_TRANSLATION_SCALE:-0.87}" \
   --arm-velocity-limit "${ARM_VELOCITY_LIMIT:-30.0}" \
   --arm-dq-feedforward "${ARM_DQ_FEEDFORWARD:-on}" \

@@ -357,7 +357,7 @@ def resolve_run_camera_calibration(args, root):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     # basic control parameters
-    parser.add_argument('--frequency', type = float, default = 60.0, help = 'control loop and record frequency. The arm consumes one queued hand sample per tick, so a sample waits on average half a tick before it is used; 60 Hz cuts that wait from ~12 ms to ~8 ms, at the cost of more IK solves per second (each ~2.5 ms). Drop back to 40 if the loop starts reporting overruns.')
+    parser.add_argument('--frequency', type = float, default = 40.0, help = 'control loop and record frequency. The arm consumes one queued hand sample per tick, so a sample waits on average half a tick before it is used, and raising this shortens that wait (40 -> 60 Hz is ~12 ms -> ~8 ms) at the cost of more IK solves per second. 40 is the default because it is the rate the loop demonstrably holds: at 60 Hz the measured body_max reached 21.3 ms against a 16.7 ms budget, so the loop had no slack, and the 4 ms it buys is noise next to the 196 ms median sample age seen in the same session. Read body_max in the exit summary before raising it.')
     parser.add_argument('--input-mode', type=str, choices=['hand', 'controller'], default='hand', help='Select XR device input tracking source')
     parser.add_argument('--display-mode', type=str, choices=['immersive', 'ego', 'pass-through'], default='immersive', help='Select XR device display mode')
     parser.add_argument('--arm', type=str, choices=['G1_29', 'G1_23', 'H1_2', 'H1', 'H2', 'R1_A5', 'R1_A7'], default='G1_29', help='Select arm controller')
