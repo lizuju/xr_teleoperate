@@ -2059,12 +2059,19 @@ class R1_A7_ArmController:
     default_dq_feedforward = True
     default_dq_feedforward_limit = 6.0
     default_dq_feedforward_filter = 0.5
+    default_target_velocity_limit = 4.0
+    default_target_accel_limit = 40.0
     dq_feedforward_timeout = 0.10
     dq_feedforward_decay = 0.85
 
     def __init__(self, motion_mode = False, simulation_mode = False, deferred_activation = False,
                  arm_velocity_limit = None, dq_feedforward = None,
-                 dq_feedforward_limit = None, dq_feedforward_filter = None):
+                 dq_feedforward_limit = None, dq_feedforward_filter = None,
+                 target_velocity_limit = None, target_accel_limit = None):
+        # Imported here rather than at module scope: the controller tests build a
+        # namespace from selected class definitions only, so a module-level import of
+        # a sibling would be missing there.
+        from teleop.robot_control.arm_target_shaper import ArmTargetShaper
         logger_mp.info("Initialize R1_A7_ArmController...")
         if motion_mode:
             raise ValueError("R1_A7_ArmController does not support motion mode.")
@@ -2121,6 +2128,31 @@ class R1_A7_ArmController:
         self._dq_feedforward_previous = None
         self._dq_feedforward_previous_at = None
         self._dq_feedforward_updated_at = None
+        # Reference shaper. The IK target arrives as a staircase -- measured p95 22.8 deg
+        # and up to 84.5 deg of joint motion inside a single control tick, against joints
+        # that saturate near 5-7 rad/s -- so it is ramped instead of applied. See
+        # arm_target_shaper for the measurements.
+        self.target_shaper = ArmTargetShaper(
+            velocity_limit=(
+                self.default_target_velocity_limit
+                if target_velocity_limit is None else target_velocity_limit
+            ),
+            accel_limit=(
+                self.default_target_accel_limit
+                if target_accel_limit is None else target_accel_limit
+            ),
+            dof=14,
+            name="R1_A7 arm",
+        )
+        logger_mp.info(
+            "[R1_A7_ArmController] joint reference shaper: %s"
+            % (
+                "velocity limit %.2f rad/s, accel limit %.1f rad/s^2"
+                % (self.target_shaper.velocity_limit, self.target_shaper.accel_limit)
+                if self.target_shaper.enabled
+                else "disabled, the raw target goes straight to the servos"
+            )
+        )
         self.control_dt = 1.0 / 250.0
         logger_mp.info(
             f"[R1_A7_ArmController] published arm target speed limit: "
@@ -2185,6 +2217,9 @@ class R1_A7_ArmController:
                 self.q_target = np.array(
                     [lowstate.motor_state[id].q for id in R1_A7_JointArmIndex]
                 )
+                # Start the reference where the arm actually is, so activation cannot
+                # produce a shaped ramp from a stale pre-activation pose.
+                self.target_shaper.reset(self.q_target)
             else:
                 self.q_target = np.zeros(14)
             self.tauff_target = np.zeros(14)
@@ -2471,10 +2506,43 @@ class R1_A7_ArmController:
         self.raise_if_failed()
         with self.ctrl_lock:
             self._check_target_freshness(self.target_updated_at)
+            q_target = self._shape_arm_target(q_target)
             self._update_dq_feedforward(q_target)
             self.q_target = q_target
             self.tauff_target = tauff_target
             self.target_updated_at = time.monotonic()
+
+    def _shape_arm_target(self, q_target):
+        """Ramp the IK solution into a reference the servos can actually execute.
+
+        Called with the lock held, right before the target is stored and the velocity
+        feed-forward is derived from it, so both the position command and the
+        feed-forward describe the same continuous motion.
+        """
+        target = np.asarray(q_target, dtype=np.float64)
+        if target.shape != (14,) or not np.isfinite(target).all():
+            raise ValueError("arm q_target must contain 14 finite values")
+        # getattr: controllers built via __new__ (tests, shadow tooling) have no shaper,
+        # and passing the raw target through is the correct behaviour there.
+        shaper = getattr(self, "target_shaper", None)
+        if shaper is None:
+            return target
+        return shaper.shape(target)
+
+    def reset_target_shaper(self, reference_q=None):
+        """Re-anchor the joint reference; see ArmTargetShaper.reset."""
+        shaper = getattr(self, "target_shaper", None)
+        if shaper is None:
+            return
+        with self.ctrl_lock:
+            shaper.reset(reference_q)
+
+    def get_target_shaper_snapshot(self):
+        shaper = getattr(self, "target_shaper", None)
+        if shaper is None:
+            return None
+        with self.ctrl_lock:
+            return shaper.snapshot()
 
     def ctrl_dual_arm_and_head(self, q_target, tauff_target, head_q_target, waist_yaw_target=None):
         '''Set arm, head, and optional waist targets from one tracking sample.'''
@@ -2496,6 +2564,7 @@ class R1_A7_ArmController:
             ))
         with self.ctrl_lock:
             self._check_target_freshness(self.target_updated_at)
+            q_target = self._shape_arm_target(q_target)
             self._update_dq_feedforward(q_target)
             self.q_target = q_target
             self.tauff_target = tauff_target
@@ -2671,6 +2740,7 @@ class R1_A7_ArmController:
         max_attempts = 100
         current_attempts = 0
         with self.ctrl_lock:
+            self.target_shaper.reset(np.zeros(14))
             self.q_target = np.zeros(14)
             # self.tauff_target = np.zeros(14)
         tolerance = 0.05  # Tolerance threshold for joint angles to determine "close to zero", can be adjusted based on your motor's precision requirements

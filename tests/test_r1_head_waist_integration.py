@@ -114,6 +114,7 @@ class R1HeadWaistIntegrationTest(unittest.TestCase):
                 workspace_position_tolerance_m=0.05, workspace_rotation_tolerance_rad=0.15,
                 arm_limit_softness=0.0, arm_posture_weight=0.0, arm_velocity_limit=30.0,
                 arm_dq_feedforward="on", arm_dq_limit=6.0, arm_dq_filter=0.5,
+                arm_target_velocity_limit=4.0, arm_target_accel_limit=40.0,
             ),
             "r1_a7_anchored": True, "r1_a7_deferred_real": True,
             "r1_independent_hands": False,
@@ -552,7 +553,8 @@ class R1HeadWaistIntegrationTest(unittest.TestCase):
     def test_waist_simulation_uses_deferred_activation_and_no_real_mode_switch(self):
         settings = SimpleNamespace(arm="R1_A7", sim=True, motion=False, hand_only=False,
                                    arm_velocity_limit=30.0, arm_dq_feedforward="on",
-                                   arm_dq_limit=6.0, arm_dq_filter=0.5)
+                                   arm_dq_limit=6.0, arm_dq_filter=0.5,
+                                   arm_target_velocity_limit=4.0, arm_target_accel_limit=40.0)
         controller_branch = next(
             node for node in ast.walk(self.tree) if isinstance(node, ast.If)
             and ast.unparse(node.test) == "args.arm == 'R1_A7'"
@@ -567,6 +569,7 @@ class R1HeadWaistIntegrationTest(unittest.TestCase):
             motion_mode=False, simulation_mode=True, deferred_activation=True,
             arm_velocity_limit=30.0, dq_feedforward=True,
             dq_feedforward_limit=6.0, dq_feedforward_filter=0.5,
+            target_velocity_limit=4.0, target_accel_limit=40.0,
         )
         ik_constructor.assert_not_called()
         switches = [

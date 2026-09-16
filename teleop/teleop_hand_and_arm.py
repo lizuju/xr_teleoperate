@@ -401,6 +401,8 @@ if __name__ == '__main__':
     parser.add_argument('--arm-dq-feedforward', choices=['on', 'off'], default='on', help='R1_A7: feed the target velocity into the servo dq field so the arm follows the commanded motion instead of chasing it with start-stop bursts (default on).')
     parser.add_argument('--arm-dq-limit', type=float, default=6.0, help='R1_A7: clamp on the feed-forward velocity in rad/s (safety net, not a tracking limit).')
     parser.add_argument('--arm-dq-filter', type=float, default=0.5, help='R1_A7: low-pass factor for the feed-forward velocity derivative, 1.0 = unfiltered.')
+    parser.add_argument('--arm-target-velocity-limit', type=float, default=4.0, help='R1_A7: how fast the arm joint REFERENCE may move, in rad/s. The hand stream reaches the loop unevenly (measured 11 fresh samples/s, worst sample age 446 ms), so one stale sample turns into a step of up to 84 deg of joint motion in a single 25 ms tick while the joints saturate near 5-7 rad/s; that mismatch is the start-stop stutter. 4.0 keeps up with ordinary hand motion (~0.8 rad/s sustained, ~2 rad/s peaks) and stretches only the catch-up. 0 disables the shaper and restores the raw target.')
+    parser.add_argument('--arm-target-accel-limit', type=float, default=40.0, help='R1_A7: how fast the shaper may change the reference speed, in rad/s^2; 0 removes the ramp and leaves a pure speed limit.')
     parser.add_argument('--wrist-display', type=str, choices=['auto', 'both', 'left', 'right', 'off'], default='auto', help='Vision Pro wrist camera panels: auto/both show both sides, left/right show one, off disables them (panels also need the wrist cameras to publish WebRTC on PC2)')
     parser.add_argument('--wrist-panel-distance', type=float, default=1.2, help='Distance of the wrist panels in front of the eyes, in meters')
     parser.add_argument('--wrist-panel-offset', type=float, nargs=2, default=[0.40, 0.40], metavar=('X', 'Y'), help='Wrist panel centre offset in meters; X is mirrored per side, Y is downwards')
@@ -867,6 +869,8 @@ if __name__ == '__main__':
                         dq_feedforward=args.arm_dq_feedforward == 'on',
                         dq_feedforward_limit=args.arm_dq_limit,
                         dq_feedforward_filter=args.arm_dq_filter,
+                        target_velocity_limit=args.arm_target_velocity_limit,
+                        target_accel_limit=args.arm_target_accel_limit,
                     )
                     arm_ik = None
                 else:
@@ -877,6 +881,8 @@ if __name__ == '__main__':
                         dq_feedforward=args.arm_dq_feedforward == 'on',
                         dq_feedforward_limit=args.arm_dq_limit,
                         dq_feedforward_filter=args.arm_dq_filter,
+                        target_velocity_limit=args.arm_target_velocity_limit,
+                        target_accel_limit=args.arm_target_accel_limit,
                     )
 
         # end-effector
@@ -1158,6 +1164,8 @@ if __name__ == '__main__':
                         left_align_target[:3, :3] = left_initial_pose[:3, :3]
                         right_align_target[:3, :3] = right_initial_pose[:3, :3]
                         arm_ik.reset_smoothing(reference_q=current_q)
+                        if hasattr(arm_ctrl, "reset_target_shaper"):
+                            arm_ctrl.reset_target_shaper(current_q)
                         align_q, align_tau = arm_ik.solve_ik(
                             left_align_target,
                             right_align_target,
@@ -1460,6 +1468,8 @@ if __name__ == '__main__':
                     held_head_q_target = r1_head_q_offset.copy()
                     wrist_holds = (R1WristHold(r1_robot_left_reference), R1WristHold(r1_robot_right_reference))
                     arm_ik.reset_smoothing(reference_q=held_q)
+                    if hasattr(arm_ctrl, "reset_target_shaper"):
+                        arm_ctrl.reset_target_shaper(held_q)
                     last_fresh_tele_data = tele_data
                     tracking_hold_active = False
                     if (
@@ -1494,6 +1504,8 @@ if __name__ == '__main__':
                     last_fresh_tele_data = tele_data
                     if tracking_hold_active:
                         arm_ik.reset_smoothing()
+                        if hasattr(arm_ctrl, "reset_target_shaper"):
+                            arm_ctrl.reset_target_shaper()
                         if args.waist_follow:
                             waist_follower.reset(arm_ctrl.get_current_waist_yaw(), time.monotonic())
                         logger_mp.info("R1_A7 Vision tracking resumed.")
@@ -1502,6 +1514,8 @@ if __name__ == '__main__':
                     tele_data = last_fresh_tele_data
                     if not tracking_hold_active:
                         arm_ik.reset_smoothing()
+                        if hasattr(arm_ctrl, "reset_target_shaper"):
+                            arm_ctrl.reset_target_shaper()
                         logger_mp.warning(
                             "R1_A7 Vision tracking is stale; holding the last tracked pose until tracking resumes."
                         )
@@ -1651,6 +1665,8 @@ if __name__ == '__main__':
                 fresh_after_ik = hand_tracking_freshness(tele_data, args.tracking_timeout, time.monotonic())
                 if any(before and not after for before, after in zip(hand_fresh, fresh_after_ik)):
                     arm_ik.reset_smoothing()
+                    if hasattr(arm_ctrl, "reset_target_shaper"):
+                        arm_ctrl.reset_target_shaper()
                     for hold, fresh in zip(wrist_holds, fresh_after_ik):
                         if not fresh:
                             hold.hold()
@@ -1661,6 +1677,8 @@ if __name__ == '__main__':
                     run_motion = False
             elif run_motion and args.waist_follow and not is_fresh_motion_data(tele_data, args.tracking_timeout):
                 arm_ik.reset_smoothing()
+                if hasattr(arm_ctrl, "reset_target_shaper"):
+                    arm_ctrl.reset_target_shaper()
                 arm_ctrl.hold_waist()
                 tracking_hold_active = True
                 capture_mode = "tracking_hold"
@@ -1798,6 +1816,7 @@ if __name__ == '__main__':
                     "q_actual": current_lr_arm_q.tolist(),
                     "dq_actual": current_lr_arm_dq.tolist(),
                     "q_ik_command": sol_q.tolist(),
+                    "arm_target_shaper": getattr(arm_ctrl, "get_target_shaper_snapshot", lambda: None)(),
                     "tau_ik_command": sol_tauff.tolist(),
                     "tau_actual": arm_tau_actual.tolist() if arm_tau_actual is not None else None,
                     "workspace": workspace_saturation,
@@ -2005,6 +2024,14 @@ if __name__ == '__main__':
                     "the arm kept its last pose until tracking returned.",
                     tracking_hold_events, workspace_saturation_events, arm_diagnostic_sequence,
                 )
+                # limited_ticks is how often the raw IK target asked for more speed than
+                # the servos can deliver; max_residual_deg is the lag traded for smoothness.
+                # Raise --arm-target-velocity-limit if the lag can be felt.
+                if hasattr(arm_ctrl, "get_target_shaper_snapshot"):
+                    logger_mp.info(
+                        "[R1 ARM SHAPER] %s",
+                        json.dumps(arm_ctrl.get_target_shaper_snapshot()),
+                    )
                 # A stop-and-go arm shows up here as iterations that missed the loop
                 # budget, not as a change in the 10 Hz diagnostic averages.
                 logger_mp.info(

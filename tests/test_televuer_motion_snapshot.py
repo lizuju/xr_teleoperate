@@ -360,3 +360,45 @@ class TeleVuerHandFreshnessTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TeleVuerMotionDiagnosticsTest(unittest.TestCase):
+    """The interval histogram is what tells a steady stream from a bursty one."""
+
+    def build(self):
+        tele_vuer = bare_televuer()
+        tele_vuer.motion_sample_counts_shared = Array("L", 8, lock=True)
+        module = tele_vuer.get_tracking_diagnostics.__func__.__globals__
+        edges = module["MOTION_INTERVAL_EDGES_MS"]
+        tele_vuer.motion_interval_bins_shared = Array("L", len(edges), lock=True)
+        tele_vuer._motion_interval_previous = None
+        return tele_vuer
+
+    def test_bins_label_the_gaps_between_callbacks(self):
+        tele_vuer = self.build()
+        tele_vuer._record_motion_interval(100.000)   # first callback: nothing to bin
+        tele_vuer._record_motion_interval(100.003)   # 3 ms  -> <=5
+        tele_vuer._record_motion_interval(100.036)   # 33 ms -> 30-40
+        tele_vuer._record_motion_interval(102.000)   # long  -> >1000
+        histogram = tele_vuer.get_tracking_diagnostics()["motion_interval_ms"]
+        self.assertEqual(histogram["<=5"], 1)
+        self.assertEqual(histogram["30-40"], 1)
+        self.assertEqual(histogram[">=1000"], 1)
+
+    def test_snapshot_outcomes_are_counted(self):
+        tele_vuer = self.build()
+        tele_vuer._begin_motion_sample()
+        self.assertIsNone(tele_vuer.get_hand_motion_snapshot(max_attempts=1))
+        tele_vuer._commit_motion_sample(1)
+        self.assertIsNotNone(tele_vuer.get_hand_motion_snapshot(max_attempts=1))
+        diagnostics = tele_vuer.get_tracking_diagnostics()
+        self.assertEqual(diagnostics["snapshot_ok"], 1)
+        self.assertEqual(diagnostics["snapshot_inflight"], 1)
+        self.assertEqual(diagnostics["snapshot_none"], 1)
+
+    def test_diagnostics_stay_quiet_without_the_counters(self):
+        # bare_televuer has neither array; the counters must never be required.
+        tele_vuer = bare_televuer()
+        diagnostics = tele_vuer.get_tracking_diagnostics()
+        self.assertNotIn("motion_interval_ms", diagnostics)
+        tele_vuer._record_motion_interval(100.0)

@@ -33,7 +33,9 @@ class R1RecordingSnapshotTests(unittest.TestCase):
     def setUp(self):
         self.now = 50.0
         self.namespace = load_r1_controller_namespace()
-        self.arm = self.namespace["R1_A7_ArmController"](deferred_activation=True)
+        self.arm = self.namespace["R1_A7_ArmController"](
+            deferred_activation=True, target_velocity_limit=0.0,
+        )
         self.arm.lowstate_subscriber.Close()
         self.namespace["time"] = SimpleNamespace(monotonic=lambda: self.now, sleep=lambda _: None)
         self.arm_state = self.arm.lowstate_buffer.GetData()
