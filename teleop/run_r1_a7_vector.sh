@@ -9,9 +9,14 @@
 #   ARM_VELOCITY_LIMIT  位置目标的安全限速，默认 30.0 rad/s（约等于不限）
 #   ARM_DIAG_HZ         设了就按该频率记录诊断（复测大臂问题建议 40）
 #   ARM_DIAG_DIR        设了就把诊断 JSONL 写进该目录
-#   WAIST_FOLLOW_THRESHOLD_DEG  腰跟随触发阈值，默认 25 度（原来 12 度太灵敏：
-#                               头轻微一转腰就动）
-#   WAIST_FOLLOW_DWELL          阈值需保持多久才触发，默认 0.5 秒（原来 0.2 秒）
+#   WAIST_FOLLOW_THRESHOLD_DEG  腰跟随触发阈值，默认 15 度
+#   WAIST_FOLLOW_DWELL          阈值需保持多久才触发，默认 0.3 秒
+#     这两个值是有数据依据的，别随手调高：2026-09-16 的诊断（r1-diag-follow-20260916-135701）
+#     显示操作时「头部未补偿偏航」的残差 p50 = 12.6 度、p05 = -18.4 度。阈值调到 25 度后
+#     96.6% 的时间腰根本不跟，手臂被迫伸到工作空间边缘 —— 同一份数据显示 workspace 饱和
+#     11.5%、最大缺口 0.23 m，表现就是大臂发卡。阈值越高，腰越不跟，手臂越容易够不到。
+#     嫌抖动的话：抖动是腰伺服自己的问题（指令恒定时实际角度仍摆动 ±4 度），
+#     不是这个阈值造成的，调它治不了。
 #   CAMERA_CALIBRATION  相机标定 JSON 路径；留空则用 assets/r1/camera_calibration.json（存在才读）。
 #                       标定结果会写进每个 episode 的 info.camera_calibration，供后面数采/训练使用。
 #
@@ -60,8 +65,8 @@ exec "$python" -u teleop_hand_and_arm.py \
   --linker-o6-method vector \
   --linker-o6-urdf-root "${dev_root}/linkerhand-urdf/O6" \
   --waist-follow \
-  --waist-follow-threshold-deg "${WAIST_FOLLOW_THRESHOLD_DEG:-25}" \
-  --waist-follow-dwell "${WAIST_FOLLOW_DWELL:-0.5}" \
+  --waist-follow-threshold-deg "${WAIST_FOLLOW_THRESHOLD_DEG:-15}" \
+  --waist-follow-dwell "${WAIST_FOLLOW_DWELL:-0.3}" \
   --arm-velocity-limit "${ARM_VELOCITY_LIMIT:-30.0}" \
   --arm-dq-feedforward "${ARM_DQ_FEEDFORWARD:-on}" \
   --arm-dq-limit "${ARM_DQ_LIMIT:-6.0}" \
