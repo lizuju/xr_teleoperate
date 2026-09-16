@@ -357,7 +357,7 @@ def resolve_run_camera_calibration(args, root):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     # basic control parameters
-    parser.add_argument('--frequency', type = float, default = 40.0, help = 'control and record \'s frequency')
+    parser.add_argument('--frequency', type = float, default = 60.0, help = 'control loop and record frequency. The arm consumes one queued hand sample per tick, so a sample waits on average half a tick before it is used; 60 Hz cuts that wait from ~12 ms to ~8 ms, at the cost of more IK solves per second (each ~2.5 ms). Drop back to 40 if the loop starts reporting overruns.')
     parser.add_argument('--input-mode', type=str, choices=['hand', 'controller'], default='hand', help='Select XR device input tracking source')
     parser.add_argument('--display-mode', type=str, choices=['immersive', 'ego', 'pass-through'], default='immersive', help='Select XR device display mode')
     parser.add_argument('--arm', type=str, choices=['G1_29', 'G1_23', 'H1_2', 'H1', 'H2', 'R1_A5', 'R1_A7'], default='G1_29', help='Select arm controller')
@@ -403,7 +403,7 @@ if __name__ == '__main__':
     parser.add_argument('--arm-dq-feedforward', choices=['on', 'off'], default='on', help='R1_A7: feed the target velocity into the servo dq field so the arm follows the commanded motion instead of chasing it with start-stop bursts (default on).')
     parser.add_argument('--arm-dq-limit', type=float, default=6.0, help='R1_A7: clamp on the feed-forward velocity in rad/s (safety net, not a tracking limit).')
     parser.add_argument('--arm-dq-filter', type=float, default=0.5, help='R1_A7: low-pass factor for the feed-forward velocity derivative, 1.0 = unfiltered.')
-    parser.add_argument('--arm-target-velocity-limit', type=float, default=4.0, help='R1_A7: how fast the arm joint REFERENCE may move, in rad/s. The hand stream reaches the loop unevenly (measured 11 fresh samples/s, worst sample age 446 ms), so one stale sample turns into a step of up to 84 deg of joint motion in a single 25 ms tick while the joints saturate near 5-7 rad/s; that mismatch is the start-stop stutter. 4.0 keeps up with ordinary hand motion (~0.8 rad/s sustained, ~2 rad/s peaks) and stretches only the catch-up. 0 disables the shaper and restores the raw target.')
+    parser.add_argument('--arm-target-velocity-limit', type=float, default=5.0, help='R1_A7: how fast the arm joint REFERENCE may move, in rad/s. The hand stream reaches the loop unevenly (measured 11 fresh samples/s, worst sample age 446 ms), so one stale sample turns into a step of up to 84 deg of joint motion in a single 25 ms tick while the joints saturate near 5-7 rad/s; that mismatch is the start-stop stutter. 4.0 keeps up with ordinary hand motion (~0.8 rad/s sustained, ~2 rad/s peaks) and stretches only the catch-up. 5.0 is the current default: the ordered sample queue plus the shaper brought the measured peak joint speed down to 5.01 rad/s against a 7.19 rad/s capability, so there is headroom to trade back for less lag. 0 disables the shaper and restores the raw target.')
     parser.add_argument('--arm-target-accel-limit', type=float, default=40.0, help='R1_A7: how fast the shaper may change the reference speed, in rad/s^2; 0 removes the ramp and leaves a pure speed limit.')
     parser.add_argument('--wrist-display', type=str, choices=['auto', 'both', 'left', 'right', 'off'], default='auto', help='Vision Pro wrist camera panels: auto/both show both sides, left/right show one, off disables them (panels also need the wrist cameras to publish WebRTC on PC2)')
     parser.add_argument('--wrist-panel-distance', type=float, default=1.2, help='Distance of the wrist panels in front of the eyes, in meters')
@@ -492,8 +492,10 @@ if __name__ == '__main__':
     # Per-iteration loop-jitter accounting. The 10 Hz JSONL sample cannot show a
     # stall that lasts a few iterations, which is exactly what a stop-and-go arm
     # feels like, so every iteration feeds this and the summary reports the tail.
+    # max_body_ms is the iteration cost with the sleep removed: it is what decides
+    # whether --frequency is actually reachable on this machine.
     loop_jitter = {"iterations": 0, "max_ms": 0.0, "over_40ms": 0, "over_80ms": 0,
-                   "worst_at_s": None}
+                   "worst_at_s": None, "max_body_ms": 0.0}
     loop_jitter_started = None
     workspace_diagnostic_next_time = 0.0
     workspace_saturation_events = 0
@@ -627,11 +629,11 @@ if __name__ == '__main__':
             if camera_config['left_wrist_camera']['enable_zmq'] and (args.record or 'left' in wrist_panels):
                 left_frame = correct_palm_frame(img_client.get_left_wrist_frame())
                 if left_frame is not None and 'left' in wrist_panels:
-                    tv_wrapper.render_wrist_to_xr('left', left_frame.bgr)
+                    tv_wrapper.render_wrist_to_xr('left', left_frame.bgr, left_frame.sequence)
             if camera_config['right_wrist_camera']['enable_zmq'] and (args.record or 'right' in wrist_panels):
                 right_frame = correct_palm_frame(img_client.get_right_wrist_frame())
                 if right_frame is not None and 'right' in wrist_panels:
-                    tv_wrapper.render_wrist_to_xr('right', right_frame.bgr)
+                    tv_wrapper.render_wrist_to_xr('right', right_frame.bgr, right_frame.sequence)
             return left_frame, right_frame
 
         if args.ee == "linker_o6":
@@ -1396,7 +1398,9 @@ if __name__ == '__main__':
                 if args.record or xr_need_local_img:
                     head_img = img_client.get_head_frame()
                 if xr_need_local_img and head_img.bgr is not None:
-                    tv_wrapper.render_to_xr(head_img.bgr)
+                    # The camera sequence lets the render path skip a repeated frame:
+                    # the head camera runs near 7.5 Hz while the XR scene ticks at 30.
+                    tv_wrapper.render_to_xr(head_img.bgr, head_img.sequence)
             # The panels need the frames even when recording is off; the fetch is a
             # cached ring-buffer read (measured 0.002 ms) plus one resize.
             left_wrist_img, right_wrist_img = grab_wrist_frames()
@@ -2009,6 +2013,8 @@ if __name__ == '__main__':
 
             current_time = time.time()
             time_elapsed = current_time - start_time
+            if time_elapsed * 1000.0 > loop_jitter["max_body_ms"]:
+                loop_jitter["max_body_ms"] = time_elapsed * 1000.0
             sleep_time = max(0, (1 / args.frequency) - time_elapsed)
             time.sleep(sleep_time)
             logger_mp.debug(f"main process sleep: {sleep_time}")
@@ -2045,12 +2051,13 @@ if __name__ == '__main__':
                 # A stop-and-go arm shows up here as iterations that missed the loop
                 # budget, not as a change in the 10 Hz diagnostic averages.
                 logger_mp.info(
-                    "[R1 LOOP JITTER] budget=%.1fms max=%.1fms over_40ms=%d over_80ms=%d "
-                    "worst_at=%.1fs of %d iterations",
-                    1000.0 / args.frequency, loop_jitter["max_ms"],
+                    "[R1 LOOP JITTER] budget=%.1fms max=%.1fms body_max=%.1fms over_40ms=%d "
+                    "over_80ms=%d worst_at=%.1fs of %d iterations. body_max is the iteration cost "
+                    "without the sleep; if it approaches the budget the loop cannot hold %g Hz.",
+                    1000.0 / args.frequency, loop_jitter["max_ms"], loop_jitter["max_body_ms"],
                     loop_jitter["over_40ms"], loop_jitter["over_80ms"],
                     loop_jitter["worst_at_s"] if loop_jitter["worst_at_s"] is not None else -1.0,
-                    loop_jitter["iterations"],
+                    loop_jitter["iterations"], args.frequency,
                 )
         except Exception as e:
             logger_mp.warning(f"Failed to write session summary: {e}")

@@ -61,11 +61,12 @@ exec "${dev_root}/.venv-xr/bin/python" -u teleop_hand_and_arm.py \
   --linker-o6-method vector \
   --linker-o6-urdf-root "${dev_root}/linkerhand-urdf/O6" \
   "${waist[@]}" \
+  --frequency "${FREQUENCY:-60}" \
   --arm-translation-scale "${ARM_TRANSLATION_SCALE:-0.87}" \
   --arm-velocity-limit "${ARM_VELOCITY_LIMIT:-30.0}" \
   --arm-dq-feedforward "${ARM_DQ_FEEDFORWARD:-on}" \
   --arm-dq-limit "${ARM_DQ_LIMIT:-6.0}" \
-  --arm-target-velocity-limit "${ARM_TARGET_VELOCITY_LIMIT:-4.0}" \
+  --arm-target-velocity-limit "${ARM_TARGET_VELOCITY_LIMIT:-5.0}" \
   --arm-target-accel-limit "${ARM_TARGET_ACCEL_LIMIT:-40.0}" \
   --camera-calibration "${CAMERA_CALIBRATION:-}" \
   --network-interface eno1 \
