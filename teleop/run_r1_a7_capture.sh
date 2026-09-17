@@ -46,6 +46,7 @@ exec "${dev_root}/.venv-xr/bin/python" -u teleop_hand_and_arm.py \
   --linker-o6-method vector \
   --linker-o6-urdf-root "${dev_root}/linkerhand-urdf/O6" \
   --waist-follow \
+  --arm-translation-scale "${ARM_TRANSLATION_SCALE:-0.87}" \
   --arm-limit-softness "${ARM_LIMIT_SOFTNESS:-0.1}" \
   --arm-posture-weight "${ARM_POSTURE_WEIGHT:-0.02}" \
   --arm-velocity-limit "${ARM_VELOCITY_LIMIT:-30.0}" \

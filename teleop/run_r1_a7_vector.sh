@@ -8,6 +8,10 @@
 #                       0.02 降到 0.629 而位置跟踪基本不变（+8%）、腕部姿态误差 0.089→0.131 rad；
 #                       0.05 能降到 0.575 但姿态误差到 0.187 且开始贴关节限位。0 = 关闭。
 #   ARM_LIMIT_SOFTNESS  软关节限位壁垒的权重，默认 0.1（0 = 关闭）。
+#   ARM_TRANSLATION_SCALE  手部位移的比例，默认 0.87。机器人手臂比人臂短，按比例映射就是两者之比：
+#                       R1_A7 肩到腕约 0.65 m，成人手臂约 0.75 m → 65/75 = 0.87。旋转从不缩放。
+#                       1.0 会让手臂去够比操作者远 15% 的位置，腕部更容易顶到工作空间边界；
+#                       0.7 少走 19%，手要划得比机器人动得还多，手感发涩。
 #   ARM_DQ_FEEDFORWARD  默认 off —— 与 2026-09-14 的生产行为一致：dq 恒为 0，纯位置控制。
 #                       设 on 则把目标速度作为速度前馈下发给电机（原来 dq 恒为 0，
 #                       纯位置控制，所以手臂追不上快速的手部动作，表现为一卡一卡）。
@@ -64,6 +68,7 @@ exec "$python" -u teleop_hand_and_arm.py \
   --linker-o6-method vector \
   --linker-o6-urdf-root "${dev_root}/linkerhand-urdf/O6" \
   --waist-follow \
+  --arm-translation-scale "${ARM_TRANSLATION_SCALE:-0.87}" \
   --arm-limit-softness "${ARM_LIMIT_SOFTNESS:-0.1}" \
   --arm-posture-weight "${ARM_POSTURE_WEIGHT:-0.02}" \
   --arm-velocity-limit "${ARM_VELOCITY_LIMIT:-30.0}" \
