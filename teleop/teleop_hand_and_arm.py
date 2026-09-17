@@ -386,6 +386,13 @@ if __name__ == '__main__':
     parser.add_argument('--waist-follow', action='store_true', help='R1_A7: sustained head turns drive waist yaw with feedback-based head and arm compensation')
     parser.add_argument('--waist-follow-threshold-deg', type=float, default=12.0, help='Head yaw needed to engage waist following (degrees)')
     parser.add_argument('--waist-follow-dwell', type=float, default=0.2, help='Seconds the head yaw threshold must be held before waist following engages')
+    parser.add_argument('--waist-follow-compensation', choices=['torso', 'world'], default='torso', help='R1_A7: which frame the wrist target is held in while the waist turns. '
+                        '"torso" (default) keeps the arm posture relative to the torso exactly as the operator commanded it, so turning the waist only rotates the whole arm with the '
+                        'body and the joints do not move at all. "world" counter-rotates the target about the pelvis axis to hold the hand still in world space, which the arm can only '
+                        'achieve by folding; measured on 2026-09-16 (r1-diag-15deg, 6494 samples) with the operator hand still to within 2 mm, the elbow moved 0.10 deg per tick while the '
+                        'waist was still and 3.51 deg per tick once the waist turned more than 2 deg -- a 35x amplification of uncommanded arm motion, and the direct cause of the arm '
+                        'twisting during waist following. The counter-rotation is only worth its cost when something must stay put in the world, which is not what a head-triggered waist '
+                        'follow is doing.')
     parser.add_argument('--startup-wrist-align', action='store_true', help='R1_A7: align wrist orientation to the initial Vision Pro pose before following')
     # record mode and task info
     parser.add_argument('--record', action = 'store_true', help = 'Enable data recording mode')
@@ -1133,6 +1140,17 @@ if __name__ == '__main__':
                         "elbow drift protection on" if args.arm_posture_weight > 0.0
                         else "elbow drift protection OFF",
                     )
+                    # Always reported while waist following is on: this one decides whether
+                    # turning the waist rotates the whole arm with the body or makes it fold to
+                    # hold the hand in world space, and the difference is felt immediately.
+                    if args.waist_follow:
+                        logger_mp.info(
+                            "[R1 WAIST] follow=on compensation=%s (%s)",
+                            getattr(args, "waist_follow_compensation", "torso"),
+                            "the arm keeps its posture relative to the torso and rides the waist"
+                            if getattr(args, "waist_follow_compensation", "torso") == 'torso'
+                            else "the target is counter-rotated to hold the hand in world space",
+                        )
                     arm_ctrl.start_publishing()
                     r1_waist_to_root = np.array([
                         [math.cos(r1_waist_yaw_reference), -math.sin(r1_waist_yaw_reference), 0.0],
@@ -1442,10 +1460,14 @@ if __name__ == '__main__':
                     r1_robot_left_reference, r1_robot_right_reference = arm_ik.forward_wrist_poses(held_q)
                     actual_waist_yaw = arm_ctrl.get_current_waist_yaw()
                     if args.waist_follow:
-                        r1_robot_left_reference, r1_robot_right_reference = (
-                            compensate_wrist_for_waist(pose, r1_waist_yaw_reference, actual_waist_yaw)
-                            for pose in (r1_robot_left_reference, r1_robot_right_reference)
-                        )
+                        # world mode records the anchor in the robot root frame and lets the
+                        # per-tick counter-rotation bring it back; torso mode keeps the FK
+                        # result in the fixed-waist IK frame the solver actually works in.
+                        if getattr(args, "waist_follow_compensation", "torso") == 'world':
+                            r1_robot_left_reference, r1_robot_right_reference = (
+                                compensate_wrist_for_waist(pose, r1_waist_yaw_reference, actual_waist_yaw)
+                                for pose in (r1_robot_left_reference, r1_robot_right_reference)
+                            )
                         waist_follower = R1HeadWaistFollower(
                             actual_waist_yaw,
                             time.monotonic(),
@@ -1628,12 +1650,19 @@ if __name__ == '__main__':
                             waist_yaw_actual, time.monotonic(),
                         )
                         head_q_target = head_q_target + r1_head_q_offset
-                    left_ik_target = compensate_wrist_for_waist(
-                        left_wrist_target, waist_yaw_actual, r1_waist_yaw_reference,
-                    )
-                    right_ik_target = compensate_wrist_for_waist(
-                        right_wrist_target, waist_yaw_actual, r1_waist_yaw_reference,
-                    )
+                    # torso mode feeds the anchored target straight to the solver: the IK
+                    # model has the waist locked at r1_waist_yaw_reference, so the solved
+                    # joints describe the arm relative to the torso, which is exactly the
+                    # operator's own arm-to-torso relationship. The real waist then carries
+                    # that whole posture with it. world mode counter-rotates the target about
+                    # the pelvis axis instead, and the arm has to fold to hold the hand still.
+                    if getattr(args, "waist_follow_compensation", "torso") == 'world':
+                        left_ik_target = compensate_wrist_for_waist(
+                            left_wrist_target, waist_yaw_actual, r1_waist_yaw_reference,
+                        )
+                        right_ik_target = compensate_wrist_for_waist(
+                            right_wrist_target, waist_yaw_actual, r1_waist_yaw_reference,
+                        )
                 if r1_a7_anchored:
                     sol_q, sol_tauff = arm_ik.solve_ik(
                         left_ik_target,
@@ -1737,20 +1766,29 @@ if __name__ == '__main__':
                         tele_data.right_wrist_pose, tele_data.head_pose,
                         r1_head_yaw_reference, r1_head_pose_reference[:3, 3],
                     )
+                # The solver reports position/orientation as soft costs, so an
+                # unreachable target silently under-follows. Surface it instead.
+                #
+                # This runs before the root-frame conversion below on purpose: the FK above
+                # is in the fixed-waist IK frame and so are the *_ik_target values, while
+                # the conversion rotates the FK to the actual root frame. Comparing across
+                # the two charged the waist angle itself as solver error -- measured on the
+                # 2026-09-16 waist run, 100% of samples read as "outside the workspace"
+                # beyond 10 deg of waist while only about 36% actually were, which is how
+                # waist following got blamed for destroying the workspace.
+                workspace_saturation = r1_workspace_saturation(
+                    solved_left_pose, solved_right_pose, left_ik_target, right_ik_target,
+                    args.workspace_position_tolerance_m, args.workspace_rotation_tolerance_rad,
+                )
                 if args.waist_follow:
-                    # Fixed-waist IK FK must be returned to the actual robot root frame.
+                    # Fixed-waist IK FK must be returned to the actual robot root frame
+                    # before it is recorded.
                     actual_left_pose, actual_right_pose, solved_left_pose, solved_right_pose = (
                         compensate_wrist_for_waist(pose, r1_waist_yaw_reference, waist_yaw_actual)
                         for pose in (actual_left_pose, actual_right_pose, solved_left_pose, solved_right_pose)
                     )
                 if not run_motion:
                     left_wrist_target, right_wrist_target = solved_left_pose.copy(), solved_right_pose.copy()
-                # The solver reports position/orientation as soft costs, so an
-                # unreachable target silently under-follows. Surface it instead.
-                workspace_saturation = r1_workspace_saturation(
-                    solved_left_pose, solved_right_pose, left_ik_target, right_ik_target,
-                    args.workspace_position_tolerance_m, args.workspace_rotation_tolerance_rad,
-                )
                 workspace_outside = tuple(
                     side for side, item in workspace_saturation.items() if item["outside"]
                 )

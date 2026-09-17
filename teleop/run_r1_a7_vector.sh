@@ -18,6 +18,14 @@
 #                       要退回“削命令”的保守方案：ARM_DQ_FEEDFORWARD=off ARM_VELOCITY_LIMIT=3.0
 #   ARM_DQ_LIMIT        前馈速度上限，默认 6.0 rad/s（安全网，不是跟踪上限）
 #   ARM_VELOCITY_LIMIT  位置目标的安全限速，默认 30.0 rad/s（约等于不限）
+#   WAIST_FOLLOW_COMPENSATION  腰部转动时手腕目标保持在哪个坐标系，默认 torso。
+#                       torso = 手臂相对躯干的姿态完全按你命令的来，腰一转整条手臂跟着身体一起转，
+#                               关节一动不动 —— 对应真人「腰转、手跟着身体走」的关系。
+#                       world = 把目标绕骨盆轴反向转，让手留在世界坐标里不动；手不动时腰一转，
+#                               手臂只能靠折叠去补偿，实测肘的活动量放大 35 倍（手静止 2mm 内：
+#                               腰不动 0.10°/周期，腰转 >2° 时 3.51°/周期），这就是「手臂乱扭」的来源。
+#                       world 只在「有东西必须钉在世界坐标里」时才有意义，而腰跟随是看头触发的，
+#                       不属于这种情况。设成 world 只为了复现旧行为做对比。
 #   ARM_DIAG_HZ         设了就按该频率记录诊断（复测大臂问题建议 40）
 #   ARM_DIAG_DIR        设了就把诊断 JSONL 写进该目录
 #   CAMERA_CALIBRATION  相机标定 JSON 路径；留空则用 assets/r1/camera_calibration.json（存在才读）。
@@ -68,6 +76,7 @@ exec "$python" -u teleop_hand_and_arm.py \
   --linker-o6-method vector \
   --linker-o6-urdf-root "${dev_root}/linkerhand-urdf/O6" \
   --waist-follow \
+  --waist-follow-compensation "${WAIST_FOLLOW_COMPENSATION:-torso}" \
   --arm-translation-scale "${ARM_TRANSLATION_SCALE:-0.87}" \
   --arm-limit-softness "${ARM_LIMIT_SOFTNESS:-0.1}" \
   --arm-posture-weight "${ARM_POSTURE_WEIGHT:-0.02}" \

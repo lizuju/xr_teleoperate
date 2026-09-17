@@ -109,6 +109,9 @@ class R1HeadWaistIntegrationTest(unittest.TestCase):
             "R1_PAUSE": None, "r1_frozen_generation": -1, "r1_head_q_offset": np.zeros(2),
             "args": SimpleNamespace(
                 waist_follow=True, ee=None, input_mode="hand", motion=False,
+                # These cases assert the counter-rotated target, i.e. the non-default
+                # frame; the default (torso) is covered by test_r1_waist_compensation.
+                waist_follow_compensation="world",
                 tracking_timeout=0.25, frequency=30.0, arm_translation_scale=1.0,
                 arm_diagnostic_hz=10.0,
                 workspace_position_tolerance_m=0.05, workspace_rotation_tolerance_rad=0.15,
