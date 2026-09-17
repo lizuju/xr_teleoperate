@@ -1607,18 +1607,33 @@ if __name__ == '__main__':
                         tele_data.head_pose,
                         r1_head_pose_reference,
                     )
-                    left_wrist_pose = wrist_in_reference_head_yaw_frame(
-                        tele_data.left_wrist_pose,
-                        tele_data.head_pose,
-                        r1_head_yaw_reference,
-                        r1_head_pose_reference[:3, 3],
-                    )
-                    right_wrist_pose = wrist_in_reference_head_yaw_frame(
-                        tele_data.right_wrist_pose,
-                        tele_data.head_pose,
-                        r1_head_yaw_reference,
-                        r1_head_pose_reference[:3, 3],
-                    )
+                    # torso mode takes the wrapper's pose as it comes. televuer already
+                    # expresses the wrist in the CURRENT head-yaw frame with the origin moved
+                    # from the head to the waist, so when the operator turns their body the
+                    # hand, the head and that frame all rotate together and this pose does not
+                    # move at all -- exactly the hand's pose relative to their own torso, which
+                    # is what the arm should reproduce. Re-referencing it to the activation yaw
+                    # below converts it to world coordinates, which is what world mode and the
+                    # waist-off path need; feeding world coordinates to a fixed-waist solver
+                    # while the real waist turns makes the hand travel twice the body rotation.
+                    if args.waist_follow and getattr(
+                        args, "waist_follow_compensation", "torso"
+                    ) == 'torso':
+                        left_wrist_pose = tele_data.left_wrist_pose
+                        right_wrist_pose = tele_data.right_wrist_pose
+                    else:
+                        left_wrist_pose = wrist_in_reference_head_yaw_frame(
+                            tele_data.left_wrist_pose,
+                            tele_data.head_pose,
+                            r1_head_yaw_reference,
+                            r1_head_pose_reference[:3, 3],
+                        )
+                        right_wrist_pose = wrist_in_reference_head_yaw_frame(
+                            tele_data.right_wrist_pose,
+                            tele_data.head_pose,
+                            r1_head_yaw_reference,
+                            r1_head_pose_reference[:3, 3],
+                        )
                     left_wrist_target = anchored_wrist_target(
                         left_wrist_pose,
                         r1_vision_left_reference,

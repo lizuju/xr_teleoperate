@@ -51,6 +51,28 @@ class WaistCompensationDefaultTest(unittest.TestCase):
 
 
 class WaistCompensationWiringTest(unittest.TestCase):
+    def test_torso_mode_takes_the_wrapper_pose_without_re_referencing(self):
+        """The wrapper's pose is already relative to the operator's own torso.
+
+        televuer expresses the wrist in the current head-yaw frame with the origin
+        moved from the head to the waist, so a body turn leaves it unchanged.
+        Re-referencing it to the activation yaw turns it into a world pose, and a
+        world pose fed to a fixed-waist solver while the real waist turns sends the
+        hand through twice the body rotation.
+        """
+        torso = SOURCE.index("left_wrist_pose = tele_data.left_wrist_pose")
+        right = SOURCE.index("right_wrist_pose = tele_data.right_wrist_pose")
+        guard = SOURCE.rindex(") == 'torso':", 0, torso)
+        world = SOURCE.index("left_wrist_pose = wrist_in_reference_head_yaw_frame(", right)
+        self.assertLess(guard, torso)
+        self.assertLess(torso, right)
+        self.assertIn("else:", SOURCE[right:world])
+
+    def test_the_world_path_still_re_references(self):
+        self.assertGreater(
+            SOURCE.count("left_wrist_pose = wrist_in_reference_head_yaw_frame("), 0
+        )
+
     def test_the_tick_target_is_only_counter_rotated_in_world_mode(self):
         call = SOURCE.index("left_ik_target = compensate_wrist_for_waist(")
         guard = SOURCE.rindex(WORLD_GUARD, 0, call)
