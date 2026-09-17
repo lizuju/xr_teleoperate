@@ -19,7 +19,7 @@ except ImportError:
 ROOT = Path(__file__).resolve().parents[1]
 MAIN_PATH = ROOT / "teleop" / "teleop_hand_and_arm.py"
 sys.path.insert(0, str(ROOT / "teleop" / "robot_control"))
-from r1_head_waist import compensate_wrist_for_waist
+from r1_head_waist import R1HeadWaistFollower, compensate_wrist_for_waist
 from r1_hand_tracking import R1WristHold, hand_tracking_freshness
 from teleop.robot_control.linker_o6_control_loop import LinkerO6ControlLoop
 
@@ -71,13 +71,19 @@ class R1HeadWaistIntegrationTest(unittest.TestCase):
         start = next(i for i, node in enumerate(self.loop.body) if assigns(node, "tele_data"))
         end = next(i for i, node in enumerate(self.loop.body) if calls(node, "write_json_line"))
         self.control_nodes = self.loop.body[start:end + 1]
-        # The main loop calls this module-level helper; pull it in the same way.
+        # The main loop calls these module-level helpers; pull them in the same way, so
+        # the loop slice and the helpers cannot drift apart on the engagement settings.
         workspace_nodes = [
             node for node in self.tree.body if isinstance(node, ast.FunctionDef)
-            and node.name in ("r1_workspace_saturation", "rotation_error_rad")
+            and node.name in (
+                "r1_workspace_saturation", "rotation_error_rad", "waist_follower_from_args",
+            )
         ]
-        workspace_ns = {"np": np, "math": math}
+        workspace_ns = {
+            "np": np, "math": math, "R1HeadWaistFollower": R1HeadWaistFollower,
+        }
         execute(workspace_nodes, workspace_ns)
+        self.waist_follower_from_args = workspace_ns["waist_follower_from_args"]
         self.workspace_saturation = workspace_ns["r1_workspace_saturation"]
         self.left = pose(0.6, [0.4, 0.2, 0.8])
         self.right = pose(-0.4, [0.35, -0.22, 0.78])
@@ -133,6 +139,9 @@ class R1HeadWaistIntegrationTest(unittest.TestCase):
             "is_fresh_motion_data": Mock(side_effect=freshness),
             "logger_mp": Mock(), "arm_ctrl": controller, "arm_ik": ik,
             "waist_follower": follower, "linker_o6_loop": None,
+            # Built by the production helper, so the resume path exercises the real
+            # engagement and slew settings instead of a hand-rolled follower.
+            "waist_follower_from_args": self.waist_follower_from_args,
             "relative_head_pitch_yaw": Mock(return_value=np.zeros(2)),
             "wrist_in_reference_head_yaw_frame": lambda wrist, *_: wrist.copy(),
             "anchored_wrist_target": lambda wrist, *_: wrist.copy(),

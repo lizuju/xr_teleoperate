@@ -29,26 +29,58 @@ def compensate_wrist_for_waist(target, waist_actual, waist_reference):
 
 
 class R1HeadWaistFollower:
+    #: Residual yaw needed to start following, and how long it must hold. The residual
+    #: is the head yaw the waist has not absorbed yet, not the raw head yaw.
+    DEFAULT_ENGAGE_THRESHOLD = math.radians(20.0)
+    DEFAULT_ENGAGE_DURATION = 0.2
+    #: Residual below which following stops, leaving a hysteresis band around the
+    #: engage threshold so the waist cannot chatter on and off at the boundary.
+    DEFAULT_RELEASE_THRESHOLD = math.radians(5.0)
+    #: Slew limits of the waist target while following. The old 20 deg/s ceiling with a
+    #: 0.5 rad/s^2 ramp took 2.2 s to absorb a 45 deg body turn, which the operator read
+    #: as the robot lagging behind them.
+    DEFAULT_MAX_VELOCITY = math.radians(40.0)
+    DEFAULT_MAX_ACCELERATION = math.radians(90.0)
+    #: Time constant of the proportional slew law: the target chases the goal with this
+    #: lag and saturates at DEFAULT_MAX_VELOCITY once the residual exceeds the product.
+    SLEW_TIME_CONSTANT = 0.8
+
     def __init__(
         self,
         waist_reference,
         now,
         tracking_timeout=0.25,
-        engage_threshold=math.radians(12.0),
-        engage_duration=0.2,
+        engage_threshold=DEFAULT_ENGAGE_THRESHOLD,
+        engage_duration=DEFAULT_ENGAGE_DURATION,
+        max_velocity=DEFAULT_MAX_VELOCITY,
+        max_acceleration=DEFAULT_MAX_ACCELERATION,
+        release_threshold=DEFAULT_RELEASE_THRESHOLD,
     ):
         self.waist_reference = float(waist_reference)
         self._last_time = float(now)
         self.tracking_timeout = float(tracking_timeout)
         self.engage_threshold = float(engage_threshold)
         self.engage_duration = float(engage_duration)
+        self.max_velocity = float(max_velocity)
+        self.max_acceleration = float(max_acceleration)
+        self.release_threshold = float(release_threshold)
         if not all(math.isfinite(value) for value in (
             self.waist_reference,
             self._last_time,
             self.tracking_timeout,
             self.engage_threshold,
             self.engage_duration,
-        )) or self.tracking_timeout <= 0.0 or self.engage_threshold <= 0.0 or self.engage_duration <= 0.0:
+            self.max_velocity,
+            self.max_acceleration,
+            self.release_threshold,
+        )) or min(
+            self.tracking_timeout,
+            self.engage_threshold,
+            self.engage_duration,
+            self.max_velocity,
+            self.max_acceleration,
+            self.release_threshold,
+        ) <= 0.0:
             raise ValueError(
                 "reference/time and engagement settings must be finite and positive"
             )
@@ -107,7 +139,7 @@ class R1HeadWaistFollower:
         if not timed_out:
             residual = self.total_yaw - (waist_actual - self.waist_reference)
             if self.following:
-                if abs(residual) < math.radians(5.0):
+                if abs(residual) < self.release_threshold:
                     self.following = False
                     self._trigger_since = None
                     self._trigger_sign = 0.0
@@ -130,19 +162,21 @@ class R1HeadWaistFollower:
                     -2.618, 2.618,
                 ))
                 desired_velocity = float(np.clip(
-                    (self._goal - self.waist_target) / 0.8, -0.35, 0.35,
+                    (self._goal - self.waist_target) / self.SLEW_TIME_CONSTANT,
+                    -self.max_velocity, self.max_velocity,
                 ))
             else:
                 desired_velocity = 0.0
             previous_velocity = self._velocity
             self._velocity += float(np.clip(
-                desired_velocity - self._velocity, -0.5 * dt, 0.5 * dt,
+                desired_velocity - self._velocity,
+                -self.max_acceleration * dt, self.max_acceleration * dt,
             ))
             step = self._velocity * dt
             remaining = self._goal - self.waist_target
             if (
                 remaining * step > 0.0 and abs(step) >= abs(remaining)
-                and abs(previous_velocity) <= 0.5 * dt
+                and abs(previous_velocity) <= self.max_acceleration * dt
             ):
                 self.waist_target = self._goal
                 self._velocity = remaining / dt

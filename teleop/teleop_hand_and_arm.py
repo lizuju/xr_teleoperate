@@ -154,6 +154,25 @@ def anchored_wrist_target(
     )
     return target
 
+
+def waist_follower_from_args(args, waist_actual, now):
+    """Build the waist follower from the launch settings.
+
+    Shared by the activation and the resume paths so the two cannot drift apart.
+    The getattr fallbacks are the argument defaults, so a namespace that predates
+    one of these flags gets the intended behaviour rather than a silent zero.
+    """
+    return R1HeadWaistFollower(
+        waist_actual,
+        now,
+        args.tracking_timeout,
+        math.radians(getattr(args, "waist_follow_threshold_deg", 20.0)),
+        getattr(args, "waist_follow_dwell", 0.2),
+        math.radians(getattr(args, "waist_follow_speed_deg", 40.0)),
+        math.radians(getattr(args, "waist_follow_accel_deg", 90.0)),
+    )
+
+
 class TeleImagerCameraClient:
     '''Camera access built on teleimager 2.x ``TeleImageClient``.
 
@@ -384,8 +403,14 @@ if __name__ == '__main__':
                         'further than the operator and saturates the wrist more often; 0.7 under-reaches by 19%%, so the operator has to move further than the robot does.')
     parser.add_argument('--arm-diagnostic-dir', type=str, default=None, help='Directory for R1_A7 alignment JSONL diagnostics')
     parser.add_argument('--waist-follow', action='store_true', help='R1_A7: sustained head turns drive waist yaw with feedback-based head and arm compensation')
-    parser.add_argument('--waist-follow-threshold-deg', type=float, default=12.0, help='Head yaw needed to engage waist following (degrees)')
+    parser.add_argument('--waist-follow-threshold-deg', type=float, default=20.0, help='Residual head yaw, i.e. the yaw the waist has not absorbed yet, needed to engage waist following. '
+                        'Not the raw head yaw: the waist turns until the residual falls under the release threshold, so this is how far the operator can turn before the robot starts '
+                        'following. Raising it stops small head movements from turning the torso at all. (degrees)')
     parser.add_argument('--waist-follow-dwell', type=float, default=0.2, help='Seconds the head yaw threshold must be held before waist following engages')
+    parser.add_argument('--waist-follow-speed-deg', type=float, default=40.0, help='R1_A7: ceiling on how fast the waist target may slew while following, in degrees per second. '
+                        'The old fixed ceiling was 20 deg/s, which took 2.2 s to absorb a 45 deg body turn and read as the robot lagging behind the operator. Must be positive.')
+    parser.add_argument('--waist-follow-accel-deg', type=float, default=90.0, help='R1_A7: how fast the waist target may change speed while following, in degrees per second squared. '
+                        'Together with --waist-follow-speed-deg this sets the ramp: 40 deg/s at 90 deg/s^2 reaches full speed in 0.44 s. Must be positive.')
     parser.add_argument('--waist-follow-compensation', choices=['torso', 'world'], default='torso', help='R1_A7: which frame the wrist target is held in while the waist turns. '
                         '"torso" (default) keeps the arm posture relative to the torso exactly as the operator commanded it, so turning the waist only rotates the whole arm with the '
                         'body and the joints do not move at all. "world" counter-rotates the target about the pelvis axis to hold the hand still in world space, which the arm can only '
@@ -447,6 +472,10 @@ if __name__ == '__main__':
         parser.error("--waist-follow-threshold-deg must be positive.")
     if not (math.isfinite(args.waist_follow_dwell) and args.waist_follow_dwell > 0.0):
         parser.error("--waist-follow-dwell must be positive.")
+    if not (math.isfinite(args.waist_follow_speed_deg) and args.waist_follow_speed_deg > 0.0):
+        parser.error("--waist-follow-speed-deg must be positive.")
+    if not (math.isfinite(args.waist_follow_accel_deg) and args.waist_follow_accel_deg > 0.0):
+        parser.error("--waist-follow-accel-deg must be positive.")
     if args.waist_follow and (args.arm != "R1_A7" or args.hand_only or args.dry_run or args.motion):
         parser.error("--waist-follow requires R1_A7 full arm control without --motion.")
     if not (math.isfinite(args.arm_diagnostic_hz) and args.arm_diagnostic_hz > 0.0):
@@ -1272,17 +1301,19 @@ if __name__ == '__main__':
                 r1_head_yaw_reference = head_yaw_rotation(reference_tele_data.head_pose)
                 r1_head_pose_reference = reference_tele_data.head_pose.copy()
                 if args.waist_follow:
-                    waist_follower = R1HeadWaistFollower(
-                        r1_waist_yaw_reference,
-                        time.monotonic(),
-                        args.tracking_timeout,
-                        math.radians(getattr(args, "waist_follow_threshold_deg", 12.0)),
-                        getattr(args, "waist_follow_dwell", 0.2),
+                    waist_follower = waist_follower_from_args(
+                        args, r1_waist_yaw_reference, time.monotonic(),
                     )
                     logger_mp.info(
-                        f"R1_A7 head/waist following enabled: {args.waist_follow_threshold_deg:g} deg for "
-                        f"{args.waist_follow_dwell:g} s to engage, "
-                        "0.35 rad/s waist speed, URDF waist range +/-2.618 rad."
+                        "R1_A7 head/waist following enabled: %.4g deg residual for %.4g s to engage, "
+                        "release at %.4g deg, %.4g deg/s with a %.4g deg/s^2 ramp, "
+                        "compensation=%s, URDF waist range +/-2.618 rad.",
+                        math.degrees(waist_follower.engage_threshold),
+                        waist_follower.engage_duration,
+                        math.degrees(waist_follower.release_threshold),
+                        math.degrees(waist_follower.max_velocity),
+                        math.degrees(waist_follower.max_acceleration),
+                        getattr(args, "waist_follow_compensation", "torso"),
                     )
                 if STOP:
                     continue
@@ -1468,12 +1499,8 @@ if __name__ == '__main__':
                                 compensate_wrist_for_waist(pose, r1_waist_yaw_reference, actual_waist_yaw)
                                 for pose in (r1_robot_left_reference, r1_robot_right_reference)
                             )
-                        waist_follower = R1HeadWaistFollower(
-                            actual_waist_yaw,
-                            time.monotonic(),
-                            args.tracking_timeout,
-                            math.radians(getattr(args, "waist_follow_threshold_deg", 12.0)),
-                            getattr(args, "waist_follow_dwell", 0.2),
+                        waist_follower = waist_follower_from_args(
+                            args, actual_waist_yaw, time.monotonic(),
                         )
                     r1_waist_to_root = np.array([
                         [math.cos(actual_waist_yaw), -math.sin(actual_waist_yaw), 0.0],

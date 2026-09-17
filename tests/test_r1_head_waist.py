@@ -12,6 +12,12 @@ sys.path.insert(0, str(REPO_ROOT / "teleop" / "robot_control"))
 from r1_head_waist import R1HeadWaistFollower, compensate_wrist_for_waist
 
 
+#: The follower's own defaults, so these tests track them instead of restating them.
+DEFAULT_THRESHOLD = R1HeadWaistFollower.DEFAULT_ENGAGE_THRESHOLD
+DEFAULT_MAX_VELOCITY = R1HeadWaistFollower.DEFAULT_MAX_VELOCITY
+DEFAULT_MAX_ACCELERATION = R1HeadWaistFollower.DEFAULT_MAX_ACCELERATION
+
+
 def rotation_yaw(angle):
     cosine, sine = math.cos(angle), math.sin(angle)
     return np.array([[cosine, -sine, 0.0], [sine, cosine, 0.0], [0.0, 0.0, 1.0]])
@@ -60,13 +66,27 @@ class R1HeadWaistTest(unittest.TestCase):
             )
         self.assertAlmostEqual(actual, settled)
 
-    def test_default_engagement_settings_reduce_follow_start_delay(self):
+    def test_default_engagement_settings_and_slew_limits(self):
         follower = R1HeadWaistFollower(0.0, 0.0)
+        # A 25 deg residual clears the 20 deg threshold and holds it for the 0.2 s dwell.
         for index in range(1, 24):
-            follower.update(head_pose(math.radians(15.0)), np.eye(4), 0.0, index * 0.01)
+            follower.update(head_pose(math.radians(25.0)), np.eye(4), 0.0, index * 0.01)
         self.assertTrue(follower.following)
-        self.assertAlmostEqual(follower.engage_threshold, math.radians(12.0))
+        self.assertAlmostEqual(follower.engage_threshold, math.radians(20.0))
         self.assertEqual(follower.engage_duration, 0.2)
+        # The old fixed ceiling was 20 deg/s with a 0.5 rad/s^2 ramp.
+        self.assertAlmostEqual(DEFAULT_MAX_VELOCITY, math.radians(40.0))
+        self.assertAlmostEqual(DEFAULT_MAX_ACCELERATION, math.radians(90.0))
+        self.assertAlmostEqual(follower.release_threshold, math.radians(5.0))
+
+    def test_a_15_degree_residual_no_longer_engages_the_waist(self):
+        follower = R1HeadWaistFollower(0.0, 0.0)
+        for index in range(1, 201):
+            _, waist = follower.update(
+                head_pose(math.radians(15.0)), np.eye(4), 0.0, index * 0.01,
+            )
+            self.assertFalse(follower.following)
+            self.assertEqual(waist, 0.0)
 
     def test_alternating_short_glances_do_not_accumulate_dwell(self):
         follower = R1HeadWaistFollower(0.0, 0.0)
@@ -87,8 +107,8 @@ class R1HeadWaistTest(unittest.TestCase):
         velocities = np.diff(targets) / dt
         accelerations = np.diff(np.concatenate(([0.0], velocities))) / dt
         self.assertLessEqual(np.max(np.abs(targets)), 2.618 + 1e-12)
-        self.assertLessEqual(np.max(np.abs(velocities)), 0.35 + 1e-12)
-        self.assertLessEqual(np.max(np.abs(accelerations)), 0.5 + 1e-10)
+        self.assertLessEqual(np.max(np.abs(velocities)), DEFAULT_MAX_VELOCITY + 1e-12)
+        self.assertLessEqual(np.max(np.abs(accelerations)), DEFAULT_MAX_ACCELERATION + 1e-10)
         self.assertGreater(targets[150], 0.1)
         self.assertLess(targets[-1], -math.radians(60.0))
         self.assertGreaterEqual(targets[-1], -math.radians(65.0))
@@ -116,7 +136,7 @@ class R1HeadWaistTest(unittest.TestCase):
             targets.append(target)
         velocity = np.diff(targets) / 0.01
         acceleration = np.diff(np.concatenate(([0.0], velocity))) / 0.01
-        self.assertLessEqual(np.max(np.abs(acceleration)), 0.5 + 1e-10)
+        self.assertLessEqual(np.max(np.abs(acceleration)), DEFAULT_MAX_ACCELERATION + 1e-10)
 
     def test_heading_unwrap_crosses_pi_without_direction_flip(self):
         follower = R1HeadWaistFollower(0.0, 0.0)
@@ -156,7 +176,7 @@ class R1HeadWaistTest(unittest.TestCase):
             self.assertFalse(follower.following)
         velocities = np.diff(targets) / 0.01
         acceleration = np.diff(np.concatenate(([0.0], velocities))) / 0.01
-        self.assertLessEqual(np.max(np.abs(acceleration)), 0.5 + 1e-10)
+        self.assertLessEqual(np.max(np.abs(acceleration)), DEFAULT_MAX_ACCELERATION + 1e-10)
         self.assertAlmostEqual(targets[-1], targets[-2])
         stopped_target = targets[-1]
         for index in range(251, 290):
@@ -241,7 +261,7 @@ class R1HeadWaistTest(unittest.TestCase):
         _, target = follower.update(head_pose(0.8), np.eye(4), 0.22, 1.23)
         self.assertTrue(follower.following)
         self.assertGreater(target, 0.22)
-        self.assertLessEqual((target - 0.22) / 0.02, 0.5 * 0.02 + 1e-12)
+        self.assertLessEqual((target - 0.22) / 0.02, DEFAULT_MAX_ACCELERATION * 0.02 + 1e-12)
 
     def test_wrist_compensation_rotates_complete_pose_and_roundtrips(self):
         target = np.eye(4)

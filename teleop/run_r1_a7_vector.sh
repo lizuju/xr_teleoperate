@@ -18,6 +18,14 @@
 #                       要退回“削命令”的保守方案：ARM_DQ_FEEDFORWARD=off ARM_VELOCITY_LIMIT=3.0
 #   ARM_DQ_LIMIT        前馈速度上限，默认 6.0 rad/s（安全网，不是跟踪上限）
 #   ARM_VELOCITY_LIMIT  位置目标的安全限速，默认 30.0 rad/s（约等于不限）
+#   WAIST_FOLLOW_THRESHOLD_DEG  腰跟随的触发门槛，默认 20 度。
+#                       注意比的不是头的绝对偏航角，而是「残差」= 你累计转了多少头 − 腰已经跟了多少。
+#                       残差超过这个值并保持 0.2 s 才开始跟；跟到残差落到 5 度以下就停（迟滞带）。
+#                       调大 = 小幅度转头完全不动腰；调小 = 更容易带动腰。
+#   WAIST_FOLLOW_SPEED_DEG  跟随时腰目标的最大角速度，默认 40 度/秒（旧值写死 20）。
+#                       旧值追一个 45 度的转身要 2.2 s，体感就是机器人拖在你后面。
+#   WAIST_FOLLOW_ACCEL_DEG  腰目标的加速度上限，默认 90 度/秒²（旧值写死 28.6）。
+#                       40 度/秒 配 90 度/秒² → 0.44 s 到全速。
 #   WAIST_FOLLOW_COMPENSATION  腰部转动时手腕目标保持在哪个坐标系，默认 torso。
 #                       torso = 手臂相对躯干的姿态完全按你命令的来，腰一转整条手臂跟着身体一起转，
 #                               关节一动不动 —— 对应真人「腰转、手跟着身体走」的关系。
@@ -76,6 +84,9 @@ exec "$python" -u teleop_hand_and_arm.py \
   --linker-o6-method vector \
   --linker-o6-urdf-root "${dev_root}/linkerhand-urdf/O6" \
   --waist-follow \
+  --waist-follow-threshold-deg "${WAIST_FOLLOW_THRESHOLD_DEG:-20}" \
+  --waist-follow-speed-deg "${WAIST_FOLLOW_SPEED_DEG:-40}" \
+  --waist-follow-accel-deg "${WAIST_FOLLOW_ACCEL_DEG:-90}" \
   --waist-follow-compensation "${WAIST_FOLLOW_COMPENSATION:-torso}" \
   --arm-translation-scale "${ARM_TRANSLATION_SCALE:-0.87}" \
   --arm-limit-softness "${ARM_LIMIT_SOFTNESS:-0.1}" \
