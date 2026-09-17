@@ -155,6 +155,10 @@ def wrist_topics(config):
     return selected
 
 
+#: Label of the head stereo JPEG window, shared by the stream check and main().
+STEREO_JPEG_LABEL = "stereo JPEG (192.168.124.147:55555)"
+
+
 def https_probe(context, port, label):
     url = f"https://192.168.124.147:{port}/"
     try:
@@ -188,8 +192,8 @@ def check_local_and_https():
             listener.bind(("0.0.0.0", 8012))
     except OSError as error:
         raise RuntimeError(f"XR port 8012 unavailable; stop the existing XR process: {error}") from error
-    https_probe(context, 60001, "head stereo")
-    print("[OK] eno1, O6 models, XR TLS files, port 8012 and verified WebRTC HTTPS", flush=True)
+    print("[OK] eno1, O6 models, XR TLS files, port 8012", flush=True)
+    return context
 
 
 def check_streams():
@@ -224,10 +228,10 @@ def check_streams():
             "rt/lowstate (robot feedback on eno1)": StreamWindow(0.25),
             "rt/linker/left/state (left O6 bridge)": StreamWindow(0.25),
             "rt/linker/right/state (right O6 bridge)": StreamWindow(0.25),
-            "stereo JPEG (192.168.124.147:55555)": StreamWindow(0.5),
+            STEREO_JPEG_LABEL: StreamWindow(0.5),
         }
         # (label, port, expected shape) for every JPEG feed the XR scene consumes.
-        jpeg_feeds = [("stereo JPEG (192.168.124.147:55555)", 55555, (448, 1088, 3))]
+        jpeg_feeds = [(STEREO_JPEG_LABEL, 55555, (448, 1088, 3))]
         for topic, zmq_port, _ in wrist:
             if (camera_config.get(topic) or {}).get("enable_zmq"):
                 label = f"{topic.removesuffix('_camera').replace('_', ' ')} JPEG (192.168.124.147:{zmq_port})"
@@ -295,7 +299,7 @@ def check_streams():
                                 print(f"[WARN] {label}: {short}/{total} frames arrive without the JPEG EOI marker "
                                       f"(wrist UVC module quirk; turbojpeg decodes them, losing at most the last MCU row)",
                                       flush=True)
-                        return
+                        return set(windows)
             raise RuntimeError("stream checks failed:\n" + "\n".join(f"  {name}: {problem}" for name, problem in problems.items()))
         finally:
             for socket_ in frame_sockets:
@@ -309,8 +313,21 @@ def check_streams():
 def main():
     print("[PREFLIGHT] read-only checks; DDS state subscriptions only", flush=True)
     try:
-        check_local_and_https()
-        check_streams()
+        context = check_local_and_https()
+        # The teleop reads the head image over ZMQ and paints it into the XR scene from
+        # shared memory; the WebRTC plane is only negotiated on headsets that support a
+        # second element, and this one does not. So a dead 60001 upstream is a warning
+        # while the ZMQ feed is healthy, and a hard failure only when it is not.
+        healthy = check_streams()
+        try:
+            https_probe(context, 60001, "head stereo")
+            print("[OK] verified WebRTC HTTPS for the head stereo plane", flush=True)
+        except RuntimeError as error:
+            if STEREO_JPEG_LABEL in healthy:
+                print(f"[WARN] {error}; the head image still arrives over ZMQ, so only the "
+                      f"optional WebRTC scene element is unavailable", flush=True)
+            else:
+                raise
     except KeyboardInterrupt:
         print("[STOP] preflight cancelled; teleoperation was not started", file=sys.stderr)
         return 130
