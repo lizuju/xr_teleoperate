@@ -111,6 +111,17 @@ class CaptureTests(unittest.TestCase):
         self.capture.reset_episode()
         self.assertFalse(self.capture.frame(self.xr, self.image, "following")["sample"]["sources"]["image"]["repeated"])
 
+    def test_colour_sequences_identify_the_head_frame(self):
+        # The writer stores a colour key once per source frame and points later
+        # samples at the same file; these sequences are how it knows they match.
+        first = self.capture.frame(self.xr, self.image, "following")
+        second = self.capture.frame(self.xr, self.image, "following")
+        self.assertEqual(first["color_sequences"], {"color_0": 10, "color_1": 10})
+        self.assertEqual(second["color_sequences"], first["color_sequences"])
+        self.capture.reset_episode()
+        self.assertEqual(self.capture.frame(self.xr, self.image, "following")["color_sequences"],
+                         {"color_0": 10, "color_1": 10})
+
     def test_tracking_loss_and_pause_keep_data_without_faking_freshness(self):
         self.xr.motion_data_ready = False
         self.xr.left_hand_timestamp = 0
@@ -251,6 +262,35 @@ class PalmCaptureTests(unittest.TestCase):
         self.assertTrue(self.sources(third)["right_wrist_image"]["repeated"])
         self.capture.reset_episode()
         self.assertFalse(self.sources(self.sample())["right_wrist_image"]["repeated"])
+
+    def test_colour_sequences_carry_each_cameras_own_sequence(self):
+        first = self.sample()
+        self.assertEqual(first["color_sequences"]["color_2"], 11)
+        self.assertEqual(first["color_sequences"]["color_3"], 12)
+        self.assertEqual(first["color_sequences"]["color_0"], first["color_sequences"]["color_1"])
+        # The head frame advances every sample, but a palm frame that did not
+        # update keeps its sequence, so the writer reuses the file it already has
+        # instead of encoding a third identical copy.
+        second = self.sample()
+        self.assertEqual(second["color_sequences"]["color_2"], 11)
+        self.assertEqual(second["color_sequences"]["color_3"], 12)
+        self.assertNotEqual(second["color_sequences"]["color_0"],
+                            first["color_sequences"]["color_0"])
+        self.assertEqual(self.sample(left=palm_at(40, 13, 5))["color_sequences"]["color_2"], 13)
+
+    def test_an_absent_palm_frame_carries_no_sequence(self):
+        # A null colour key is never written, so it must not claim a sequence.
+        capture = R1Capture(self.arm, self.hand, self.loop, 0.25, (16, 32),
+                            wrist_image_shapes={"left": (8, 16), "right": (8, 16)},
+                            wrist_timeout=0.02)
+        head = SimpleNamespace(bgr=self.image.bgr, sequence=100,
+                               received_monotonic_ns=time.monotonic_ns())
+        frames = {"left": palm_at(40, 11, 0), "right": palm_at(90, 12, 0)}
+        capture.frame(self.xr, head, "following", frames)
+        time.sleep(0.05)
+        stale = capture.frame(self.xr, head, "following", frames)
+        self.assertIsNone(stale["colors"]["color_3"])
+        self.assertNotIn("color_3", stale["color_sequences"])
 
     def test_swapping_the_palm_frames_does_not_swap_the_colour_keys(self):
         frame = self.sample(left=self.right, right=self.left)

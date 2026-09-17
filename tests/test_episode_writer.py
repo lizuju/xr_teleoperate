@@ -133,6 +133,103 @@ class EpisodeWriterTest(unittest.TestCase):
         self.assertEqual(sorted(path.name for path in (self.directory / "episode_0000" / "colors").iterdir()),
                          ["000000_color_0.jpg", "000000_color_1.jpg"])
 
+    def colour_files(self, index=0):
+        return sorted(path.name for path in (self.directory / f"episode_{index:04d}" / "colors").iterdir())
+
+    def test_a_repeated_camera_sequence_is_stored_once_and_referenced_again(self):
+        # The 40 Hz sample loop sees a fresh head frame about a quarter of the
+        # time; writing the same JPEG again each tick measured 62% of an episode.
+        writer = self.make_writer(image_size=(16, 16))
+        pixels = np.full((16, 16, 3), 70, dtype=np.uint8)
+        writer.create_episode()
+        for index in range(4):
+            writer.add_item({"color_0": pixels, "color_1": pixels},
+                            sample={"timestamp_ns": index * 25_000_000},
+                            color_sequences={"color_0": 11, "color_1": 11})
+        writer.save_episode(outcome="success")
+        self.wait_until(writer.is_ready)
+        rows = self.frames()
+        self.assertEqual(self.colour_files(), ["000000_color_0.jpg", "000000_color_1.jpg"])
+        for row in rows:
+            self.assertEqual(row["colors"]["color_0"], "colors/000000_color_0.jpg")
+            self.assertEqual(row["colors"]["color_1"], "colors/000000_color_1.jpg")
+        info = self.manifest()["info"]
+        self.assertEqual(info["image_storage"]["written_images"], 2)
+        self.assertEqual(info["image_storage"]["reused_images"], 6)
+
+    def test_a_new_camera_sequence_writes_a_new_file(self):
+        writer = self.make_writer(image_size=(16, 16))
+        writer.create_episode()
+        for index, sequence in enumerate((11, 11, 12)):
+            writer.add_item({"color_0": np.full((16, 16, 3), sequence, dtype=np.uint8)},
+                            sample={"timestamp_ns": index * 25_000_000},
+                            color_sequences={"color_0": sequence})
+        writer.save_episode(outcome="success")
+        self.wait_until(writer.is_ready)
+        self.assertEqual(self.colour_files(), ["000000_color_0.jpg", "000002_color_0.jpg"])
+        rows = self.frames()
+        self.assertEqual(rows[1]["colors"]["color_0"], rows[0]["colors"]["color_0"])
+        self.assertNotEqual(rows[2]["colors"]["color_0"], rows[0]["colors"]["color_0"])
+
+    def test_colours_without_a_sequence_are_always_written(self):
+        # A caller that predates color_sequences must keep the old behaviour
+        # rather than have unrelated frames collapse onto one file.
+        writer = self.make_writer(image_size=(16, 16))
+        pixels = np.full((16, 16, 3), 70, dtype=np.uint8)
+        writer.create_episode()
+        for index in range(3):
+            writer.add_item({"color_0": pixels}, sample={"timestamp_ns": index * 25_000_000})
+        writer.save_episode(outcome="success")
+        self.wait_until(writer.is_ready)
+        self.assertEqual(len(self.colour_files()), 3)
+
+    def test_the_reuse_cache_does_not_leak_into_the_next_episode(self):
+        pixels = np.full((16, 16, 3), 70, dtype=np.uint8)
+        writer = self.make_writer(image_size=(16, 16))
+        for index in range(2):
+            writer.create_episode()
+            writer.add_item({"color_0": pixels}, sample={"timestamp_ns": index * 25_000_000},
+                            color_sequences={"color_0": 11})
+            writer.save_episode(outcome="success")
+            self.wait_until(writer.is_ready)
+        # Episode 1 reuses sequence 11, but that file belongs to episode 0, so it
+        # has to be written again under its own directory.
+        self.assertEqual(self.colour_files(0), ["000000_color_0.jpg"])
+        self.assertEqual(self.colour_files(1), ["000000_color_0.jpg"])
+        self.assertTrue((self.directory / "episode_0001" / "colors" / "000000_color_0.jpg").is_file())
+
+    def test_manifest_reports_the_measured_rate_and_keeps_the_declared_one(self):
+        writer = self.make_writer(
+            image_size=(16, 16), frequency=40,
+            metadata={"images": {"color_0": {"fps": 30, "width": 16, "height": 16}}},
+        )
+        pixels = np.full((16, 16, 3), 30, dtype=np.uint8)
+        writer.create_episode()
+        # Three samples over two seconds holding one camera frame.
+        for timestamp in (0, 1_000_000_000, 2_000_000_000):
+            writer.add_item({"color_0": pixels}, sample={"timestamp_ns": timestamp},
+                            color_sequences={"color_0": 5})
+        writer.save_episode(outcome="success")
+        self.wait_until(writer.is_ready)
+        info = self.manifest()["info"]
+        self.assertAlmostEqual(info["image"]["fps"], 0.5)
+        self.assertEqual(info["image"]["declared_fps"], 40)
+        self.assertAlmostEqual(info["images"]["color_0"]["fps"], 0.5)
+        self.assertEqual(info["images"]["color_0"]["declared_fps"], 30)
+        self.assertEqual(info["images"]["color_0"]["unique_frames"], 1)
+        self.assertEqual(info["images"]["color_0"]["frames"], 3)
+
+    def test_a_single_sample_episode_leaves_the_declared_rate_alone(self):
+        # No elapsed time means no measurable rate; guessing one would be worse
+        # than repeating what the camera config asked for.
+        writer = self.make_writer(image_size=(16, 16), frequency=40)
+        writer.create_episode()
+        writer.add_item({"color_0": np.zeros((16, 16, 3), dtype=np.uint8)},
+                        sample={"timestamp_ns": 7})
+        writer.save_episode(outcome="success")
+        self.wait_until(writer.is_ready)
+        self.assertEqual(self.manifest()["info"]["image"]["fps"], 40)
+
     def test_create_and_save_do_not_wait_for_filesystem(self):
         writer = self.make_writer()
         entered, release = self.hold_worker_start(writer)

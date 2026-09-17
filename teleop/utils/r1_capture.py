@@ -274,6 +274,11 @@ class R1Capture:
         }
         half = self.image_shape[1] // 2
         colors = {"color_0": image.bgr[:, :half], "color_1": image.bgr[:, half:]}
+        # The writer stores a colour key once per source frame and references it
+        # again on every later sample that reuses it. The 40 Hz loop sees a fresh
+        # head frame about a quarter of the time, so without this the same JPEG is
+        # encoded and written four times over.
+        color_sequences = {"color_0": int(image.sequence), "color_1": int(image.sequence)}
         # Pair every stream around the head frame in hand instead of taking
         # whatever each palm camera happened to deliver most recently, which
         # measured a median 31.6 ms apart and 12.8% of samples over 50 ms.
@@ -308,10 +313,13 @@ class R1Capture:
                     sample["offset_ms"] = float(pairing.offsets_ms[name])
             sources[f"{side}_wrist_image"] = sample
             colors[WRIST_COLOR_KEYS[side]] = pixels
+            if pixels is not None:
+                color_sequences[WRIST_COLOR_KEYS[side]] = int(wrist.sequence)
         if pairing is not None:
             image_source["offset_ms"] = float(pairing.offsets_ms.get("head", 0.0))
         return {
             "colors": colors,
+            "color_sequences": color_sequences,
             "states": states,
             "actions": actions,
             "sample": {

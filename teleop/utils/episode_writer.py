@@ -58,6 +58,13 @@ class EpisodeWriter:
         self.episode_dir = None
         self._frames = None
         self._frame_count = 0
+        #: (field, colour key, source sequence) -> the relative path already written,
+        #: plus the counters the final manifest reports the measured rates from.
+        self._image_paths = {}
+        self._written_images = {}
+        self._reused_images = 0
+        self._first_timestamp_ns = None
+        self._last_timestamp_ns = None
         self.worker_thread = Thread(target=self.process_queue, name="episode-writer", daemon=True)
         self.worker_thread.start()
 
@@ -84,7 +91,15 @@ class EpisodeWriter:
         return True
 
     def add_item(self, colors, depths=None, states=None, actions=None, tactiles=None,
-                 audios=None, sim_state=None, sample=None):
+                 audios=None, sim_state=None, sample=None, color_sequences=None):
+        """Queue one sample.
+
+        ``color_sequences`` maps a colour key to the source frame's sequence number.
+        A key whose sequence was already written in this episode is stored once and
+        referenced again, which is what keeps a 40 Hz sample loop over a 10 Hz camera
+        from writing the same JPEG four times. Keys without a sequence are always
+        written.
+        """
         self.raise_if_failed()
         with self._lock:
             if self._closed or self._state != "recording":
@@ -104,6 +119,7 @@ class EpisodeWriter:
                     "audios": audios,
                     "sim_state": sim_state,
                     "sample": sample,
+                    "color_sequences": color_sequences,
                 })
                 self.item_data_queue.put_nowait(item)
         self.raise_if_failed()
@@ -132,6 +148,11 @@ class EpisodeWriter:
         episode_dir.mkdir()
         self.episode_dir = episode_dir
         self._frame_count = 0
+        self._image_paths = {}
+        self._written_images = {}
+        self._reused_images = 0
+        self._first_timestamp_ns = None
+        self._last_timestamp_ns = None
         for name in ("colors", "depths", "audios"):
             if name == "depths" and self.info.get("depth") is None:
                 continue
@@ -169,6 +190,13 @@ class EpisodeWriter:
 
     def _process_item_data(self, item):
         idx = item["idx"]
+        sequences = item.pop("color_sequences", None) or {}
+        sample = item.get("sample") or {}
+        timestamp = sample.get("timestamp_ns")
+        if isinstance(timestamp, int) and not isinstance(timestamp, bool):
+            if self._first_timestamp_ns is None:
+                self._first_timestamp_ns = timestamp
+            self._last_timestamp_ns = timestamp
         for field in ("colors", "depths"):
             for key, image in (item[field] or {}).items():
                 # A modality key may be present with a null payload: the camera
@@ -177,6 +205,18 @@ class EpisodeWriter:
                 # the matching sample.sources entry stays checkable.
                 if image is None:
                     continue
+                sequence = sequences.get(key) if field == "colors" else None
+                if sequence is not None:
+                    previous = self._image_paths.get((field, key, int(sequence)))
+                    if previous is not None:
+                        # Same camera frame as an earlier sample, so it is already
+                        # byte for byte on disk. Point at it instead of encoding and
+                        # writing a second copy; sample.sources still carries the
+                        # sequence and the repeated flag for consumers that need to
+                        # tell a reused frame from a fresh one.
+                        item[field][key] = previous
+                        self._reused_images += 1
+                        continue
                 suffix = ".jpg" if field == "colors" else ".png"
                 relative = Path(field) / f"{idx:06d}_{key}{suffix}"
                 # `depths/` only exists when the manifest declares depth, so a
@@ -185,6 +225,9 @@ class EpisodeWriter:
                 if not cv2.imwrite(str(self.episode_dir / relative), image):
                     raise OSError(f"Failed to save {relative}")
                 item[field][key] = str(relative)
+                self._written_images[key] = self._written_images.get(key, 0) + 1
+                if sequence is not None:
+                    self._image_paths[(field, key, int(sequence))] = str(relative)
         for key, audio in (item["audios"] or {}).items():
             relative = Path("audios") / f"audio_{idx:06d}_{key}.npy"
             np.save(self.episode_dir / relative, audio.astype(np.int16))
@@ -196,12 +239,61 @@ class EpisodeWriter:
         if self.rerun_logger is not None:
             self.rerun_logger.log_item_data(item)
 
+    def _record_measured_image_rates(self):
+        """Replace the declared frame rates with the ones the episode holds.
+
+        The camera config states what the publisher is asked for, not what the
+        device delivers: the head stereo stream runs near 10 Hz against a
+        configured 30, and a 40 Hz sample loop reuses each of those frames about
+        four times. A manifest that repeats the configured number makes every
+        downstream timeline wrong, so the rate is measured from the images that
+        were actually written, and the configured value is kept beside it.
+        """
+        if self._first_timestamp_ns is None or self._last_timestamp_ns is None:
+            return
+        duration_s = (self._last_timestamp_ns - self._first_timestamp_ns) / 1e9
+        if duration_s <= 0.0 or not self._written_images:
+            return
+        images = self.info.get("images")
+        if not isinstance(images, dict):
+            images = {}
+        for key, written in self._written_images.items():
+            spec = images.get(key)
+            if not isinstance(spec, dict):
+                continue
+            spec.setdefault("declared_fps", spec.get("fps"))
+            spec["fps"] = written / duration_s
+            spec["unique_frames"] = written
+            spec["frames"] = self._frame_count
+        head = images.get("color_0")
+        if not isinstance(head, dict):
+            head = None
+        if isinstance(self.info.get("image"), dict):
+            if head is not None:
+                self.info["image"]["declared_fps"] = self.info["image"].get("fps")
+                self.info["image"]["fps"] = head["fps"]
+            elif "color_0" in self._written_images:
+                # A caller that supplies no per-key roster still gets an honest
+                # `image.fps`; only the declared value beside it is missing.
+                self.info["image"]["declared_fps"] = self.info["image"].get("fps")
+                self.info["image"]["fps"] = self._written_images["color_0"] / duration_s
+        self.info["image_storage"] = {
+            "duration_s": duration_s,
+            "written_images": sum(self._written_images.values()),
+            "reused_images": self._reused_images,
+            "note": ("a colour key whose camera frame is unchanged from an earlier "
+                     "sample is stored once and referenced again, so the files under "
+                     "colors/ are fewer than the frame count; sample.sources carries "
+                     "each key's sequence and repeated flag"),
+        }
+
     def _finish_episode(self):
         self._frames.flush()
         os.fsync(self._frames.fileno())
         self._frames.close()
         self._frames = None
         self.raise_if_failed()
+        self._record_measured_image_rates()
         self._write_manifest("complete")
         with self._lock:
             if self._error is not None:
