@@ -18,6 +18,14 @@
 #                       要退回“削命令”的保守方案：ARM_DQ_FEEDFORWARD=off ARM_VELOCITY_LIMIT=3.0
 #   ARM_DQ_LIMIT        前馈速度上限，默认 6.0 rad/s（安全网，不是跟踪上限）
 #   ARM_VELOCITY_LIMIT  位置目标的安全限速，默认 30.0 rad/s（约等于不限）
+#   WRIST_DISPLAY       头显上要不要显示左右腕部相机小窗，默认 **off**（不显示）。
+#                       为什么默认关：两路面板每 30 Hz 无条件重新编码重发，而画面内容只有约 12 Hz
+#                       是新的，实测单块 base64 60.7 KB、两块合计约 3.5 MB/s，全压在同一条 Wi-Fi 上，
+#                       和手部跟踪的上行抢信道；Vuer 子进程也因此常年吃满一个核。
+#                       实测同一天：链路空闲时手部数据年龄 p50 24 ms（不卡），链路忙时 p50 106 ms、
+#                       7% 的帧超时导致手臂冻结（卡）。关掉面板省下这部分下行，给上行让路。
+#                       取值 off(默认) / auto(相机在就显示) / both / left / right。
+#                       不影响录制：腕部画面照样进 episode 的 color_2 / color_3。
 #   WAIST_FOLLOW_THRESHOLD_DEG  腰跟随的触发门槛，默认 20 度。
 #                       注意比的不是头的绝对偏航角，而是「残差」= 你累计转了多少头 − 腰已经跟了多少。
 #                       残差超过这个值并保持 0.2 s 才开始跟；跟到残差落到 5 度以下就停（迟滞带）。
@@ -88,6 +96,7 @@ exec "$python" -u teleop_hand_and_arm.py \
   --waist-follow-speed-deg "${WAIST_FOLLOW_SPEED_DEG:-40}" \
   --waist-follow-accel-deg "${WAIST_FOLLOW_ACCEL_DEG:-90}" \
   --waist-follow-compensation "${WAIST_FOLLOW_COMPENSATION:-torso}" \
+  --wrist-display "${WRIST_DISPLAY:-off}" \
   --arm-translation-scale "${ARM_TRANSLATION_SCALE:-0.87}" \
   --arm-limit-softness "${ARM_LIMIT_SOFTNESS:-0.1}" \
   --arm-posture-weight "${ARM_POSTURE_WEIGHT:-0.02}" \

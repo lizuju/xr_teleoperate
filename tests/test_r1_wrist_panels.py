@@ -178,6 +178,19 @@ class WristPanelWiringTest(unittest.TestCase):
     def test_panels_are_disabled_in_pass_through_and_by_flag(self):
         self.assertIn("if args.display_mode != 'pass-through' and args.wrist_display != 'off':", self.source)
 
+    def test_the_launch_scripts_leave_the_panels_off(self):
+        """Off by default in both wrappers.
+
+        The two panels are re-encoded and re-sent at 30 Hz while their content
+        changes at about 12 Hz, measured at roughly 3.5 MB/s of base64 on the
+        same Wi-Fi link the hand-tracking uplink uses. Recording is unaffected:
+        grab_wrist_frames still fetches the palm frames whenever --record is set,
+        so color_2/color_3 keep landing in the episode.
+        """
+        for name in ("run_r1_a7_vector.sh", "run_r1_a7_capture.sh"):
+            script = (MAIN_PATH.parent / name).read_text(encoding="utf-8")
+            self.assertIn('--wrist-display "${WRIST_DISPLAY:-off}"', script, name)
+
     def test_frames_are_pushed_every_iteration_not_only_while_recording(self):
         self.assertIn("def grab_wrist_frames():", self.source)
         self.assertIn("(args.record or 'left' in wrist_panels):", self.source)
