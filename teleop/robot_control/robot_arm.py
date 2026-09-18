@@ -2061,6 +2061,10 @@ class R1_A7_ArmController:
     default_dq_feedforward_filter = 0.5
     dq_feedforward_timeout = 0.10
     dq_feedforward_decay = 0.85
+    # Match R1HeadWaistFollower.DEFAULT_MAX_VELOCITY (40 deg/s). 0.35 rad/s
+    # (~20 deg/s) was left here when the follower ceiling was raised on 2026-09-17,
+    # so the 250 Hz publisher still halved the intended waist slew.
+    default_waist_velocity_limit = np.deg2rad(40.0)
 
     def __init__(self, motion_mode = False, simulation_mode = False, deferred_activation = False,
                  arm_velocity_limit = None, dq_feedforward = None,
@@ -2075,7 +2079,7 @@ class R1_A7_ArmController:
         self.waist_target_updated_at = None
         self.waist_target_sequence = 0
         self.waist_yaw_limit = 2.618
-        self.waist_velocity_limit = 0.35
+        self.waist_velocity_limit = self.default_waist_velocity_limit
         self.waist_tracking_error_limit = np.deg2rad(5.0)
         self.waist_target_timeout = 0.25
         self.waist_hold_requested = False

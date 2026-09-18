@@ -196,6 +196,12 @@ class R1A7FeedbackShutdownTest(unittest.TestCase):
         self.assertEqual(self.controller_class.default_arm_velocity_limit, 30.0)
         self.assertTrue(self.controller_class.default_dq_feedforward)
 
+    def test_wrappers_enable_velocity_feedforward_by_default(self):
+        root = MAIN_PATH.parents[1]
+        for name in ("run_r1_a7_vector.sh", "run_r1_a7_capture.sh"):
+            script = (root / "teleop" / name).read_text(encoding="utf-8")
+            self.assertIn('--arm-dq-feedforward "${ARM_DQ_FEEDFORWARD:-on}"', script)
+
     def test_main_program_exposes_and_forwards_the_limit_and_feedforward(self):
         source = MAIN_PATH.read_text(encoding="utf-8")
         for flag in ("'--arm-velocity-limit'", "'--arm-dq-feedforward'", "'--arm-dq-limit'", "'--arm-dq-filter'"):

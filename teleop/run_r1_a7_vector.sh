@@ -12,9 +12,11 @@
 #                       R1_A7 肩到腕约 0.65 m，成人手臂约 0.75 m → 65/75 = 0.87。旋转从不缩放。
 #                       1.0 会让手臂去够比操作者远 15% 的位置，腕部更容易顶到工作空间边界；
 #                       0.7 少走 19%，手要划得比机器人动得还多，手感发涩。
-#   ARM_DQ_FEEDFORWARD  默认 off —— 与 2026-09-14 的生产行为一致：dq 恒为 0，纯位置控制。
-#                       设 on 则把目标速度作为速度前馈下发给电机（原来 dq 恒为 0，
-#                       纯位置控制，所以手臂追不上快速的手部动作，表现为一卡一卡）。
+#   ARM_DQ_FEEDFORWARD  默认 on —— 把目标速度写入电机 dq，让手臂跟着走而不是纯位置追。
+#                       Python / 控制器默认本来就是 on。脚本曾为对齐 09-14 写成 off，
+#                       同时位置限速已从 3.0 撤回到 30（约等于不限），于是既没有削尖峰
+#                       也没有前馈。09-15 实测 dq=0 时跟随比 p50 只有 0.22–0.69。
+#                       关掉：ARM_DQ_FEEDFORWARD=off
 #                       要退回“削命令”的保守方案：ARM_DQ_FEEDFORWARD=off ARM_VELOCITY_LIMIT=3.0
 #   ARM_DQ_LIMIT        前馈速度上限，默认 6.0 rad/s（安全网，不是跟踪上限）
 #   ARM_VELOCITY_LIMIT  位置目标的安全限速，默认 30.0 rad/s（约等于不限）
@@ -48,7 +50,7 @@
 #                       标定结果会写进每个 episode 的 info.camera_calibration，供后面数采/训练使用。
 #
 # 例：
-#   ./teleop/run_r1_a7_vector.sh                        # 日常遥操（限速 3.0 已生效）
+#   ./teleop/run_r1_a7_vector.sh                        # 日常遥操（dq 前馈 on，位置限速 30 ≈ 不限）
 #   ARM_DIAG_HZ=40 ARM_DIAG_DIR=$HOME/r1-diag ./teleop/run_r1_a7_vector.sh
 set -euo pipefail
 
@@ -101,7 +103,7 @@ exec "$python" -u teleop_hand_and_arm.py \
   --arm-limit-softness "${ARM_LIMIT_SOFTNESS:-0.1}" \
   --arm-posture-weight "${ARM_POSTURE_WEIGHT:-0.02}" \
   --arm-velocity-limit "${ARM_VELOCITY_LIMIT:-30.0}" \
-  --arm-dq-feedforward "${ARM_DQ_FEEDFORWARD:-off}" \
+  --arm-dq-feedforward "${ARM_DQ_FEEDFORWARD:-on}" \
   --arm-dq-limit "${ARM_DQ_LIMIT:-6.0}" \
   --camera-calibration "${CAMERA_CALIBRATION:-}" \
   --network-interface eno1 \

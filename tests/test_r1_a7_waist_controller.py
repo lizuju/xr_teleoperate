@@ -95,6 +95,13 @@ class R1A7WaistControllerTest(unittest.TestCase):
                 )
                 np.testing.assert_allclose(self.controller.head_q_target, [0.1, -0.2])
 
+    def test_default_publisher_waist_speed_matches_the_follower_ceiling(self):
+        namespace = load_r1_controller_namespace()
+        self.assertAlmostEqual(
+            namespace["R1_A7_ArmController"].default_waist_velocity_limit,
+            np.deg2rad(40.0),
+        )
+
     def test_initialized_angle_limit_matches_robot_mechanical_model(self):
         namespace = load_r1_controller_namespace()
         controller = namespace["R1_A7_ArmController"](deferred_activation=True)

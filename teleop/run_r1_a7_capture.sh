@@ -55,7 +55,7 @@ exec "${dev_root}/.venv-xr/bin/python" -u teleop_hand_and_arm.py \
   --arm-limit-softness "${ARM_LIMIT_SOFTNESS:-0.1}" \
   --arm-posture-weight "${ARM_POSTURE_WEIGHT:-0.02}" \
   --arm-velocity-limit "${ARM_VELOCITY_LIMIT:-30.0}" \
-  --arm-dq-feedforward "${ARM_DQ_FEEDFORWARD:-off}" \
+  --arm-dq-feedforward "${ARM_DQ_FEEDFORWARD:-on}" \
   --arm-dq-limit "${ARM_DQ_LIMIT:-6.0}" \
   --camera-calibration "${CAMERA_CALIBRATION:-}" \
   --network-interface eno1 \
