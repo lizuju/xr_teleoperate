@@ -15,7 +15,13 @@ from check_teleop_episode import SOURCE_NAMES, validate_episode
 from replay_teleop_episode import replay_episode
 
 
-class EpisodeOfflineToolsTests(unittest.TestCase):
+class EpisodeFixture(unittest.TestCase):
+    """A small valid episode plus the helpers every checker test needs.
+
+    Kept separate from the cases themselves so a second suite can reuse the
+    fixture without inheriting -- and re-running -- the first suite's tests.
+    """
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
@@ -73,6 +79,7 @@ class EpisodeOfflineToolsTests(unittest.TestCase):
                                           for side in ("left", "right")}},
             }
 
+class EpisodeOfflineToolsTests(EpisodeFixture):
     def test_valid_statistics_and_explicit_video_repetition(self):
         image = self.frames[1]["sample"]["sources"]["image"]
         image.update(sequence=0, repeated=True, age_ms=200.0,
@@ -272,6 +279,76 @@ class EpisodeOfflineToolsTests(unittest.TestCase):
         self.assertFalse(result["validation"]["valid"])
         self.assertNotIn("replay", result)
         self.assertFalse(output.exists())
+
+
+class EpisodeImageReuseTests(EpisodeFixture):
+    """A repeated camera frame is stored once and referenced again.
+
+    The writer has done that since 2026-09-17, so the offline checker has to
+    accept a colour path several samples share -- and to catch the case where
+    the repeated flag and the stored path disagree, because then a consumer
+    following either signal alone reads the wrong picture. Episodes recorded
+    before the change wrote a new file every time, so there the flag means "the
+    camera frame is unchanged" and a mismatch is only worth a warning.
+    """
+
+    def drop_frame_one_copies(self):
+        for eye in range(2):
+            (self.episode / f"colors/000001_color_{eye}.png").unlink()
+
+    def test_a_deduped_episode_accepts_a_shared_path(self):
+        self.manifest["info"]["image_storage"] = {"written_images": 4, "reused_images": 2}
+        for eye in range(2):
+            key = f"color_{eye}"
+            self.frames[1]["colors"][key] = self.frames[0]["colors"][key]
+        self.frames[1]["sample"]["sources"]["image"]["repeated"] = True
+        self.drop_frame_one_copies()
+        self.write()
+        result = validate_episode(self.episode)
+        self.assertNotIn("flagged", "\n".join(result["errors"]))
+        self.assertEqual(result["repeated_flag_mismatches"], 0)
+        self.assertEqual(result["unreferenced_image_files"], 0)
+        reuse = result["image_reuse"]["color_0"]
+        self.assertEqual((reuse["referenced"], reuse["files"], reuse["reused_references"]), (3, 2, 1))
+
+    def test_a_repeated_flag_that_names_a_new_file_is_an_error(self):
+        self.manifest["info"]["image_storage"] = {"written_images": 6, "reused_images": 0}
+        self.frames[1]["sample"]["sources"]["image"]["repeated"] = True
+        self.write()
+        result = validate_episode(self.episode)
+        self.assertIn("flagged repeated but points at a new file", "\n".join(result["errors"]))
+
+    def test_a_fresh_flag_that_reuses_a_file_is_an_error(self):
+        self.manifest["info"]["image_storage"] = {"written_images": 4, "reused_images": 2}
+        for eye in range(2):
+            key = f"color_{eye}"
+            self.frames[1]["colors"][key] = self.frames[0]["colors"][key]
+        self.drop_frame_one_copies()
+        self.write()
+        result = validate_episode(self.episode)
+        self.assertIn("flagged fresh but reuses", "\n".join(result["errors"]))
+
+    def test_an_episode_without_the_dedup_block_only_warns(self):
+        self.frames[1]["sample"]["sources"]["image"]["repeated"] = True
+        self.write()
+        result = validate_episode(self.episode)
+        self.assertNotIn("flagged", "\n".join(result["errors"]))
+        self.assertEqual(result["repeated_flag_mismatches"], 2)
+        self.assertTrue(any("predates the 2026-09-17 dedup" in text for text in result["warnings"]))
+
+    def test_a_colour_file_no_sample_references_is_reported(self):
+        self.assertTrue(cv2.imwrite(str(self.episode / "colors/999999_color_0.png"),
+                                    np.zeros((48, 64, 3), dtype=np.uint8)))
+        self.write()
+        result = validate_episode(self.episode)
+        self.assertEqual(result["unreferenced_image_files"], 1)
+        self.assertTrue(any("no sample references" in text for text in result["warnings"]))
+
+    def test_a_manifest_count_that_disagrees_with_the_files_is_reported(self):
+        self.manifest["info"]["image_storage"] = {"written_images": 99, "reused_images": 0}
+        self.write()
+        result = validate_episode(self.episode)
+        self.assertTrue(any("written_images: declared 99" in text for text in result["warnings"]))
 
 
 if __name__ == "__main__":

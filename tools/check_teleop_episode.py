@@ -60,6 +60,8 @@ def validate_episode(path):
               "command_inactive_frames": 0, "absent_image_frames": 0,
               "measured_torque_frames": 0, "calibration_status": None,
               "camera_alignment_frames": 0, "unaligned_frames": 0,
+              "image_reuse": {}, "reused_image_references": 0,
+              "repeated_flag_mismatches": 0, "unreferenced_image_files": 0,
               "sources": {}, "sampling": {}}
 
     def error(message):
@@ -224,6 +226,14 @@ def validate_episode(path):
     gap_count = gap_sum = gap_max = gap_abnormal = zero_gaps = 0
     first_ns = last_ns = None
     sources = {}
+    # Since 2026-09-17 the writer stores a camera frame once and points later
+    # samples at the same file, so a colour path is no longer unique per sample.
+    # Episodes from before that still wrote a new file every time, and their
+    # `repeated` flag means "the camera frame is unchanged", not "the file is
+    # reused" -- the manifest's image_storage block is what tells the two apart.
+    dedup_aware = isinstance((manifest.get("info") or {}).get("image_storage"), dict)
+    previous_image_paths = {}
+    image_files = {}
     with stream:
         for line_number, line in enumerate(stream, 1):
             label = f"line {line_number}"
@@ -447,6 +457,35 @@ def validate_episode(path):
                             stats["sequence_repeats"] += sequence == old_sequence
                             stats["sequence_regressions"] += sequence < old_sequence
                         previous[f"sequence:{name}"] = sequence
+            # The `repeated` flag and the stored path have to agree once the
+            # writer dedupes: a repeated camera frame must point at the file an
+            # earlier sample already wrote, and a fresh one must have its own.
+            # A mismatch means a consumer following either signal alone reads the
+            # wrong picture, which is what the 2026-09-17 change was about.
+            for key, relative in (frame.get("colors") or {}).items():
+                if not isinstance(relative, str) or not relative:
+                    continue
+                entry = image_files.setdefault(key, {"referenced": 0, "files": set(), "bytes": 0})
+                entry["referenced"] += 1
+                if relative not in entry["files"]:
+                    entry["files"].add(relative)
+                    try:
+                        entry["bytes"] += (directory / relative).stat().st_size
+                    except OSError:
+                        pass
+                name = COLOR_SOURCES.get(key)
+                source = source_data.get(name) if name else None
+                repeated = source.get("repeated") if isinstance(source, dict) else None
+                previous_path = previous_image_paths.get(key)
+                if repeated is True and previous_path != relative:
+                    report["repeated_flag_mismatches"] += 1
+                    if dedup_aware:
+                        error(f"{label}.colors.{key}: flagged repeated but points at a new file {relative}")
+                elif repeated is False and previous_path == relative:
+                    report["repeated_flag_mismatches"] += 1
+                    if dedup_aware:
+                        error(f"{label}.colors.{key}: flagged fresh but reuses {previous_path}")
+                previous_image_paths[key] = relative
             # A colour key and its source entry have to tell the same story: a
             # null image means the source was not fresh, and a written image
             # means it was. Otherwise the freshness flags cannot be used to
@@ -551,6 +590,53 @@ def validate_episode(path):
 
     if report["frames_checked"] == 0:
         error("frames.jsonl: episode has no frames")
+    # Colour files no sample references are leftovers: the writer only creates a
+    # file it is about to point at, so an orphan means a rewrite or a hand-edited
+    # directory.
+    for key, entry in sorted(image_files.items()):
+        written = len(entry["files"])
+        report["image_reuse"][key] = {
+            "referenced": entry["referenced"],
+            "files": written,
+            "reused_references": entry["referenced"] - written,
+            "megabytes": round(entry["bytes"] / 1024 / 1024, 2),
+        }
+        report["reused_image_references"] += entry["referenced"] - written
+        colours_dir = directory / "colors"
+        if not colours_dir.is_dir():
+            continue
+        # Extension-agnostic on purpose: the writer uses .jpg for colours, but a
+        # converted or hand-made episode may not.
+        on_disk = {f"colors/{path.name}" for path in colours_dir.glob(f"*_{key}.*") if path.is_file()}
+        orphaned = on_disk - entry["files"]
+        if orphaned:
+            report["unreferenced_image_files"] += len(orphaned)
+            report["warnings"].append(
+                f"colors/: {len(orphaned)} {key} file(s) that no sample references, "
+                f"e.g. {sorted(orphaned)[0]}"
+            )
+    if report["reused_image_references"]:
+        report["warnings"].append(
+            f"{report['reused_image_references']} colour references reuse a file an earlier sample "
+            "wrote, because a repeated camera frame is stored once; that is expected and is not a "
+            "dropped frame. Filter on sample.sources.<name>.repeated to find the fresh ones."
+        )
+    if report["repeated_flag_mismatches"] and not dedup_aware:
+        report["warnings"].append(
+            f"{report['repeated_flag_mismatches']} samples carry a repeated flag that does not match "
+            "the stored path. This episode predates the 2026-09-17 dedup, when every sample wrote its "
+            "own copy of an unchanged frame, so there the flag means 'the camera frame is unchanged' "
+            "and the path is unique per sample. Do not treat the path as frame identity."
+        )
+    storage = (manifest.get("info") or {}).get("image_storage")
+    if isinstance(storage, dict):
+        declared = storage.get("written_images")
+        measured = sum(len(entry["files"]) for entry in image_files.values())
+        if type(declared) is int and declared != measured:
+            report["warnings"].append(
+                f"info.image_storage.written_images: declared {declared}, but {measured} distinct files "
+                "are referenced"
+            )
     if manifest.get("status") != "recording" and count != report["frames_checked"]:
         error(f"manifest.frame_count: declared {count}, found {report['frames_checked']} lines")
     if manifest.get("status") == "recording" and count != report["frames_checked"]:
