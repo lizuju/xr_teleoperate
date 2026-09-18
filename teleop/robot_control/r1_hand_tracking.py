@@ -1,13 +1,29 @@
 import math
 
 
-def hand_tracking_freshness(tele_data, timeout, now):
+def _hand_timestamps(tele_data):
+    return (tele_data.left_hand_timestamp, tele_data.right_hand_timestamp)
+
+
+def hand_tracking_present(tele_data):
+    """True while this hand still has a last sample.
+
+    Vision Pro zeroes the timestamp in the same HAND_MOVE that drops a hand.
+    A Wi-Fi hole sends nothing, so the last timestamp stays put and only ages.
+    Hold on the zeroed timestamp, not on age.
+    """
     return tuple(
         bool(tele_data.motion_data_ready)
         and math.isfinite(timestamp)
         and timestamp > 0.0
-        and 0.0 <= now - timestamp <= timeout
-        for timestamp in (tele_data.left_hand_timestamp, tele_data.right_hand_timestamp)
+        for timestamp in _hand_timestamps(tele_data)
+    )
+
+
+def hand_tracking_freshness(tele_data, timeout, now):
+    return tuple(
+        present and 0.0 <= now - timestamp <= timeout
+        for present, timestamp in zip(hand_tracking_present(tele_data), _hand_timestamps(tele_data))
     )
 
 

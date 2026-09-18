@@ -2,6 +2,7 @@ import ast
 from contextlib import redirect_stdout
 from enum import IntEnum
 import io
+import math
 from pathlib import Path
 import queue
 import threading
@@ -74,9 +75,17 @@ def load_controller():
         "ChannelPublisher": Mock(side_effect=AssertionError("No real command initialization allowed")),
         "hg_LowState": object, "R1_A7_Num_Motors": 35, "kTopicLowState": "rt/lowstate",
         "wait_for_dds": wait_for,
+        "ArmTargetShaper": _load_arm_target_shaper(),
     }
     exec(compile(ast.Module(body=classes, type_ignores=[]), str(ARM_PATH), "exec"), namespace)
     return namespace["R1_A7_ArmController"], namespace
+
+
+def _load_arm_target_shaper():
+    path = ARM_PATH.parent / "arm_target_shaper.py"
+    namespace = {"np": np, "math": math, "time": time}
+    exec(compile(path.read_text(encoding="utf-8"), str(path), "exec"), namespace)
+    return namespace["ArmTargetShaper"]
 
 
 class R1A7FeedbackShutdownTest(unittest.TestCase):
@@ -195,19 +204,26 @@ class R1A7FeedbackShutdownTest(unittest.TestCase):
         # Mode B (dq feed-forward) keeps the command; the position cap is only a net.
         self.assertEqual(self.controller_class.default_arm_velocity_limit, 30.0)
         self.assertTrue(self.controller_class.default_dq_feedforward)
+        self.assertEqual(self.controller_class.default_target_velocity_limit, 6.0)
+        self.assertEqual(self.controller_class.default_target_accel_limit, 40.0)
 
     def test_wrappers_enable_velocity_feedforward_by_default(self):
         root = MAIN_PATH.parents[1]
         for name in ("run_r1_a7_vector.sh", "run_r1_a7_capture.sh"):
             script = (root / "teleop" / name).read_text(encoding="utf-8")
             self.assertIn('--arm-dq-feedforward "${ARM_DQ_FEEDFORWARD:-on}"', script)
+            self.assertIn('--arm-target-velocity-limit "${ARM_TARGET_VELOCITY_LIMIT:-6.0}"', script)
+            self.assertIn('--arm-target-accel-limit "${ARM_TARGET_ACCEL_LIMIT:-40.0}"', script)
 
     def test_main_program_exposes_and_forwards_the_limit_and_feedforward(self):
         source = MAIN_PATH.read_text(encoding="utf-8")
-        for flag in ("'--arm-velocity-limit'", "'--arm-dq-feedforward'", "'--arm-dq-limit'", "'--arm-dq-filter'"):
+        for flag in ("'--arm-velocity-limit'", "'--arm-dq-feedforward'", "'--arm-dq-limit'",
+                     "'--arm-dq-filter'", "'--arm-target-velocity-limit'", "'--arm-target-accel-limit'"):
             self.assertIn(flag, source)
         self.assertEqual(source.count("arm_velocity_limit=args.arm_velocity_limit"), 2)
         self.assertEqual(source.count("dq_feedforward=args.arm_dq_feedforward == 'on'"), 2)
+        self.assertEqual(source.count("target_velocity_limit=args.arm_target_velocity_limit"), 2)
+        self.assertEqual(source.count("target_accel_limit=args.arm_target_accel_limit"), 2)
 
     def test_late_callback_after_stop_is_ignored(self):
         controller = self.controller_class(deferred_activation=True)

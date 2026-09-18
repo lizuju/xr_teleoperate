@@ -12,7 +12,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from teleop.robot_control.r1_hand_tracking import R1WristHold, hand_tracking_freshness
+from teleop.robot_control.r1_hand_tracking import R1WristHold, hand_tracking_freshness, hand_tracking_present
 
 MAIN = Path(__file__).resolve().parents[1] / "teleop/teleop_hand_and_arm.py"
 
@@ -42,13 +42,13 @@ class SideIndependenceTest(unittest.TestCase):
         end = next(i for i, n in enumerate(loop.body) if "write_json_line" in ast.unparse(n))
         control_nodes = loop.body[start:end + 1]
 
-        # Right side frozen at t=99.0; left side fresh at t=1.0
+        # Right side lost (timestamp zeroed); left side still present.
         sample = SimpleNamespace(
             head_pose=pose(0.0, [0, 0, 1]),
             left_wrist_pose=pose(0.0, [0.40, 0.20, 0.80]),
             right_wrist_pose=pose(0.0, [0.35, -0.22, 0.78]),
             motion_data_ready=True, motion_data_timestamp=99.0,
-            left_hand_timestamp=1.0, right_hand_timestamp=99.0,
+            left_hand_timestamp=1.0, right_hand_timestamp=0.0,
         )
         controller = Mock()
         controller.get_current_waist_yaw.return_value = 0.0
@@ -88,10 +88,12 @@ class SideIndependenceTest(unittest.TestCase):
             "wrist_holds": (R1WristHold(pose(0.0, [0.4, 0.2, 0.8])),
                             R1WristHold(pose(0.0, [0.35, -0.22, 0.78]))),
             "hand_tracking_freshness": hand_tracking_freshness,
+            "hand_tracking_present": hand_tracking_present,
             "held_head_q_target": np.array([0.1, 0.2]),
             "last_fresh_tele_data": sample, "tracking_hold_active": False,
             "tv_wrapper": Mock(get_tele_data=Mock(return_value=sample)),
             "is_fresh_motion_data": Mock(return_value=True),
+            "is_present_motion_data": Mock(return_value=True),
             "logger_mp": Mock(), "arm_ctrl": controller, "arm_ik": ik,
             "waist_follower": follower, "linker_o6_loop": None,
             "run_motion": True, "capture_mode": "following",
@@ -104,7 +106,7 @@ class SideIndependenceTest(unittest.TestCase):
             "xr_motion_data_ready": SimpleNamespace(get_lock=nullcontext, value=False),
             "time": SimpleNamespace(time=lambda: 1.0, monotonic=lambda: 1.0, sleep=Mock(),
                                     time_ns=lambda: 1, monotonic_ns=lambda: 1),
-            "waist_diagnostic_next_time": 2.0, "arm_diagnostic_file": None,
+            "waist_diagnostic_next_time": 2.0, "power_diagnostic_next_time": 2.0, "arm_diagnostic_file": None,
             "arm_diagnostic_next_time": 0.0, "arm_diagnostic_sequence": 0,
             "loop_period_ms": 33.0, "write_json_line": Mock(),
             "rotation_error_rad": lambda a, b: 0.0,

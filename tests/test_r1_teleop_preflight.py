@@ -6,6 +6,7 @@ from tools.check_r1_teleop import (
     StreamWindow,
     jpeg_decoder,
     jpeg_is_complete,
+    stream_check_failure,
     unwrap_camera_config,
     validate_camera_config,
     validate_state,
@@ -172,6 +173,31 @@ class WristCameraConfigTest(unittest.TestCase):
                   "left_wrist_camera": wrist_camera(webrtc=False, webrtc_port=61002)}
         validate_camera_config(config)
         self.assertEqual(wrist_topics(config), [("left_wrist_camera", 55556, 60002)])
+
+    def test_wrist_zmq_without_webrtc_is_the_recording_path(self):
+        # Data collection reads 55556/55557. Wrist WebRTC 60002/60003 is unused
+        # by the headset and can be off on PC2 without dropping color_2/color_3.
+        config = {
+            "head_camera": HEAD_CAMERA,
+            "left_wrist_camera": wrist_camera(webrtc=False),
+            "right_wrist_camera": wrist_camera(zmq_port=55557, webrtc_port=60003, webrtc=False),
+        }
+        validate_camera_config(config)
+        self.assertEqual(
+            wrist_topics(config),
+            [("left_wrist_camera", 55556, 60002), ("right_wrist_camera", 55557, 60003)],
+        )
+
+
+class StreamCheckFailureTest(unittest.TestCase):
+    def test_empty_problems_is_a_timeout_not_a_name_error(self):
+        message = stream_check_failure({})
+        self.assertIn("timed out after 8s", message)
+        self.assertNotIn("NameError", message)
+
+    def test_named_problems_are_listed(self):
+        message = stream_check_failure({"stereo JPEG": "stale samples (0.9s old)"})
+        self.assertIn("stereo JPEG: stale samples (0.9s old)", message)
 
 if __name__ == "__main__":
     unittest.main()

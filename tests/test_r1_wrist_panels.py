@@ -185,7 +185,8 @@ class WristPanelWiringTest(unittest.TestCase):
         changes at about 12 Hz, measured at roughly 3.5 MB/s of base64 on the
         same Wi-Fi link the hand-tracking uplink uses. Recording is unaffected:
         grab_wrist_frames still fetches the palm frames whenever --record is set,
-        so color_2/color_3 keep landing in the episode.
+        so color_2/color_3 keep landing in the episode. Wrist WebRTC is not on
+        this path: recording reads enable_zmq / 55556 / 55557.
         """
         for name in ("run_r1_a7_vector.sh", "run_r1_a7_capture.sh"):
             script = (MAIN_PATH.parent / name).read_text(encoding="utf-8")
@@ -197,6 +198,11 @@ class WristPanelWiringTest(unittest.TestCase):
         self.assertIn("(args.record or 'right' in wrist_panels):", self.source)
         self.assertIn("tv_wrapper.render_wrist_to_xr('left', left_frame.bgr)", self.source)
         self.assertIn("tv_wrapper.render_wrist_to_xr('right', right_frame.bgr)", self.source)
+        grab_start = self.source.index("def grab_wrist_frames():")
+        grab_end = self.source.index("return left_frame, right_frame", grab_start)
+        grab = self.source[grab_start:grab_end]
+        self.assertIn("enable_zmq", grab)
+        self.assertNotIn("enable_webrtc", grab)
 
     def test_panels_are_fed_before_the_operator_arms_the_robot(self):
         """The pre-start waiting loop must publish frames too.

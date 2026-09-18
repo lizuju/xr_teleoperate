@@ -15,6 +15,7 @@ import logging_mp
 logger_mp = logging_mp.getLogger(__name__)
 
 from teleop.robot_control.dds_utils import wait_for_dds
+from teleop.robot_control.arm_target_shaper import ArmTargetShaper
 
 kTopicLowCommand_Debug  = "rt/lowcmd"
 kTopicLowCommand_Motion = "rt/arm_sdk"
@@ -2061,6 +2062,12 @@ class R1_A7_ArmController:
     default_dq_feedforward_filter = 0.5
     dq_feedforward_timeout = 0.10
     dq_feedforward_decay = 0.85
+    # Shape the IK target before dq is derived from it. 6 rad/s matches the
+    # feed-forward clamp and the ~5 rad/s the arm delivered with feed-forward on
+    # 2026-09-16; 40 rad/s^2 is the jerk limit that keeps a Vision Pro burst from
+    # becoming a step the servo then chases. 0 velocity disables the shaper.
+    default_target_velocity_limit = 6.0
+    default_target_accel_limit = 40.0
     # Match R1HeadWaistFollower.DEFAULT_MAX_VELOCITY (40 deg/s). 0.35 rad/s
     # (~20 deg/s) was left here when the follower ceiling was raised on 2026-09-17,
     # so the 250 Hz publisher still halved the intended waist slew.
@@ -2068,7 +2075,8 @@ class R1_A7_ArmController:
 
     def __init__(self, motion_mode = False, simulation_mode = False, deferred_activation = False,
                  arm_velocity_limit = None, dq_feedforward = None,
-                 dq_feedforward_limit = None, dq_feedforward_filter = None):
+                 dq_feedforward_limit = None, dq_feedforward_filter = None,
+                 target_velocity_limit = None, target_accel_limit = None):
         logger_mp.info("Initialize R1_A7_ArmController...")
         if motion_mode:
             raise ValueError("R1_A7_ArmController does not support motion mode.")
@@ -2125,6 +2133,18 @@ class R1_A7_ArmController:
         self._dq_feedforward_previous = None
         self._dq_feedforward_previous_at = None
         self._dq_feedforward_updated_at = None
+        self.target_shaper = ArmTargetShaper(
+            velocity_limit=(
+                self.default_target_velocity_limit
+                if target_velocity_limit is None else target_velocity_limit
+            ),
+            accel_limit=(
+                self.default_target_accel_limit
+                if target_accel_limit is None else target_accel_limit
+            ),
+            dof=14,
+            name="arm",
+        )
         self.control_dt = 1.0 / 250.0
         logger_mp.info(
             f"[R1_A7_ArmController] published arm target speed limit: "
@@ -2136,6 +2156,12 @@ class R1_A7_ArmController:
             f"limit={self.dq_feedforward_limit:.2f} rad/s "
             f"filter={self.dq_feedforward_filter:.2f} "
             f"hold-timeout={self.dq_feedforward_timeout:.2f} s"
+        )
+        logger_mp.info(
+            f"[R1_A7_ArmController] arm target shaper: "
+            f"{'on' if self.target_shaper.enabled else 'off'} "
+            f"velocity={self.target_shaper.velocity_limit:.2f} rad/s "
+            f"accel={self.target_shaper.accel_limit:.2f} rad/s^2"
         )
 
         self.ctrl_lock = threading.Lock()
@@ -2444,13 +2470,12 @@ class R1_A7_ArmController:
             time.sleep(sleep_time)
 
     def _update_dq_feedforward(self, q_target):
-        """Low-passed derivative of the arm target, used as the servo velocity feed-forward.
+        """Low-passed derivative of the (shaped) arm target, used as velocity feed-forward.
 
-        The motors are commanded with dq=0 today, so a fast operator hand leaves a
-        position error that the servo closes in start-stop bursts. Feeding the target's
-        own velocity tells the servo how fast that joint is supposed to be moving. The
-        estimate is clamped (no commanded lurch after a re-anchor jump) and low-passed
-        (no buzzing from a noisy Vision Pro derivative).
+        Differentiating the raw IK step turns a Vision Pro burst into a velocity
+        spike. The target passed in here is the shaped reference, so dq tracks a
+        continuous ramp. The estimate is still clamped (re-anchor jump) and
+        low-passed (residual Vision Pro noise).
         """
         # getattr: bare controllers built via __new__ (tests, shadow tooling) have no
         # feed-forward state, and this must stay a no-op there.
@@ -2470,13 +2495,38 @@ class R1_A7_ArmController:
         self._dq_feedforward_previous = np.array(q_target, dtype=np.float64, copy=True)
         self._dq_feedforward_previous_at = now
 
+    def _shape_arm_target(self, q_target):
+        shaper = getattr(self, "target_shaper", None)
+        if shaper is None:
+            return np.array(q_target, dtype=np.float64, copy=True)
+        return shaper.shape(q_target, now=time.monotonic())
+
+    def reset_target_shaper(self, reference_q=None):
+        shaper = getattr(self, "target_shaper", None)
+        if shaper is None:
+            return
+        if reference_q is None:
+            reference_q = self.q_target
+        shaper.reset(reference_q)
+
+    def get_target_shaper_snapshot(self):
+        shaper = getattr(self, "target_shaper", None)
+        if shaper is None:
+            return None
+        return shaper.snapshot()
+
+    def get_reference_q(self):
+        with self.ctrl_lock:
+            return np.array(self.q_target, dtype=np.float64, copy=True)
+
     def ctrl_dual_arm(self, q_target, tauff_target):
         '''Set control target values q & tau of the left and right arm motors.'''
         self.raise_if_failed()
         with self.ctrl_lock:
             self._check_target_freshness(self.target_updated_at)
-            self._update_dq_feedforward(q_target)
-            self.q_target = q_target
+            shaped = self._shape_arm_target(q_target)
+            self._update_dq_feedforward(shaped)
+            self.q_target = shaped
             self.tauff_target = tauff_target
             self.target_updated_at = time.monotonic()
 
@@ -2500,8 +2550,9 @@ class R1_A7_ArmController:
             ))
         with self.ctrl_lock:
             self._check_target_freshness(self.target_updated_at)
-            self._update_dq_feedforward(q_target)
-            self.q_target = q_target
+            shaped = self._shape_arm_target(q_target)
+            self._update_dq_feedforward(shaped)
+            self.q_target = shaped
             self.tauff_target = tauff_target
             self.head_q_target = head_q_target
             self.target_updated_at = time.monotonic()
@@ -2522,6 +2573,9 @@ class R1_A7_ArmController:
             self._check_target_freshness(self.target_updated_at)
             if self.target_updated_at is not None:
                 self.target_updated_at = time.monotonic()
+            shaper = getattr(self, "target_shaper", None)
+            if shaper is not None:
+                shaper.reset(self.q_target)
 
     def raise_if_failed(self):
         if self.publish_error is not None:
@@ -2676,6 +2730,9 @@ class R1_A7_ArmController:
         current_attempts = 0
         with self.ctrl_lock:
             self.q_target = np.zeros(14)
+            shaper = getattr(self, "target_shaper", None)
+            if shaper is not None:
+                shaper.reset(self.q_target)
             # self.tauff_target = np.zeros(14)
         tolerance = 0.05  # Tolerance threshold for joint angles to determine "close to zero", can be adjusted based on your motor's precision requirements
         while current_attempts < max_attempts:

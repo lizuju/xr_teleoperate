@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 MAIN_PATH = ROOT / "teleop" / "teleop_hand_and_arm.py"
 sys.path.insert(0, str(ROOT / "teleop" / "robot_control"))
 from r1_head_waist import R1HeadWaistFollower, compensate_wrist_for_waist
-from r1_hand_tracking import R1WristHold, hand_tracking_freshness
+from r1_hand_tracking import R1WristHold, hand_tracking_freshness, hand_tracking_present
 from teleop.robot_control.linker_o6_control_loop import LinkerO6ControlLoop
 
 
@@ -103,6 +103,8 @@ class R1HeadWaistIntegrationTest(unittest.TestCase):
             "requested": {"arm_q": [0.0] * 14, "arm_tau": [0.0] * 14, "head_q": [0.1, 0.2]},
             "published": {"arm_q": [0.0] * 14, "arm_tau": [0.0] * 14, "head_q": [0.1, 0.2]},
         }
+        controller.get_reference_q.return_value = np.zeros(14)
+        controller.get_target_shaper_snapshot.return_value = None
         follower = Mock(total_yaw=0.7, following=True)
         follower.update.return_value = (np.array([0.2, 0.27]), 1.2)
         ik = Mock()
@@ -123,6 +125,7 @@ class R1HeadWaistIntegrationTest(unittest.TestCase):
                 workspace_position_tolerance_m=0.05, workspace_rotation_tolerance_rad=0.15,
                 arm_limit_softness=0.0, arm_posture_weight=0.0, arm_velocity_limit=30.0,
                 arm_dq_feedforward="on", arm_dq_limit=6.0, arm_dq_filter=0.5,
+                arm_target_velocity_limit=6.0, arm_target_accel_limit=40.0,
             ),
             "r1_a7_anchored": True, "r1_a7_deferred_real": True,
             "r1_independent_hands": False,
@@ -137,6 +140,9 @@ class R1HeadWaistIntegrationTest(unittest.TestCase):
             "r1_workspace_saturation": self.workspace_saturation,
             "tv_wrapper": Mock(get_tele_data=Mock(return_value=tele_data)),
             "is_fresh_motion_data": Mock(side_effect=freshness),
+            "is_present_motion_data": Mock(return_value=True),
+            "hand_tracking_present": hand_tracking_present,
+            "hand_tracking_freshness": hand_tracking_freshness,
             "logger_mp": Mock(), "arm_ctrl": controller, "arm_ik": ik,
             "waist_follower": follower, "linker_o6_loop": None,
             # Built by the production helper, so the resume path exercises the real
@@ -175,8 +181,9 @@ class R1HeadWaistIntegrationTest(unittest.TestCase):
         np.testing.assert_allclose(sent.args[2], [0.2, 0.27])
         self.assertEqual(ns["waist_follower"].update.call_args.args[2], 0.43)
 
-    def test_stale_xr_does_not_solve_or_refresh_waist_command(self):
-        ns = self.context(freshness=(False,))
+    def test_lost_xr_does_not_solve_or_refresh_waist_command(self):
+        ns = self.context()
+        ns["is_present_motion_data"] = Mock(return_value=False)
         execute(self.control_nodes, ns, loop=True)
         self.assertTrue(ns["completed"])
         ns["arm_ctrl"].hold_waist.assert_called_once_with()
@@ -186,8 +193,19 @@ class R1HeadWaistIntegrationTest(unittest.TestCase):
         ns["arm_ik"].reset_smoothing.assert_called_once_with()
         ns["waist_follower"].update.assert_not_called()
 
-    def test_xr_expiring_during_ik_does_not_publish(self):
-        ns = self.context(freshness=(True, False))
+    def test_aged_xr_wifi_hole_keeps_publishing_last_pose(self):
+        ns = self.context(freshness=(False,))
+        execute(self.control_nodes, ns, loop=True)
+        self.assertTrue(ns["completed"])
+        ns["arm_ik"].solve_ik.assert_called_once()
+        ns["arm_ctrl"].ctrl_dual_arm_and_head.assert_called_once()
+        ns["arm_ctrl"].hold_targets.assert_not_called()
+        self.assertFalse(ns["tracking_hold_active"])
+        self.assertEqual(ns["tracking_hold_events"], 0)
+
+    def test_xr_lost_during_ik_does_not_publish(self):
+        ns = self.context()
+        ns["is_present_motion_data"] = Mock(side_effect=(True, False))
         execute(self.control_nodes, ns, loop=True)
         self.assertTrue(ns["completed"])
         ns["arm_ik"].solve_ik.assert_called_once()
@@ -210,6 +228,7 @@ class R1HeadWaistIntegrationTest(unittest.TestCase):
         ns["r1_independent_hands"] = True
         ns["wrist_holds"] = (R1WristHold(self.left), R1WristHold(self.right))
         ns["hand_tracking_freshness"] = hand_tracking_freshness
+        ns["hand_tracking_present"] = hand_tracking_present
         ns["held_head_q_target"] = np.array([0.1, 0.2])
         sample = ns["tv_wrapper"].get_tele_data.return_value
         sample.left_hand_timestamp = left_time
@@ -243,8 +262,8 @@ class R1HeadWaistIntegrationTest(unittest.TestCase):
         for moving_side in (0, 1):
             with self.subTest(moving_side=moving_side):
                 ns, sample = self.independent_context(
-                    0.99 if moving_side == 0 else 0.1,
-                    0.99 if moving_side == 1 else 0.1,
+                    0.99 if moving_side == 0 else 0.0,
+                    0.99 if moving_side == 1 else 0.0,
                 )
                 sample.left_wrist_pose = pose(1.0, [0.5, 0.25, 0.82])
                 sample.right_wrist_pose = pose(-1.0, [0.45, -0.3, 0.84])
@@ -269,7 +288,7 @@ class R1HeadWaistIntegrationTest(unittest.TestCase):
                 np.testing.assert_allclose(sent.args[2], [0.1, 0.2])
 
     def test_both_hands_lost_holds_without_solving_or_publishing(self):
-        ns, _ = self.independent_context(0.1, 0.1)
+        ns, _ = self.independent_context(0.0, 0.0)
         execute(self.control_nodes, ns, loop=True)
         self.assertTrue(ns["completed"])
         ns["arm_ik"].solve_ik.assert_not_called()
@@ -280,7 +299,7 @@ class R1HeadWaistIntegrationTest(unittest.TestCase):
         self.assertFalse(ns["wrist_holds"][1].tracking)
 
     def test_both_hands_lost_renews_explicit_hold_in_default_mode(self):
-        ns, _ = self.independent_context(0.1, 0.1)
+        ns, _ = self.independent_context(0.0, 0.0)
         ns["args"].waist_follow = False
         execute(self.control_nodes, ns, loop=True)
         ns["arm_ctrl"].hold_targets.assert_called_once_with()
@@ -289,7 +308,7 @@ class R1HeadWaistIntegrationTest(unittest.TestCase):
         ns["arm_ik"].solve_ik.assert_not_called()
 
     def test_recovery_initially_holds_only_the_previously_lost_arm(self):
-        ns, sample = self.independent_context(0.99, 0.1)
+        ns, sample = self.independent_context(0.99, 0.0)
         sample.left_wrist_pose = pose(0.7, [0.42, 0.2, 0.8])
         sample.right_wrist_pose = pose(-1.2, [0.8, -0.6, 0.9])
         execute(self.control_nodes, ns, loop=True)
@@ -306,11 +325,23 @@ class R1HeadWaistIntegrationTest(unittest.TestCase):
         ns["waist_follower"].reset.assert_called_once_with(0.43, 1.0)
         ns["waist_follower"].update.assert_called_once()
 
-    def test_single_hand_expiring_during_ik_discards_unpublished_targets(self):
-        ns, sample = self.independent_context(0.99, 0.1)
+    def test_wifi_hole_does_not_freeze_arms(self):
+        ns, _ = self.independent_context(0.1, 0.1)
+        execute(self.control_nodes, ns, loop=True)
+        self.assertTrue(ns["completed"])
+        ns["arm_ik"].solve_ik.assert_called_once()
+        ns["arm_ctrl"].ctrl_dual_arm_and_head.assert_called_once()
+        ns["arm_ctrl"].hold_targets.assert_not_called()
+        self.assertTrue(ns["wrist_holds"][0].tracking)
+        self.assertTrue(ns["wrist_holds"][1].tracking)
+        self.assertFalse(ns["tracking_hold_active"])
+        self.assertEqual(ns["tracking_hold_events"], 0)
+
+    def test_hand_lost_during_ik_discards_unpublished_targets(self):
+        ns, sample = self.independent_context(0.99, 0.99)
         sample.left_wrist_pose = pose(0.8, [0.45, 0.2, 0.8])
         def slow_ik(*args, **kwargs):
-            ns["time"].monotonic = lambda: 1.5
+            sample.left_hand_timestamp = 0.0
             return np.zeros(14), np.zeros(14)
         ns["arm_ik"].solve_ik.side_effect = slow_ik
         execute(self.control_nodes, ns, loop=True)
@@ -320,8 +351,20 @@ class R1HeadWaistIntegrationTest(unittest.TestCase):
         np.testing.assert_allclose(ns["wrist_holds"][0].target, self.left)
         self.assertFalse(ns["wrist_holds"][0].tracking)
 
+    def test_wifi_hole_during_ik_still_publishes(self):
+        ns, sample = self.independent_context(0.99, 0.99)
+        sample.left_wrist_pose = pose(0.8, [0.45, 0.2, 0.8])
+        def slow_ik(*args, **kwargs):
+            ns["time"].monotonic = lambda: 1.5
+            return np.zeros(14), np.zeros(14)
+        ns["arm_ik"].solve_ik.side_effect = slow_ik
+        execute(self.control_nodes, ns, loop=True)
+        ns["arm_ctrl"].ctrl_dual_arm_and_head.assert_called_once()
+        ns["arm_ctrl"].hold_targets.assert_not_called()
+        self.assertTrue(ns["wrist_holds"][0].tracking)
+
     def test_independent_hands_work_without_waist_follow(self):
-        ns, sample = self.independent_context(0.99, 0.1)
+        ns, sample = self.independent_context(0.99, 0.0)
         ns["args"].waist_follow = False
         sample.left_wrist_pose = pose(0.8, [0.45, 0.2, 0.8])
         execute(self.control_nodes, ns, loop=True)
@@ -336,7 +379,7 @@ class R1HeadWaistIntegrationTest(unittest.TestCase):
         ns, sample = self.independent_context()
         ns["args"].waist_follow = False
         for cycle in range(5):
-            sample.left_hand_timestamp = 0.1
+            sample.left_hand_timestamp = 0.0
             execute(self.control_nodes, ns, loop=True)
             sample.left_hand_timestamp = 0.99
             sample.left_wrist_pose = pose(0.7, [0.42, 0.2, 0.8])
@@ -385,7 +428,7 @@ class R1HeadWaistIntegrationTest(unittest.TestCase):
         ns["linker_o6_retargeter"].left.reset.assert_not_called()
 
     def test_o6_is_released_when_both_hands_are_stale(self):
-        ns, _ = self.independent_context(0.1, 0.1)
+        ns, _ = self.independent_context(0.0, 0.0)
         ns["args"].ee = "linker_o6"
         ns["linker_o6_retargeter"] = Mock()
         ns["hand_ctrl"] = Mock()
@@ -423,7 +466,7 @@ class R1HeadWaistIntegrationTest(unittest.TestCase):
         ns["hand_ctrl"].hold.assert_not_called()
         self.assertEqual(ns["hand_ctrl"].update.call_count, 1)
         self.assertEqual(ns["hand_ctrl"].update.call_args.kwargs["tracking_fresh"], (False, False))
-        ns["arm_ctrl"].ctrl_dual_arm_and_head.assert_not_called()
+        ns["arm_ctrl"].ctrl_dual_arm_and_head.assert_called_once()
 
     def test_worker_failure_aborts_before_arm_command_is_sent(self):
         ns, _ = self.independent_context()
@@ -501,11 +544,13 @@ class R1HeadWaistIntegrationTest(unittest.TestCase):
         execute(self.control_nodes, ns, loop=True)
         payload = ns["write_json_line"].call_args.args[1]
         self.assertTrue(payload["hand_tracking"]["left"]["fresh"])
+        self.assertTrue(payload["hand_tracking"]["left"]["present"])
         self.assertFalse(payload["hand_tracking"]["right"]["fresh"])
+        self.assertTrue(payload["hand_tracking"]["right"]["present"])
         self.assertAlmostEqual(payload["hand_tracking"]["right"]["age_ms"], 900.0)
 
     def test_recording_during_one_sided_hold_keeps_numeric_body_actions(self):
-        ns, _ = self.independent_context(0.99, 0.1)
+        ns, _ = self.independent_context(0.99, 0.0)
         execute(self.control_nodes, ns, loop=True)
         body_record = next(
             node for node in ast.walk(self.tree) if isinstance(node, ast.If)
@@ -564,7 +609,8 @@ class R1HeadWaistIntegrationTest(unittest.TestCase):
     def test_waist_simulation_uses_deferred_activation_and_no_real_mode_switch(self):
         settings = SimpleNamespace(arm="R1_A7", sim=True, motion=False, hand_only=False,
                                    arm_velocity_limit=30.0, arm_dq_feedforward="on",
-                                   arm_dq_limit=6.0, arm_dq_filter=0.5)
+                                   arm_dq_limit=6.0, arm_dq_filter=0.5,
+                                   arm_target_velocity_limit=6.0, arm_target_accel_limit=40.0)
         controller_branch = next(
             node for node in ast.walk(self.tree) if isinstance(node, ast.If)
             and ast.unparse(node.test) == "args.arm == 'R1_A7'"
@@ -579,6 +625,7 @@ class R1HeadWaistIntegrationTest(unittest.TestCase):
             motion_mode=False, simulation_mode=True, deferred_activation=True,
             arm_velocity_limit=30.0, dq_feedforward=True,
             dq_feedforward_limit=6.0, dq_feedforward_filter=0.5,
+            target_velocity_limit=6.0, target_accel_limit=40.0,
         )
         ik_constructor.assert_not_called()
         switches = [
@@ -630,6 +677,15 @@ class R1HeadWaistIntegrationTest(unittest.TestCase):
                         compensate_wrist_for_waist(actual_pose, actual, reference),
                         fixed_pose, atol=1e-12,
                     )
+
+
+class HandTrackingPresenceTest(unittest.TestCase):
+    def test_zeroed_timestamp_is_lost_and_an_old_timestamp_is_still_present(self):
+        sample = SimpleNamespace(
+            motion_data_ready=True, left_hand_timestamp=0.1, right_hand_timestamp=0.0,
+        )
+        self.assertEqual(hand_tracking_present(sample), (True, False))
+        self.assertEqual(hand_tracking_freshness(sample, 0.25, 1.0), (False, False))
 
 
 if __name__ == "__main__":

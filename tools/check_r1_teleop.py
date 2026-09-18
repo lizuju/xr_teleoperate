@@ -159,6 +159,20 @@ def wrist_topics(config):
 STEREO_JPEG_LABEL = "stereo JPEG (192.168.124.147:55555)"
 
 
+def stream_check_failure(problems):
+    """Format the 8s stream-check timeout so `problems` is never unbound.
+
+    The map is created before the wait loop. If the deadline is already in the
+    past (clock jump) the loop body never runs and `problems` stays empty; that
+    used to NameError when the raise interpolated an unassigned name.
+    """
+    if not problems:
+        return "stream checks timed out after 8s before a diagnosis was collected"
+    return "stream checks failed:\n" + "\n".join(
+        f"  {name}: {problem}" for name, problem in problems.items()
+    )
+
+
 def https_probe(context, port, label):
     url = f"https://192.168.124.147:{port}/"
     try:
@@ -300,7 +314,7 @@ def check_streams():
                                       f"(wrist UVC module quirk; turbojpeg decodes them, losing at most the last MCU row)",
                                       flush=True)
                         return set(windows)
-            raise RuntimeError("stream checks failed:\n" + "\n".join(f"  {name}: {problem}" for name, problem in problems.items()))
+            raise RuntimeError(stream_check_failure(problems))
         finally:
             for socket_ in frame_sockets:
                 socket_.close()

@@ -18,8 +18,11 @@ parent_dir = os.path.dirname(current_dir)
 sys.path.append(parent_dir)
 
 from teleop.utils.ipc import IPC_Server
+from teleop.utils.xr_record_gate import recording_blocked_by_tracking, tracking_diagnostics
 from teleop.robot_control.r1_head_waist import R1HeadWaistFollower, compensate_wrist_for_waist
-from teleop.robot_control.r1_hand_tracking import R1WristHold, hand_tracking_freshness
+from teleop.robot_control.r1_hand_tracking import (
+    R1WristHold, hand_tracking_freshness, hand_tracking_present,
+)
 from sshkeyboard import listen_keyboard, stop_listening
 
 def publish_reset_category(category: int, publisher): # Scene Reset signal
@@ -88,7 +91,16 @@ def get_state() -> dict:
         "RECORD_RUNNING": RECORD_RUNNING,
     }
 
+def is_present_motion_data(tele_data):
+    """True while Vision Pro still has a last sample (timestamp not zeroed)."""
+    if not tele_data.motion_data_ready or tele_data.motion_data_timestamp <= 0.0:
+        return False
+    return math.isfinite(tele_data.motion_data_timestamp)
+
+
 def is_fresh_motion_data(tele_data, timeout, now=None):
+    # Keep this self-contained: several tests exec only this function.
+    # Presence (timestamp > 0) is the arm-hold signal; age is startup/recording.
     if not tele_data.motion_data_ready or tele_data.motion_data_timestamp <= 0.0:
         return False
     if now is None:
@@ -391,9 +403,10 @@ if __name__ == '__main__':
     parser.add_argument('--ipc', action = 'store_true', help = 'Enable IPC server to handle input; otherwise enable sshkeyboard')
     parser.add_argument('--hand-only', action='store_true', help='Skip robot arm, IK, and lowcmd initialization')
     parser.add_argument('--dry-run', action='store_true', help='Compute Linker O6 targets without DDS command publishers')
-    parser.add_argument('--tracking-timeout', type=float, default=0.5, help="XR timeout in seconds; a hand sample older than this holds the arm. "
-                        "Vision Pro hand events arrive bursty (~30Hz with a long tail), so 0.25 "
-                        "caused frequent false holds that looked like stuttering.")
+    parser.add_argument('--tracking-timeout', type=float, default=0.5, help="XR freshness window in seconds for startup and recording. "
+                        "Arm hold no longer uses age: Vision Pro zeroes a lost hand's timestamp, "
+                        "and only that freezes the arm. A Wi-Fi hole leaves the last timestamp in "
+                        "place; following that last pose avoids the freeze-resume hitch.")
     parser.add_argument('--linker-o6-urdf-root', type=str, default='/home/hnh/unitree_r1_dev/linkerhand-urdf/O6', help='Official Linker O6 URDF root')
     parser.add_argument('--linker-o6-method', choices=['vector', 'position', 'dexpilot'], default='vector', help='dex-retargeting optimizer for Linker O6')
     parser.add_argument('--linker-o6-live-state', type=str, default=None, help='Atomic JSON target snapshot for isolated Linker O6 simulation')
@@ -421,6 +434,7 @@ if __name__ == '__main__':
     parser.add_argument('--startup-wrist-align', action='store_true', help='R1_A7: align wrist orientation to the initial Vision Pro pose before following')
     # record mode and task info
     parser.add_argument('--record', action = 'store_true', help = 'Enable data recording mode')
+    parser.add_argument('--record-max-tracking-age-ms', type=float, default=100.0, help='Refuse to start an episode while any tracked XR hand is older than this many milliseconds. 0 disables the gate. Measured 2026-09-18: a bad Wi-Fi evening was left_age_ms p50=106 ms with 7% of frames past 500 ms; a good morning was 24 ms.')
     parser.add_argument('--task-dir', type = str, default = './utils/data/', help = 'path to save data')
     parser.add_argument('--task-name', type = str, default = 'pick cube', help = 'task file name for recording')
     parser.add_argument('--task-goal', type = str, default = 'pick up cube.', help = 'task goal for recording at json file')
@@ -435,7 +449,9 @@ if __name__ == '__main__':
     parser.add_argument('--arm-dq-feedforward', choices=['on', 'off'], default='on', help='R1_A7: feed the target velocity into the servo dq field so the arm follows the commanded motion instead of chasing it with start-stop bursts (default on).')
     parser.add_argument('--arm-dq-limit', type=float, default=6.0, help='R1_A7: clamp on the feed-forward velocity in rad/s (safety net, not a tracking limit).')
     parser.add_argument('--arm-dq-filter', type=float, default=0.5, help='R1_A7: low-pass factor for the feed-forward velocity derivative, 1.0 = unfiltered.')
-    parser.add_argument('--wrist-display', type=str, choices=['auto', 'both', 'left', 'right', 'off'], default='auto', help='Vision Pro wrist camera panels: auto/both show both sides, left/right show one, off disables them (panels also need the wrist cameras to publish WebRTC on PC2)')
+    parser.add_argument('--arm-target-velocity-limit', type=float, default=6.0, help='R1_A7: shape the IK joint target to this speed (rad/s) before dq feed-forward is taken from it. Fast XR/IK bursts otherwise become a step the servo chases. 0 disables. 6 matches --arm-dq-limit and the ~5 rad/s the arm delivered with feed-forward on 2026-09-16; this is not the revoked 3.0 position clip.')
+    parser.add_argument('--arm-target-accel-limit', type=float, default=40.0, help='R1_A7: how fast the shaped reference may change speed, in rad/s^2. 40 reaches 6 rad/s in 0.15 s. 0 means no acceleration limit. This is the term that removes fast-motion jerk; the velocity ceiling only stretches catch-up after a stale sample.')
+    parser.add_argument('--wrist-display', type=str, choices=['auto', 'both', 'left', 'right', 'off'], default='auto', help='Vision Pro wrist camera panels: auto/both show both sides, left/right show one, off disables them. Panels and recording both read the wrist JPEG over ZMQ; wrist WebRTC on PC2 is unused.')
     parser.add_argument('--wrist-panel-distance', type=float, default=1.2, help='Distance of the wrist panels in front of the eyes, in meters')
     parser.add_argument('--wrist-panel-offset', type=float, nargs=2, default=[0.40, 0.40], metavar=('X', 'Y'), help='Wrist panel centre offset in meters; X is mirrored per side, Y is downwards')
     parser.add_argument('--wrist-panel-height', type=float, default=0.26, help='Wrist panel height in meters at --wrist-panel-distance')
@@ -705,6 +721,13 @@ if __name__ == '__main__':
                 if args.record and RECORD_TOGGLE:
                     RECORD_TOGGLE = False
                     if not RECORD_RUNNING:
+                        reason = recording_blocked_by_tracking(
+                            tracking_diagnostics(tv_wrapper),
+                            getattr(args, "record_max_tracking_age_ms", 100.0),
+                        )
+                        if reason:
+                            logger_mp.warning("[RECORD] not started: %s", reason)
+                            continue
                         record_dir = Path(args.task_dir) / args.task_name
                         record_dir.mkdir(parents=True, exist_ok=True)
                         record_path = record_dir / f"linker_o6_dry_run_{time.strftime('%Y%m%d_%H%M%S')}_{time.time_ns()}.jsonl"
@@ -905,6 +928,8 @@ if __name__ == '__main__':
                         dq_feedforward=args.arm_dq_feedforward == 'on',
                         dq_feedforward_limit=args.arm_dq_limit,
                         dq_feedforward_filter=args.arm_dq_filter,
+                        target_velocity_limit=args.arm_target_velocity_limit,
+                        target_accel_limit=args.arm_target_accel_limit,
                     )
                     arm_ik = None
                 else:
@@ -915,6 +940,8 @@ if __name__ == '__main__':
                         dq_feedforward=args.arm_dq_feedforward == 'on',
                         dq_feedforward_limit=args.arm_dq_limit,
                         dq_feedforward_filter=args.arm_dq_filter,
+                        target_velocity_limit=args.arm_target_velocity_limit,
+                        target_accel_limit=args.arm_target_accel_limit,
                     )
 
         # end-effector
@@ -1410,6 +1437,13 @@ if __name__ == '__main__':
                 logger_mp.info(
                     "[XR TRACKING] " + json.dumps(tv_wrapper.tvuer.get_tracking_diagnostics())
                 )
+                if RECORD_RUNNING:
+                    reason = recording_blocked_by_tracking(
+                        tracking_diagnostics(tv_wrapper),
+                        getattr(args, "record_max_tracking_age_ms", 100.0),
+                    )
+                    if reason:
+                        logger_mp.warning("[RECORD] XR tracking degraded while recording: %s", reason)
             start_time = time.time()
             loop_monotonic = time.monotonic()
             loop_period_ms = (
@@ -1456,7 +1490,13 @@ if __name__ == '__main__':
             if args.record and RECORD_TOGGLE:
                 RECORD_TOGGLE = False
                 if not RECORD_RUNNING:
-                    if recorder.create_episode():
+                    reason = recording_blocked_by_tracking(
+                        tracking_diagnostics(tv_wrapper),
+                        getattr(args, "record_max_tracking_age_ms", 100.0),
+                    )
+                    if reason:
+                        logger_mp.warning("[RECORD] not started: %s", reason)
+                    elif recorder.create_episode():
                         RECORD_RUNNING = True
                         RECORD_OUTCOME = 'unspecified'
                         if r1_capture is not None:
@@ -1517,36 +1557,36 @@ if __name__ == '__main__':
                     arm_ik.reset_smoothing(reference_q=held_q)
                     last_fresh_tele_data = tele_data
                     tracking_hold_active = False
-                    if (
-                        R1_PAUSE.poll_resume(tele_data, args.tracking_timeout, time.monotonic()) == resume_generation
-                        and R1_PAUSE.complete_resume(resume_generation)
-                    ):
+                    if R1_PAUSE.complete_resume(resume_generation):
                         logger_mp.info("[R1 PAUSE] References realigned at held targets; following resumes next frame.")
             if r1_independent_hands:
-                raw_hand_fresh = hand_tracking_freshness(tele_data, args.tracking_timeout, time.monotonic())
-                hand_fresh = []
-                for index, (side, hold, fresh) in enumerate(zip(("left", "right"), wrist_holds, raw_hand_fresh)):
-                    hold.resume_streak = hold.resume_streak + 1 if fresh else 0
-                    hand_fresh.append(fresh and (hold.tracking or hold.resume_streak >= 2))
-                hand_fresh = tuple(hand_fresh)
-                for side, hold, fresh in zip(("left", "right"), wrist_holds, hand_fresh):
-                    if fresh != hold.tracking and capture_mode != "paused":
-                        logger_mp.info(f"[R1 HAND TRACKING] {side}: {'resumed; position follows fixed reference via IK filter' if fresh else 'stale; holding target'}")
-                    if not fresh:
+                raw_hand_present = hand_tracking_present(tele_data)
+                hand_present = []
+                for index, (side, hold, present) in enumerate(zip(("left", "right"), wrist_holds, raw_hand_present)):
+                    hold.resume_streak = hold.resume_streak + 1 if present else 0
+                    hand_present.append(present and (hold.tracking or hold.resume_streak >= 2))
+                hand_present = tuple(hand_present)
+                for side, hold, present in zip(("left", "right"), wrist_holds, hand_present):
+                    if present != hold.tracking and capture_mode != "paused":
+                        logger_mp.info(f"[R1 HAND TRACKING] {side}: {'resumed; position follows fixed reference via IK filter' if present else 'lost; holding target'}")
+                    if not present:
                         hold.hold()
                 if args.waist_follow:
-                    if not all(hand_fresh):
+                    if not all(hand_present):
                         arm_ctrl.hold_waist()
                     elif tracking_hold_active:
                         waist_follower.reset(arm_ctrl.get_current_waist_yaw(), time.monotonic())
-                tracking_hold_active = not all(hand_fresh)
+                tracking_hold_active = not all(hand_present)
                 if tracking_hold_active and capture_mode != "paused":
                     capture_mode = "tracking_hold"
-                if not any(hand_fresh):
+                if not any(hand_present):
                     run_motion = False
             elif r1_a7_anchored:
-                if is_fresh_motion_data(tele_data, args.tracking_timeout):
-                    last_fresh_tele_data = tele_data
+                if is_present_motion_data(tele_data):
+                    if is_fresh_motion_data(tele_data, args.tracking_timeout):
+                        last_fresh_tele_data = tele_data
+                    else:
+                        tele_data = last_fresh_tele_data
                     if tracking_hold_active:
                         arm_ik.reset_smoothing()
                         if args.waist_follow:
@@ -1558,7 +1598,7 @@ if __name__ == '__main__':
                     if not tracking_hold_active:
                         arm_ik.reset_smoothing()
                         logger_mp.warning(
-                            "R1_A7 Vision tracking is stale; holding the last tracked pose until tracking resumes."
+                            "R1_A7 Vision tracking is lost; holding the last tracked pose until tracking returns."
                         )
                     tracking_hold_active = True
                 if args.waist_follow and tracking_hold_active:
@@ -1676,9 +1716,9 @@ if __name__ == '__main__':
                         args.arm_translation_scale,
                     )
                 if r1_independent_hands:
-                    left_wrist_target = wrist_holds[0].prepare(left_wrist_target, hand_fresh[0])
-                    right_wrist_target = wrist_holds[1].prepare(right_wrist_target, hand_fresh[1])
-                    if not all(hand_fresh):
+                    left_wrist_target = wrist_holds[0].prepare(left_wrist_target, hand_present[0])
+                    right_wrist_target = wrist_holds[1].prepare(right_wrist_target, hand_present[1])
+                    if not all(hand_present):
                         head_q_target = held_head_q_target.copy()
                 left_ik_target = left_wrist_target
                 right_ik_target = right_wrist_target
@@ -1686,7 +1726,7 @@ if __name__ == '__main__':
                 waist_yaw_target = None
                 if args.waist_follow:
                     waist_yaw_actual = arm_ctrl.get_current_waist_yaw()
-                    if not r1_independent_hands or all(hand_fresh):
+                    if not r1_independent_hands or all(hand_present):
                         head_q_target, waist_yaw_target = waist_follower.update(
                             tele_data.head_pose, r1_head_pose_reference,
                             waist_yaw_actual, time.monotonic(),
@@ -1725,18 +1765,18 @@ if __name__ == '__main__':
             if STOP:
                 break
             if r1_independent_hands and run_motion:
-                fresh_after_ik = hand_tracking_freshness(tele_data, args.tracking_timeout, time.monotonic())
-                if any(before and not after for before, after in zip(hand_fresh, fresh_after_ik)):
+                present_after_ik = hand_tracking_present(tele_data)
+                if any(before and not after for before, after in zip(hand_present, present_after_ik)):
                     arm_ik.reset_smoothing()
-                    for hold, fresh in zip(wrist_holds, fresh_after_ik):
-                        if not fresh:
+                    for hold, present in zip(wrist_holds, present_after_ik):
+                        if not present:
                             hold.hold()
                     if args.waist_follow:
                         arm_ctrl.hold_waist()
                     tracking_hold_active = True
                     capture_mode = "tracking_hold"
                     run_motion = False
-            elif run_motion and args.waist_follow and not is_fresh_motion_data(tele_data, args.tracking_timeout):
+            elif run_motion and args.waist_follow and not is_present_motion_data(tele_data):
                 arm_ik.reset_smoothing()
                 arm_ctrl.hold_waist()
                 tracking_hold_active = True
@@ -1860,9 +1900,15 @@ if __name__ == '__main__':
                     "source_monotonic_time": tele_data.motion_data_timestamp,
                     "tracking_age_ms": 1000.0 * (diagnostic_now - tele_data.motion_data_timestamp),
                     "hand_tracking": {
-                        side: {"fresh": fresh, "age_ms": 1000.0 * (diagnostic_now - timestamp)}
-                        for side, fresh, timestamp in zip(
-                            ("left", "right"), hand_fresh,
+                        side: {
+                            "fresh": age_fresh,
+                            "present": present,
+                            "age_ms": 1000.0 * (diagnostic_now - timestamp),
+                        }
+                        for side, age_fresh, present, timestamp in zip(
+                            ("left", "right"),
+                            hand_tracking_freshness(tele_data, args.tracking_timeout, diagnostic_now),
+                            hand_present,
                             (tele_data.left_hand_timestamp, tele_data.right_hand_timestamp),
                         )
                     } if r1_independent_hands else None,
@@ -1883,6 +1929,14 @@ if __name__ == '__main__':
                     "q_actual": current_lr_arm_q.tolist(),
                     "dq_actual": current_lr_arm_dq.tolist(),
                     "q_ik_command": sol_q.tolist(),
+                    "q_reference_command": (
+                        arm_ctrl.get_reference_q().tolist()
+                        if hasattr(arm_ctrl, "get_reference_q") else sol_q.tolist()
+                    ),
+                    "arm_target_shaper": (
+                        arm_ctrl.get_target_shaper_snapshot()
+                        if hasattr(arm_ctrl, "get_target_shaper_snapshot") else None
+                    ),
                     "tau_ik_command": sol_tauff.tolist(),
                     "tau_actual": arm_tau_actual.tolist() if arm_tau_actual is not None else None,
                     "workspace": workspace_saturation,
@@ -2086,8 +2140,8 @@ if __name__ == '__main__':
             if r1_a7_anchored and arm_ik is not None:
                 logger_mp.info(
                     "[R1 SESSION SUMMARY] tracking_holding_events=%d workspace_saturation_events=%d "
-                    "diagnostic_samples=%d. A hold event means at least one hand lost tracking; "
-                    "the arm kept its last pose until tracking returned.",
+                    "diagnostic_samples=%d. A hold event means Vision Pro zeroed a hand "
+                    "(lost/missing), not a Wi-Fi gap; the arm kept its last pose until tracking returned.",
                     tracking_hold_events, workspace_saturation_events, arm_diagnostic_sequence,
                 )
                 # A stop-and-go arm shows up here as iterations that missed the loop

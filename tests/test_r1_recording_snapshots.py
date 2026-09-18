@@ -52,6 +52,9 @@ class R1RecordingSnapshotTests(unittest.TestCase):
             return True
 
         self.arm.lowcmd_publisher = Mock(Write=Mock(side_effect=write_arm))
+        # Snapshot tests assert requested == the ctrl argument. Leave shaping to
+        # test_arm_target_shaper; a same-timestamp 0.8 -> 0.9 would otherwise hold.
+        self.arm.target_shaper.velocity_limit = 0.0
         hand_fixtures.FakePublisher.instances.clear()
         hand_fixtures.FakeSubscriber.instances.clear()
         hand_fixtures.FakeSubscriber.queued_messages = {}

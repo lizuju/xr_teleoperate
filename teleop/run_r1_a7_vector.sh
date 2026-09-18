@@ -20,6 +20,11 @@
 #                       要退回“削命令”的保守方案：ARM_DQ_FEEDFORWARD=off ARM_VELOCITY_LIMIT=3.0
 #   ARM_DQ_LIMIT        前馈速度上限，默认 6.0 rad/s（安全网，不是跟踪上限）
 #   ARM_VELOCITY_LIMIT  位置目标的安全限速，默认 30.0 rad/s（约等于不限）
+#   ARM_TARGET_VELOCITY_LIMIT  IK 目标整形的巡航上限，默认 6.0 rad/s。
+#                       dq 前馈从这条整形后的轨迹求导，避免 Vision Pro/IK 突发台阶被伺服猛追。
+#                       0 = 关掉整形。不是已撤销的 3.0 位置限速。
+#   ARM_TARGET_ACCEL_LIMIT  整形加速度，默认 40 rad/s^2（0.15 s 到 6 rad/s）。这是去快动作顿挫的那一项。
+#                       0 = 不限加速度。
 #   WRIST_DISPLAY       头显上要不要显示左右腕部相机小窗，默认 **off**（不显示）。
 #                       为什么默认关：两路面板每 30 Hz 无条件重新编码重发，而画面内容只有约 12 Hz
 #                       是新的，实测单块 base64 60.7 KB、两块合计约 3.5 MB/s，全压在同一条 Wi-Fi 上，
@@ -27,7 +32,12 @@
 #                       实测同一天：链路空闲时手部数据年龄 p50 24 ms（不卡），链路忙时 p50 106 ms、
 #                       7% 的帧超时导致手臂冻结（卡）。关掉面板省下这部分下行，给上行让路。
 #                       取值 off(默认) / auto(相机在就显示) / both / left / right。
-#                       不影响录制：腕部画面照样进 episode 的 color_2 / color_3。
+#                       不影响录制：腕部画面走 ZMQ 55556/55557，进 episode 的 color_2 / color_3。
+#                       腕部 WebRTC（60002/60003）头显不用，PC2 上可以关，数采不受影响。
+#   RECORD_MAX_TRACKING_AGE_MS  按 [s] 开录前，XR 手部数据允许的最大年龄，默认 100 ms。
+#                       09-18 实测：链路好时 left_age_ms p50=24 ms，晚上差时 106 ms 且 7% 超 500 ms。
+#                       超限会拒绝开录并打 [RECORD] not started；已经在录的 episode 只告警不停。
+#                       关掉门控：RECORD_MAX_TRACKING_AGE_MS=0
 #   WAIST_FOLLOW_THRESHOLD_DEG  腰跟随的触发门槛，默认 20 度。
 #                       注意比的不是头的绝对偏航角，而是「残差」= 你累计转了多少头 − 腰已经跟了多少。
 #                       残差超过这个值并保持 0.2 s 才开始跟；跟到残差落到 5 度以下就停（迟滞带）。
@@ -50,7 +60,7 @@
 #                       标定结果会写进每个 episode 的 info.camera_calibration，供后面数采/训练使用。
 #
 # 例：
-#   ./teleop/run_r1_a7_vector.sh                        # 日常遥操（dq 前馈 on，位置限速 30 ≈ 不限）
+#   ./teleop/run_r1_a7_vector.sh                        # 日常遥操（dq 前馈 on，目标整形 6 rad/s / 40 rad/s^2）
 #   ARM_DIAG_HZ=40 ARM_DIAG_DIR=$HOME/r1-diag ./teleop/run_r1_a7_vector.sh
 set -euo pipefail
 
@@ -105,7 +115,10 @@ exec "$python" -u teleop_hand_and_arm.py \
   --arm-velocity-limit "${ARM_VELOCITY_LIMIT:-30.0}" \
   --arm-dq-feedforward "${ARM_DQ_FEEDFORWARD:-on}" \
   --arm-dq-limit "${ARM_DQ_LIMIT:-6.0}" \
+  --arm-target-velocity-limit "${ARM_TARGET_VELOCITY_LIMIT:-6.0}" \
+  --arm-target-accel-limit "${ARM_TARGET_ACCEL_LIMIT:-40.0}" \
   --camera-calibration "${CAMERA_CALIBRATION:-}" \
+  --record-max-tracking-age-ms "${RECORD_MAX_TRACKING_AGE_MS:-100}" \
   --network-interface eno1 \
   --img-server-ip 192.168.124.147 \
   --headless \

@@ -277,6 +277,9 @@ class R1A7VelocityFeedforwardTest(unittest.TestCase):
         self.controller.crc = FakeCRC()
         self.published = []
         self.controller.lowcmd_publisher = Mock(Write=self.capture)
+        # These cases assert the raw derivative. The production shaper is tested
+        # separately; leaving it on would accel-limit the 2 rad/s step.
+        self.controller.target_shaper.velocity_limit = 0.0
 
     def tearDown(self):
         self.controller.stop()

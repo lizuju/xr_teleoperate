@@ -105,6 +105,13 @@ def wait_for_dds(predicate, name):
     raise TimeoutError(name)
 
 
+def load_arm_target_shaper():
+    path = ARM_PATH.parent / "arm_target_shaper.py"
+    namespace = {"np": np, "math": math, "time": time}
+    exec(compile(path.read_text(encoding="utf-8"), str(path), "exec"), namespace)
+    return namespace["ArmTargetShaper"]
+
+
 def load_r1_controller_namespace():
     tree = ast.parse(ARM_PATH.read_text(encoding="utf-8"))
     selected_names = {
@@ -137,6 +144,7 @@ def load_r1_controller_namespace():
         "R1_A7_Num_Motors": 35,
         "kTopicLowCommand_Debug": "rt/lowcmd",
         "kTopicLowState": "rt/lowstate",
+        "ArmTargetShaper": load_arm_target_shaper(),
     }
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(ARM_PATH), "exec"), namespace)
     return namespace
