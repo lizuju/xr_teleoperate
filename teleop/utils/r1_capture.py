@@ -97,10 +97,22 @@ def capture_metadata(args, camera_config, retargeter, calibration=None):
         "units": {"arm_and_body_qpos": "rad", "arm_qvel": "rad/s",
                   "arm_torque": "N*m measured at the joint (DDS tau_est)",
                   "arm_torque_command": "N*m requested feed-forward (arm_tau)",
-                  "hand_qpos": "normalized_vendor_axis_0_to_1", "hand_points": "m",
+                  "hand_qpos": ("normalized_vendor_axis_0_to_1, from a one-byte device "
+                                "register: 256 levels over the joint range"),
+                  "hand_points": "m",
                   "hand_qvel": "normalized_0_to_1 relative joint speed, not rad/s",
                   "hand_torque": ("normalized_0_to_1 relative joint torque from the O6 "
-                                  "telemetry block, not N*m"),
+                                  "telemetry block. Not N*m and not a measured contact "
+                                  "force: it is inferred from motor current, so it also "
+                                  "carries the finger's own weight and inertia, and no "
+                                  "calibration can separate those out. The O6 register is "
+                                  "one byte per channel (LinkerHand's native scale), so the "
+                                  "value has 256 levels -- 1/255 resolution, saturating at "
+                                  "1.0 -- and the device is the quantizer: PC2 forwards it "
+                                  "already normalised and leaves q_raw, dq_raw and tau_est_raw "
+                                  "at zero, so no more precision can be recovered "
+                                  "downstream. Use it for contact and grasp events, not as "
+                                  "a force regressor."),
                   "hand_temperature": "raw device register value",
                   "hand_errors": ("per-joint O6 fault code; all zeros means no fault was "
                                   "reported. PC2 only fills reserve[0] once hand_dds_service "

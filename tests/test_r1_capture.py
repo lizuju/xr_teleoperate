@@ -10,7 +10,7 @@ import numpy as np
 
 from teleop.utils.camera_calibration import camera_calibration_metadata, load_camera_calibration
 from teleop.utils.episode_writer import EpisodeWriter
-from teleop.utils.r1_capture import R1Capture
+from teleop.utils.r1_capture import R1Capture, capture_metadata
 
 
 def calibration_document():
@@ -501,6 +501,61 @@ class PalmCaptureTests(unittest.TestCase):
             self.assertFalse(report["valid"])
             self.assertTrue(any("null image needs" in message for message in report["errors"]),
                             report["errors"])
+
+
+class HandTelemetryUnitsTest(unittest.TestCase):
+    """The O6 telemetry is easy to misread as a measured force.
+
+    It is inferred from motor current and comes off a one-byte device register,
+    so the episode has to say so: measured on a recorded session, 103848 torque
+    values held exactly 255 distinct levels on the 1/255 grid, saturating at 1.0,
+    and the device is the quantizer -- PC2 leaves q_raw/dq_raw at zero, so no
+    more precision can be recovered downstream.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        # capture_metadata hashes the hand URDFs, so point at a real one.
+        urdf = Path(__file__).resolve().parents[1] / "assets" / "r1" / "r1_a7.urdf"
+        hand = SimpleNamespace(
+            urdf_path=urdf,
+            hardware_joint_order=[f"joint_{index}" for index in range(6)],
+            hardware_lower=np.zeros(6), hardware_upper=np.ones(6),
+        )
+        cls.retargeter = SimpleNamespace(
+            method="vector", mapping_name="o6",
+            left=hand, right=hand,
+        )
+        cls.camera_config = {
+            "head_camera": {"binocular": True, "image_shape": [448, 1088], "fps": 30,
+                            "enable_zmq": True},
+            "left_wrist_camera": {"enable_zmq": True, "image_shape": [480, 640], "fps": 30},
+            "right_wrist_camera": {"enable_zmq": True, "image_shape": [480, 640], "fps": 30},
+        }
+        cls.args = SimpleNamespace(frequency=40.0, camera_sync_tolerance_ms=25.0)
+        cls.units = capture_metadata(cls.args, cls.camera_config, cls.retargeter)["units"]
+
+    def test_torque_is_not_advertised_as_a_measured_force(self):
+        torque = self.units["hand_torque"]
+        self.assertIn("Not N*m", torque)
+        self.assertIn("not a measured contact force", torque)
+        self.assertIn("motor current", torque)
+
+    def test_torque_carries_the_device_quantisation(self):
+        torque = self.units["hand_torque"]
+        self.assertIn("256 levels", torque)
+        self.assertIn("1/255", torque)
+        self.assertIn("saturating at", torque)
+        # The device is the quantizer, so a consumer cannot recover precision.
+        self.assertIn("q_raw", torque)
+
+    def test_torque_states_what_it_is_usable_for(self):
+        self.assertIn("contact and grasp events", self.units["hand_torque"])
+        self.assertIn("not as a force regressor", self.units["hand_torque"])
+
+    def test_hand_position_reports_the_same_register_width(self):
+        self.assertIn("256 levels", self.units["hand_qpos"])
+        self.assertEqual(self.units["hand_points"], "m")
 
 
 if __name__ == "__main__":
