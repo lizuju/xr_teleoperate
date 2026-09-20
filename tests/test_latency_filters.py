@@ -40,7 +40,7 @@ class LatencyFilterTest(unittest.TestCase):
             retarget = LPFilter(retarget_alpha)
             retarget.next(np.zeros(6))
             action = np.zeros(6)
-            controller_alpha = -math.expm1(-(1 / 30) / 0.03)
+            controller_alpha = -math.expm1(-(1 / 30) / 0.015)
             outputs = []
             for step in range(1, 16):
                 target = retarget.next(np.ones(6))
@@ -51,7 +51,7 @@ class LatencyFilterTest(unittest.TestCase):
                     break
             self.assertLess(outputs[0][0], 1.0)
             self.assertTrue(np.all(np.diff(np.array(outputs), axis=0) >= 0.0))
-        self.assertEqual(frames_to_90, [5, 3])
+        self.assertEqual(frames_to_90, [4, 2])
 
     def test_wrist_recovery_has_one_held_frame_without_bypassing_joint_filter(self):
         for angle in (math.pi / 2, math.pi):

@@ -462,9 +462,9 @@ class LinkerO6ControllerTest(unittest.TestCase):
                 controller.update([target] * 6, [target] * 6)
                 if step > 30:
                     filtered.append(controller.get_action()[0][0])
-            # The 30 ms response intentionally trades a small amount of stationary
+            # The 15 ms response intentionally trades a small amount of stationary
             # noise for lower fast-motion lag; keep the noise bound explicit.
-            self.assertLess(np.std(filtered), 0.011)
+            self.assertLess(np.std(filtered), 0.018)
             for step in range(121, 151):
                 clock.return_value = started + step / 30
                 self.queue_pair([0.5] * 6, [0.5] * 6, modes=(2, 2))
@@ -472,7 +472,7 @@ class LinkerO6ControllerTest(unittest.TestCase):
             np.testing.assert_allclose(controller.get_action(), [[1.0] * 6, [0.0] * 6], atol=1e-9)
             controller.stop()
 
-    def test_30ms_smoothing_advances_a_fast_step_on_the_first_frame(self):
+    def test_15ms_smoothing_advances_a_fast_step_on_the_first_frame(self):
         self.queue_pair([0.0] * 6, [0.0] * 6)
         controller = self.module.LinkerO6Controller()
         controller.wait_until_ready(timeout=0.1)

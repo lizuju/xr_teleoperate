@@ -304,7 +304,7 @@ class LinkerO6Controller:
                 raise TimeoutError(message)
         targets, modes, release_times = [], [], []
         dt = min(max(now - self.action_time, 0.0), 1.0 / 30.0)
-        alpha = -math.expm1(-dt / 0.03)
+        alpha = -math.expm1(-dt / 0.015)
         for target, previous, state, state_time, gate_mode, fresh, released_at in zip(
             (left, right), (self.left_action, self.right_action),
             (left_state, right_state), (left_state_time, right_state_time),
