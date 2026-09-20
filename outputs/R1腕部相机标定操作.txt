@@ -1,0 +1,40 @@
+R1 腕部相机标定（左腕 → 右腕，针孔 plumb_bob）
+更新：2026-09-20    不启动遥操    不驱动机械臂    不覆盖已安装的头部标定
+
+0. 开拍前只读检查（本机图形终端，不要纯 SSH）：
+   export XDG_RUNTIME_DIR=/run/user/$(id -u)
+   systemctl --user is-active r1-camera-forward-55556.service
+   systemctl --user is-active r1-camera-forward-55557.service
+   # 两个都要 active。不要用 60002/60003。不要开遥操。
+   # 若 inactive：只检查服务，不要擅自重启。不要杀 PC2 的 linker_hand_server。
+
+1. 先采左腕（机器人站着别动；人把板举到左腕相机正前方）：
+   cd /home/hnh/unitree_r1_dev/xr_teleoperate
+   /home/hnh/unitree_r1_dev/.venv-xr/bin/python tools/calibrate_r1_wrist_capture.py \
+     --side left --host 192.168.124.147 --pattern 9 6 --square 0.030 \
+     --out-root ~/r1-cam-calib --day 20260920
+
+2. 怎么拿板：
+   同一块 DFOPTIX A3，横着拿（长边水平），OpenCV 内角点 9×6=54，格距 0.030 m。
+   距离 0.25–0.7 m，在该手腕相机正前方。一次只标一只手腕。
+   绿字 OK 且停稳后再按空格。覆盖中心、四角、倾斜，不要连续两张几乎一样。
+   ≥40 张（≥30 训练 + ≥10 验收）。q 退出采集（不是急停）。
+   手臂挡镜头时，用手把胳膊摆开即可，不要用软件发运动指令。
+
+3. 再采右腕（同一套动作，换 --side right，默认端口 55557）：
+   /home/hnh/unitree_r1_dev/.venv-xr/bin/python tools/calibrate_r1_wrist_capture.py \
+     --side right --host 192.168.124.147 --pattern 9 6 --square 0.030 \
+     --out-root ~/r1-cam-calib --day 20260920
+
+4. 两只手腕都拍够后，拟合（写入当天目录的 JSON 副本，不装 assets/）：
+   /home/hnh/unitree_r1_dev/.venv-xr/bin/python tools/calibrate_r1_wrist_fit.py \
+     --day-dir ~/r1-cam-calib/20260920 --side both
+
+5. 把拟合终端全文 + json 路径发回来。我们审查后再安装。
+   默认写：~/r1-cam-calib/20260920/camera_calibration.json
+   会保留已有 head_left / head_right / stereo.head。不要自己拷到 assets/r1/。
+
+6. 不要做：
+   q 不是急停。不要用腕部 WebRTC 60002/60003。不要开遥操、不要按 r。
+   不要覆盖 assets/r1/camera_calibration.json（头部双目已装上）。
+   不要用 tools/r1_wrist_calibration.py（那是 Vision Pro 腕姿态，不是相机内参）。

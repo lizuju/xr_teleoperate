@@ -6,8 +6,11 @@ import unittest
 
 from teleop.utils.camera_calibration import (CALIBRATION_SCHEMA, CalibrationError,
                                              DEFAULT_CALIBRATION_RELPATH, camera_calibration_metadata,
-                                             expected_cameras, load_camera_calibration,
-                                             resolve_camera_calibration)
+                                             default_camera_calibration_root, expected_cameras,
+                                             load_camera_calibration, resolve_camera_calibration)
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+MAIN_PATH = REPO_ROOT / "teleop/teleop_hand_and_arm.py"
 
 
 IDENTITY = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
@@ -185,12 +188,16 @@ class ResolveCalibrationTest(unittest.TestCase):
 
     def test_no_default_file_is_not_an_error(self):
         self.assertEqual(resolve_camera_calibration("", root=self.root), (None, None))
+        self.assertEqual(resolve_camera_calibration(None, root=self.root), (None, None))
 
     def test_default_file_is_picked_up_and_validated(self):
         path = self.install_default(document())
-        resolved, calibration = resolve_camera_calibration("", root=self.root)
-        self.assertEqual(resolved, path)
-        self.assertEqual(calibration["schema"], CALIBRATION_SCHEMA)
+        for value in ("", None):
+            resolved, calibration = resolve_camera_calibration(value, root=self.root)
+            self.assertEqual(resolved, path)
+            self.assertEqual(calibration["schema"], CALIBRATION_SCHEMA)
+            self.assertEqual(sorted(calibration["cameras"]),
+                             ["head_left", "head_right", "left_wrist", "right_wrist"])
 
     def test_broken_default_file_is_not_silently_ignored(self):
         self.install_default({"schema": CALIBRATION_SCHEMA, "cameras": {}})
@@ -207,6 +214,70 @@ class ResolveCalibrationTest(unittest.TestCase):
         explicit.write_text(json.dumps(document()), encoding="utf-8")
         resolved, _ = resolve_camera_calibration(str(explicit), root=self.root)
         self.assertEqual(resolved, explicit)
+
+
+class DefaultCalibrationRootTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        # Production layout: unitree_r1_dev/xr_teleoperate/teleop/teleop_hand_and_arm.py
+        # parents[2] from the main script is unitree_r1_dev, which has no assets/.
+        self.dev = Path(self.temporary.name) / "unitree_r1_dev"
+        self.repo = self.dev / "xr_teleoperate"
+        self.main = self.repo / "teleop/teleop_hand_and_arm.py"
+        self.helper = self.repo / "teleop/utils/camera_calibration.py"
+        self.main.parent.mkdir(parents=True)
+        self.helper.parent.mkdir(parents=True, exist_ok=True)
+        self.main.write_text("# stub\n", encoding="utf-8")
+        self.helper.write_text("# stub\n", encoding="utf-8")
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def install_repo_default(self):
+        path = self.repo / DEFAULT_CALIBRATION_RELPATH
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(document()), encoding="utf-8")
+        return path.resolve()
+
+    def test_root_from_main_script_is_repo_not_dev(self):
+        self.assertEqual(default_camera_calibration_root(self.main), self.repo.resolve())
+        self.assertEqual(self.main.resolve().parents[1], self.repo.resolve())
+        self.assertEqual(self.main.resolve().parents[2], self.dev.resolve())
+
+    def test_root_from_helper_is_also_repo(self):
+        self.assertEqual(default_camera_calibration_root(self.helper), self.repo.resolve())
+        self.assertEqual(self.helper.resolve().parents[2], self.repo.resolve())
+
+    def test_empty_arg_finds_repo_assets_not_dev_assets(self):
+        default = self.install_repo_default()
+        self.assertFalse((self.dev / DEFAULT_CALIBRATION_RELPATH).exists())
+        resolved, calibration = resolve_camera_calibration(
+            "", root=default_camera_calibration_root(self.main))
+        self.assertEqual(resolved, default)
+        self.assertEqual(sorted(calibration["cameras"]),
+                         ["head_left", "head_right", "left_wrist", "right_wrist"])
+        self.assertEqual(resolve_camera_calibration("", root=self.main.resolve().parents[2]),
+                         (None, None))
+
+    def test_explicit_path_still_wins_on_the_fake_tree(self):
+        self.install_repo_default()
+        explicit = self.dev / "other.json"
+        explicit.write_text(json.dumps(document()), encoding="utf-8")
+        resolved, _ = resolve_camera_calibration(
+            str(explicit), root=default_camera_calibration_root(self.main))
+        self.assertEqual(resolved, explicit)
+
+    def test_main_script_no_longer_passes_parents_2(self):
+        source = MAIN_PATH.read_text(encoding="utf-8")
+        self.assertIn("default_camera_calibration_root(__file__)", source)
+        self.assertIn("resolve_run_camera_calibration(args)", source)
+        self.assertNotIn("Path(__file__).resolve().parents[2]", source)
+        self.assertIn("raise SystemExit(2)", source)
+
+    def test_wrappers_still_pass_empty_camera_calibration(self):
+        for name in ("run_r1_a7_vector.sh", "run_r1_a7_capture.sh"):
+            script = (REPO_ROOT / "teleop" / name).read_text(encoding="utf-8")
+            self.assertIn('--camera-calibration "${CAMERA_CALIBRATION:-}"', script)
 
 
 class CalibrationMetadataTest(unittest.TestCase):

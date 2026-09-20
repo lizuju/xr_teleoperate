@@ -241,13 +241,30 @@ def load_camera_calibration(path):
     return calibration
 
 
+def default_camera_calibration_root(from_file):
+    """xr_teleoperate repo root (the directory that contains teleop/ and assets/).
+
+    The main program lives at ``teleop/teleop_hand_and_arm.py``, so
+    ``Path(__file__).resolve().parents[1]`` is the repo root. This helper lives
+    at ``teleop/utils/camera_calibration.py``, so ``parents[2]`` would be the
+    repo root from HERE. Production used ``parents[2]`` from the main script
+    and looked in ``unitree_r1_dev/assets/``, which does not exist.
+    """
+    path = Path(from_file).resolve()
+    for parent in path.parents:
+        if parent.name == "teleop":
+            return parent.parent
+    raise ValueError(f"{path} is not inside a teleop/ package")
+
+
 def resolve_camera_calibration(path, root=None):
     """Resolve the calibration file for a run.
 
     An explicitly requested file must exist and be valid: silently recording an
     episode with no calibration when one was asked for is exactly the failure
     this module exists to prevent. The default location is optional, but a file
-    found there is still validated rather than ignored.
+    found there is still validated rather than ignored. ``None`` and ``""`` both
+    mean "use the default if it exists".
     """
     if path:
         return Path(path).expanduser(), load_camera_calibration(path)

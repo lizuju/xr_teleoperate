@@ -362,15 +362,22 @@ def correct_palm_frame(frame):
     return PalmFrame(frame)
 
 
-def resolve_run_camera_calibration(args, root):
+def resolve_run_camera_calibration(args, root=None):
     """Resolve the camera calibration for this run, or stop before touching robot state.
 
     A calibration file that was asked for but cannot be trusted must end the run
     here rather than let a whole collection session record episodes whose
     geometry is silently wrong. A file found at the default location is held to
     the same standard: a corrupt one is a defect, not something to skip past.
+
+    The default root is the xr_teleoperate repo (parent of teleop/), not
+    unitree_r1_dev. Path(__file__).parents[2] from this file is the latter.
     """
-    from teleop.utils.camera_calibration import CalibrationError, resolve_camera_calibration
+    from teleop.utils.camera_calibration import (
+        CalibrationError, default_camera_calibration_root, resolve_camera_calibration,
+    )
+    if root is None:
+        root = default_camera_calibration_root(__file__)
     try:
         path, calibration = resolve_camera_calibration(args.camera_calibration, root=root)
     except CalibrationError as error:
@@ -462,8 +469,8 @@ if __name__ == '__main__':
     logger_mp.debug(f"args: {args}")
 
     # Resolved before any robot state is touched; see resolve_run_camera_calibration.
-    camera_calibration_path, camera_calibration = resolve_run_camera_calibration(
-        args, Path(__file__).resolve().parents[2])
+    # Default root is xr_teleoperate (parent of teleop/), not unitree_r1_dev.
+    camera_calibration_path, camera_calibration = resolve_run_camera_calibration(args)
 
     if args.ee == "dex1_internal" and args.motion:
         parser.error("--ee dex1_internal does not currently support --motion.")
