@@ -2184,7 +2184,7 @@ class R1_A7_ArmController:
         else:
             self.activate()
 
-    def activate(self, cancel_requested=None):
+    def activate(self, cancel_requested=None, home_head_waist=True):
         with self.lifecycle_lock:
             self.raise_if_failed()
             if self.active:
@@ -2255,7 +2255,17 @@ class R1_A7_ArmController:
                         self.msg.motor_cmd[id].kd = self.kd_high
                 self.msg.motor_cmd[id].q = self.all_motor_q[id]
             self._write_command(cancel_requested=cancel_requested)
-            self.ctrl_head_and_waist_go_home(cancel_requested=cancel_requested)
+            if home_head_waist:
+                self.head_q_target = np.zeros(2)
+                self.ctrl_head_and_waist_go_home(cancel_requested=cancel_requested)
+            else:
+                self.head_q_target = np.array(
+                    [lowstate.motor_state[id].q for id in R1_A7_JointHeadIndex],
+                    dtype=np.float64,
+                )
+                logger_mp.info(
+                    "[R1_A7_ArmController] holding live head and waist; skip go-home"
+                )
             logger_mp.info("Lock OK!")
 
             self._check_activation_cancelled(cancel_requested)

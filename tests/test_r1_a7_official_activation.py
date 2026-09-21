@@ -223,6 +223,32 @@ class R1A7OfficialActivationTest(unittest.TestCase):
         self.assertIsNone(controller.lowstate_subscriber)
         self.assertFalse(controller.publish_thread.is_alive())
 
+    def test_activate_can_hold_live_head_and_waist_instead_of_recentering(self):
+        namespace = load_r1_controller_namespace()
+        controller = namespace["R1_A7_ArmController"](deferred_activation=True)
+        controller.defer_publishing()
+        calls = []
+        original = controller.ctrl_head_and_waist_go_home
+
+        def wrapped(**kwargs):
+            calls.append(kwargs)
+            return original(duration=0.0, **kwargs)
+
+        controller.ctrl_head_and_waist_go_home = wrapped
+        controller.activate(home_head_waist=False)
+        self.assertEqual(calls, [])
+        self.assertEqual(len(FakePublisher.instances[0].writes), 1)
+        self.assertEqual(
+            FakePublisher.instances[0].writes[0],
+            [0.01 * index for index in range(35)],
+        )
+        head_indices = [member.value for member in namespace["R1_A7_JointHeadIndex"]]
+        np.testing.assert_allclose(
+            controller.head_q_target,
+            [0.01 * index for index in head_indices],
+        )
+        controller.stop()
+
     def test_relative_head_pitch_yaw_tracks_robot_joint_axes(self):
         tree = ast.parse(MAIN_PATH.read_text(encoding="utf-8"))
         function = next(
