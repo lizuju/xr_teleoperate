@@ -166,3 +166,68 @@ class EpisodeReplayPlanTests(unittest.TestCase):
         self.assertIn("no robot commands sent", process.stdout)
         self.assertNotIn("unitree_sdk2py", process.stdout)
         self.assertNotIn("Enter_Debug_Mode", process.stdout)
+
+
+def _load_replay_tool():
+    import importlib.util
+    path = ROOT / "tools/replay_r1_episode_on_robot.py"
+    spec = importlib.util.spec_from_file_location("replay_r1_episode_on_robot", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class ReplayTtyRestoreTests(unittest.TestCase):
+    def setUp(self):
+        self.replay = _load_replay_tool()
+
+    def _pty(self):
+        import os
+        import pty
+        master, slave = pty.openpty()
+        self.addCleanup(os.close, master)
+        self.addCleanup(os.close, slave)
+        return master, slave
+
+    def test_restore_tty_reenables_echo_and_canonical(self):
+        import termios
+        _, slave = self._pty()
+        snapshot = (slave, termios.tcgetattr(slave))
+        attrs = termios.tcgetattr(slave)
+        attrs[3] &= ~(termios.ECHO | termios.ICANON)
+        termios.tcsetattr(slave, termios.TCSADRAIN, attrs)
+        broken = termios.tcgetattr(slave)
+        self.assertFalse(broken[3] & termios.ECHO)
+        self.assertFalse(broken[3] & termios.ICANON)
+        self.assertTrue(self.replay.restore_tty(snapshot))
+        restored = termios.tcgetattr(slave)
+        self.assertTrue(restored[3] & termios.ECHO)
+        self.assertTrue(restored[3] & termios.ICANON)
+
+    def test_stop_keyboard_on_q_stops_listener_and_restores_tty(self):
+        import sys
+        import termios
+        from unittest import mock
+
+        _, slave = self._pty()
+        snapshot = (slave, termios.tcgetattr(slave))
+        attrs = termios.tcgetattr(slave)
+        attrs[3] &= ~(termios.ECHO | termios.ICANON)
+        termios.tcsetattr(slave, termios.TCSADRAIN, attrs)
+
+        class FakeListener:
+            def __init__(self):
+                self.joined = False
+
+            def join(self, timeout=None):
+                self.joined = True
+
+        listener = FakeListener()
+        fake_sshkeyboard = mock.Mock()
+        with mock.patch.dict(sys.modules, {"sshkeyboard": fake_sshkeyboard}):
+            self.replay.stop_keyboard(listener, snapshot)
+        fake_sshkeyboard.stop_listening.assert_called_once()
+        self.assertTrue(listener.joined)
+        restored = termios.tcgetattr(slave)
+        self.assertTrue(restored[3] & termios.ECHO)
+        self.assertTrue(restored[3] & termios.ICANON)

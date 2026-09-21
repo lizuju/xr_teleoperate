@@ -126,7 +126,33 @@ def stream_poses(arm_ctrl, hand_ctrl, poses, hz, stop):
     return True
 
 
+def snapshot_tty(stream=None):
+    stream = sys.stdin if stream is None else stream
+    if not hasattr(stream, "isatty") or not stream.isatty():
+        return None
+    import termios
+    fd = stream.fileno()
+    try:
+        return (fd, termios.tcgetattr(fd))
+    except termios.error:
+        return None
+
+
+def restore_tty(snapshot):
+    if snapshot is None:
+        return False
+    fd, attrs = snapshot
+    import termios
+    try:
+        termios.tcsetattr(fd, termios.TCSADRAIN, attrs)
+        return True
+    except termios.error:
+        return False
+
+
 def start_keyboard(stop, started):
+    snapshot = snapshot_tty()
+
     def on_press(key):
         if key in ("q", "Q"):
             stop[0] = True
@@ -140,7 +166,18 @@ def start_keyboard(stop, started):
         daemon=True,
     )
     listener.start()
-    return listener
+    return listener, snapshot
+
+
+def stop_keyboard(listener, snapshot):
+    try:
+        from sshkeyboard import stop_listening
+        stop_listening()
+    except Exception:
+        pass
+    if listener is not None:
+        listener.join(timeout=1.0)
+    restore_tty(snapshot)
 
 
 def wait_for_start(stop, started):
@@ -184,7 +221,7 @@ def run_robot(args, plan):
     hand_ctrl = LinkerO6Controller()
     stop = [False]
     started = threading.Event()
-    start_keyboard(stop, started)
+    listener, tty_snapshot = start_keyboard(stop, started)
     try:
         hand_ctrl.wait_until_ready(timeout=3.0)
         live = current_pose(arm_ctrl, hand_ctrl)
@@ -250,6 +287,7 @@ def run_robot(args, plan):
         hold_until_quit(arm_ctrl, hand_ctrl, last, stop)
         return 0
     finally:
+        stop_keyboard(listener, tty_snapshot)
         shutdown(arm_ctrl, hand_ctrl)
 
 
