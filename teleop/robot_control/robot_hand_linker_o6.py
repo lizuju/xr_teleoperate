@@ -8,17 +8,20 @@ from unitree_sdk2py.core.channel import ChannelPublisher, ChannelSubscriber
 from unitree_sdk2py.idl.default import unitree_go_msg_dds__MotorCmd_
 from unitree_sdk2py.idl.unitree_go.msg.dds_ import MotorCmds_, MotorStates_
 
+from teleop.utils.o6_grip_cap import GripCapError, clamp_close_q, limits_from_document, load_grip_cap
+
 
 STATE_TIMEOUT = 0.25
 COMMAND_TIMEOUT = 0.1
 GATE_REQUIRE_RELEASE = 0
 GATE_READY = 1
 GATE_ARMED = 2
+DEFAULT_COMMAND_TORQUE = 1.0
 logger = logging.getLogger(__name__)
 
 
 class LinkerO6Controller:
-    def __init__(self):
+    def __init__(self, grip_cap_path=None, apply_grip_cap=True):
         self.left_publisher = ChannelPublisher("rt/linker/left/cmd", MotorCmds_)
         self.left_publisher.Init()
         self.right_publisher = ChannelPublisher("rt/linker/right/cmd", MotorCmds_)
@@ -46,6 +49,10 @@ class LinkerO6Controller:
         self.ready = False
         self.active = False
         self.closed = False
+        # Operator-confirmed per-axis max normalised close q; None means uncapped.
+        self._grip_max_close = {"left": None, "right": None}
+        self._command_torque = DEFAULT_COMMAND_TORQUE
+        self._grip_cap_path = None
 
         self.left_state_error = None
         self.right_state_error = None
@@ -53,6 +60,66 @@ class LinkerO6Controller:
         self.left_subscriber.Init(self._on_left_state, 1)
         self.right_subscriber = ChannelSubscriber("rt/linker/right/state", MotorStates_)
         self.right_subscriber.Init(self._on_right_state, 1)
+        if apply_grip_cap:
+            self.load_grip_cap(grip_cap_path)
+
+    def load_grip_cap(self, path=None):
+        """Load an operator-confirmed max close. Missing file leaves hands uncapped."""
+        try:
+            document = load_grip_cap(path)
+        except GripCapError as error:
+            logger.warning("[LINKER O6 GRIP] ignoring invalid grip cap: %s", error)
+            self.clear_grip_cap()
+            return None
+        limits = limits_from_document(document)
+        self._grip_max_close = {"left": limits["left"], "right": limits["right"]}
+        torque = limits["command_torque"]
+        self._command_torque = DEFAULT_COMMAND_TORQUE if torque is None else float(torque)
+        self._grip_cap_path = str(path) if path is not None else None
+        if document is None:
+            logger.info("[LINKER O6 GRIP] no saved max close; teleop uncapped")
+        else:
+            def _fmt(limit):
+                if limit is None:
+                    return None
+                return [round(float(v), 3) for v in limit]
+
+            logger.info(
+                "[LINKER O6 GRIP] max_close_q left=%s right=%s command_torque=%.3f path=%s",
+                _fmt(self._grip_max_close["left"]),
+                _fmt(self._grip_max_close["right"]),
+                self._command_torque,
+                path if path is not None else "default",
+            )
+        return document
+
+    def clear_grip_cap(self):
+        self._grip_max_close = {"left": None, "right": None}
+        self._command_torque = DEFAULT_COMMAND_TORQUE
+        self._grip_cap_path = None
+
+    def set_grip_max_close(self, left=None, right=None, command_torque=None):
+        """Override in-memory per-axis limits (used by the cup-grip calibration tool)."""
+        for side, value in (("left", left), ("right", right)):
+            if value is None:
+                self._grip_max_close[side] = None
+            else:
+                vector = np.asarray(value, dtype=float)
+                if vector.shape == ():
+                    vector = np.full(6, float(vector), dtype=float)
+                if vector.shape != (6,):
+                    raise ValueError(f"{side} max close must contain six axes")
+                if not np.isfinite(vector).all() or np.any(vector < 0.0) or np.any(vector > 1.0):
+                    raise ValueError(f"{side} max close must be within [0, 1]")
+                self._grip_max_close[side] = vector.copy()
+        if command_torque is not None:
+            number = float(command_torque)
+            if not np.isfinite(number) or number < 0.0 or number > 1.0:
+                raise ValueError("command_torque must be within [0, 1]")
+            self._command_torque = number
+
+    def _capped_target(self, values, side):
+        return clamp_close_q(values, self._grip_max_close.get(side))
 
     @staticmethod
     def _values(values, name):
@@ -204,6 +271,8 @@ class LinkerO6Controller:
                     self.published_commands[side] = {
                         "q": [float(command.q) for command in message.cmds],
                         "mode": int(message.cmds[0].mode),
+                        "torque": float(message.cmds[0].tau),
+                        "speed": float(message.cmds[0].dq),
                         "monotonic_ns": int(time.monotonic() * 1e9),
                         "sequence": self.published_sequences[side],
                     }
@@ -264,8 +333,10 @@ class LinkerO6Controller:
     def update(self, left_target, right_target, tracking_fresh=(True, True)):
         if not self.active:
             raise RuntimeError("Linker O6 controller is not active")
-        left = self._values(left_target, "left target")
-        right = self._values(right_target, "right target")
+        # Cap the retargeted close target before the 15 ms smoother so teleop
+        # cannot command a tighter grasp than the operator saved.
+        left = self._capped_target(self._values(left_target, "left target"), "left")
+        right = self._capped_target(self._values(right_target, "right target"), "right")
         with self.state_lock:
             self.requested_targets = (left.copy(), right.copy())
         left_state, right_state, left_state_time, right_state_time, left_mode, right_mode = self._state_snapshot()
@@ -318,7 +389,8 @@ class LinkerO6Controller:
             targets.append(start + alpha * (target - start) if enabled else state)
             modes.append(1 if enabled else 0)
             release_times.append(None if enabled else (released_at if released_at is not None else now))
-        self._write_pair(*targets, modes=modes, speed=1.0, torque=1.0)
+        torque = self._command_torque
+        self._write_pair(*targets, modes=modes, speed=1.0, torque=torque)
         for side, before, after in zip(("left", "right"), self.release_times, release_times):
             if before is None and after is not None:
                 logger.info("[LINKER O6] %s: holding; automatic recovery pending", side)

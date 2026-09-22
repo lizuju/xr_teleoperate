@@ -1,12 +1,18 @@
 import importlib
+import os
 import sys
+import tempfile
 import threading
 import time
 import types
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import numpy as np
+
+# Controller defaults load ~/.config/.../o6_grip_cap.json; unit tests must not.
+_ABSENT_GRIP_CAP = Path(tempfile.gettempdir()) / "xr-o6-grip-cap-absent-for-linker-tests.json"
 
 
 class FakeMotorCmd:
@@ -121,6 +127,14 @@ class LinkerO6ControllerTest(unittest.TestCase):
         FakePublisher.instances.clear()
         FakeSubscriber.instances.clear()
         FakeSubscriber.queued_messages = {}
+        # Isolate from the operator's saved cup-grip file on the Ubuntu host.
+        self._grip_cap_env = mock.patch.dict(
+            os.environ, {"XR_O6_GRIP_CAP": str(_ABSENT_GRIP_CAP)}
+        )
+        self._grip_cap_env.start()
+
+    def tearDown(self):
+        self._grip_cap_env.stop()
 
     @staticmethod
     def queue_pair(left=None, right=None, modes=(1, 1)):
