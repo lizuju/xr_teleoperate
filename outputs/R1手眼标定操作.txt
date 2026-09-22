@@ -1,0 +1,62 @@
+R1 手眼标定（腕部 eye-in-hand + 头部相机→head_yaw_link）
+更新：2026-09-22    不启动遥操    不发臂/手运动指令    不覆盖 assets 直到你说「装上」
+
+手眼标定给出什么
+  - left_wrist / right_wrist：相机相对 left_wrist_yaw_link / right_wrist_yaw_link 的旋转+平移（米）
+  - head_left：相机相对 head_yaw_link；head_right 由已装 stereo.head 合成，保持左右一致
+  - 距离/外参由求解器算出，不用手量
+
+棋盘格（与内参同一块）
+  DFOPTIX V1 A3，横着拿（长边水平），OpenCV 内角点 9×6=54，格边 0.030 m（10×7 格）
+  不要遮住角点；不要用机器人自动回放去摆姿态
+
+怎么动
+  人自己搬手臂/转头（或已在跑的遥操里慢慢摆）。本工具只读关节、只采图，不发 lowcmd。
+  每个姿态：板在镜头里绿字 OK 且停稳 → 按空格或 s 采一对（图+关节 q）
+  目标 ≥20 个够散的姿态（拟合会留出若干做残差检查）。三路分开采：左腕、右腕、头 = 三次会话。
+
+0. 开拍前只读检查（本机图形终端，不要纯 SSH）：
+   export XDG_RUNTIME_DIR=/run/user/$(id -u)
+   systemctl --user is-active r1-camera-forward-55556.service   # 左腕
+   systemctl --user is-active r1-camera-forward-55557.service   # 右腕
+   systemctl --user is-active r1-camera-forward-55555.service   # 头 JPEG（不是 WebRTC 60001）
+   # 不要开遥操也可以采（手臂用手掰）；若遥操已在跑，不要再开第二个。
+   # 可选：已有只读 shadow 时用 --shadow-json，否则脚本自己 subscribe rt/lowstate（不发 lowcmd）。
+
+1. 左腕（端口 55556）：
+   cd /home/hnh/unitree_r1_dev/xr_teleoperate
+   /home/hnh/unitree_r1_dev/.venv-xr/bin/python tools/calibrate_r1_hand_eye_capture.py \
+     --target left_wrist --host 192.168.124.147 --pattern 9 6 --square 0.030 \
+     --out-root ~/r1-cam-calib --day 20260922
+
+2. 右腕（55557，同一天目录）：
+   /home/hnh/unitree_r1_dev/.venv-xr/bin/python tools/calibrate_r1_hand_eye_capture.py \
+     --target right_wrist --host 192.168.124.147 --pattern 9 6 --square 0.030 \
+     --out-root ~/r1-cam-calib --day 20260922
+
+3. 头部（55555，存 head_left 半幅 544×448）：
+   /home/hnh/unitree_r1_dev/.venv-xr/bin/python tools/calibrate_r1_hand_eye_capture.py \
+     --target head --host 192.168.124.147 --pattern 9 6 --square 0.030 \
+     --out-root ~/r1-cam-calib --day 20260922
+   人转头/点头换姿态；板对着头相机。
+
+按键
+  空格 或 s = 保存当前 OK 样本（图 + q）
+  q / Esc / Ctrl+C = 退出采集（不是急停；本工具从未发运动）
+
+文件落点
+  ~/r1-cam-calib/20260922/hand_eye/left_wrist/000.png + 000.json
+  ~/r1-cam-calib/20260922/hand_eye/right_wrist/...
+  ~/r1-cam-calib/20260922/hand_eye/head_left/...
+  续采不会覆盖已有编号。
+
+4. 拟合（写入当天 JSON 副本，合并 hand_eye，保留四路内参+stereo；不装 assets/）：
+   /home/hnh/unitree_r1_dev/.venv-xr/bin/python tools/calibrate_r1_hand_eye_fit.py \
+     --day-dir ~/r1-cam-calib/20260922 --target all
+
+5. 把终端全文 + ~/r1-cam-calib/20260922/camera_calibration.json 路径发回来审查。
+   只有你说「装上」才会拷到 assets/r1/camera_calibration.json。
+
+不要做
+  不要开第二次遥操；不要用回放脚本摆臂；不要用 WebRTC 60001/60002/60003。
+  不要自己 cp 到 assets/。q 不是急停。

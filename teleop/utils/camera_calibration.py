@@ -38,10 +38,124 @@ HEAD_COLOR_KEYS = ("color_0", "color_1")
 WRIST_COLOR_KEYS = {"left": "color_2", "right": "color_3"}
 
 DISTORTION_MODELS = ("plumb_bob", "rational_polynomial", "fisheye", "none")
+IMAGE_MIRROR_VALUES = ("none", "horizontal")
 
 
 class CalibrationError(ValueError):
     """Raised when a calibration file exists but cannot be trusted."""
+
+
+def _image_mirror(value, location):
+    if value is None or value == "":
+        return "none"
+    if not isinstance(value, str) or value not in IMAGE_MIRROR_VALUES:
+        raise CalibrationError(
+            f"{location}: expected one of {', '.join(IMAGE_MIRROR_VALUES)}, got {value!r}"
+        )
+    return value
+
+
+def resolve_image_mirror(camera_entry=None, hand_eye_entry=None):
+    """Return how raw pixels relate to the hand-eye optical frame.
+
+    ``hand_eye`` wins when both are set. Missing fields mean ``none`` so older
+    calibration files keep loading unchanged.
+    """
+    for entry, label in ((hand_eye_entry, "hand_eye"), (camera_entry, "camera")):
+        if isinstance(entry, dict) and "image_mirror" in entry:
+            return _image_mirror(entry.get("image_mirror"), f"{label}.image_mirror")
+    return "none"
+
+
+def horizontal_unmirror_intrinsics(camera_matrix, distortion_coefficients, distortion_model, width):
+    """Map plumb_bob / rational intrinsics into the horizontally unmirrored frame."""
+    K = np.asarray(camera_matrix, dtype=float).reshape(3, 3).copy()
+    K[0, 2] = float(width - 1) - float(K[0, 2])
+    D = np.asarray(distortion_coefficients, dtype=float).reshape(-1).copy()
+    if distortion_model in ("plumb_bob", "rational_polynomial") and D.size >= 3:
+        # Tangential p1 flips sign under a horizontal image reflection.
+        D[2] = -D[2]
+    return K, D
+
+
+def prepare_image_for_hand_eye(image, camera_entry, hand_eye_entry=None):
+    """Return ``(image, K, D, model)`` in the optical frame of ``hand_eye``.
+
+    Wrist UVC streams are horizontally mirrored. Hand-eye extrinsics are solved
+    after one H-unmirror; this helper applies that unmirror at most once so
+    callers never sprinkle ``cv2.flip`` across teleop. Head cameras pass through.
+    """
+    import cv2
+
+    if not isinstance(camera_entry, dict):
+        raise CalibrationError("camera_entry: expected an object")
+    image = np.asarray(image)
+    if image.ndim < 2:
+        raise CalibrationError("prepare_image_for_hand_eye expects an image array")
+    height, width = image.shape[:2]
+    expected = camera_entry.get("image_size")
+    if expected is not None and [int(expected[0]), int(expected[1])] != [int(width), int(height)]:
+        raise CalibrationError(
+            f"image size {width}x{height} does not match calibration "
+            f"{int(expected[0])}x{int(expected[1])}"
+        )
+    K = np.asarray(camera_entry["camera_matrix"], dtype=float).reshape(3, 3)
+    D = np.asarray(camera_entry.get("distortion_coefficients", []), dtype=float).reshape(-1)
+    model = camera_entry.get("distortion_model", "plumb_bob")
+    if resolve_image_mirror(camera_entry, hand_eye_entry) == "horizontal":
+        image = cv2.flip(image, 1)
+        K, D = horizontal_unmirror_intrinsics(K, D, model, width)
+    return image, K, D, model
+
+
+def project_link_points_to_pixels(points_link, hand_eye_entry, camera_entry):
+    """Project link-frame points into **raw** image pixel coordinates.
+
+    Uses ``hand_eye`` cam→frame plus camera intrinsics. When ``image_mirror`` is
+    ``horizontal``, the mirror is applied exactly once inside this helper: callers
+    pass raw wrist JPEGs and draw the returned pixels directly — no manual flip.
+    """
+    import cv2
+
+    if not isinstance(hand_eye_entry, dict):
+        raise CalibrationError("hand_eye_entry: expected an object")
+    if not isinstance(camera_entry, dict):
+        raise CalibrationError("camera_entry: expected an object")
+    points = np.asarray(points_link, dtype=float).reshape(-1, 3)
+    R = np.asarray(hand_eye_entry["rotation"], dtype=float).reshape(3, 3)
+    t = np.asarray(hand_eye_entry["translation_m"], dtype=float).reshape(3)
+    # P_frame = R @ P_cam + t  =>  P_cam = R.T @ (P_frame - t)
+    points_cam = (R.T @ (points - t).T).T
+    K = np.asarray(camera_entry["camera_matrix"], dtype=float).reshape(3, 3)
+    D = np.asarray(camera_entry.get("distortion_coefficients", []), dtype=float).reshape(-1)
+    model = camera_entry.get("distortion_model", "plumb_bob")
+    width = int(camera_entry["image_size"][0])
+    mirror = resolve_image_mirror(camera_entry, hand_eye_entry) == "horizontal"
+    if mirror:
+        K_use, D_use = horizontal_unmirror_intrinsics(K, D, model, width)
+    else:
+        K_use, D_use = K, D
+    object_points = np.asarray(points_cam, dtype=np.float64).reshape(-1, 1, 3)
+    rvec = np.zeros((3, 1), dtype=np.float64)
+    tvec = np.zeros((3, 1), dtype=np.float64)
+    if model == "fisheye":
+        D4 = np.zeros((4, 1), dtype=np.float64)
+        D4[: min(4, D_use.size), 0] = np.asarray(D_use, dtype=np.float64).reshape(-1)[:4]
+        projected, _ = cv2.fisheye.projectPoints(object_points, rvec, tvec, K_use, D4)
+    elif model in ("plumb_bob", "rational_polynomial", "none"):
+        dist = (
+            np.asarray(D_use, dtype=np.float64).reshape(-1)
+            if model != "none"
+            else np.zeros(5, dtype=np.float64)
+        )
+        projected, _ = cv2.projectPoints(object_points, rvec, tvec, K_use, dist)
+    else:
+        raise CalibrationError(f"unsupported distortion_model {model!r}")
+    pixels = np.asarray(projected, dtype=float).reshape(-1, 2)
+    if mirror:
+        pixels = pixels.copy()
+        pixels[:, 0] = float(width - 1) - pixels[:, 0]
+    return pixels
 
 
 def _finite_number(value, location):
@@ -106,14 +220,17 @@ def _camera_entry(name, entry, location):
         "distortion_model": model,
         "distortion_coefficients": coefficients,
     }
-    for optional in ("reprojection_error_px", "calibration_frame"):
-        if optional in entry:
-            if optional == "calibration_frame":
-                if not isinstance(entry[optional], str) or not entry[optional]:
-                    raise CalibrationError(f"{location}.{optional}: expected a non-empty string")
-                result[optional] = entry[optional]
-            else:
-                result[optional] = _finite_number(entry[optional], f"{location}.{optional}")
+    for optional in ("reprojection_error_px", "calibration_frame", "image_mirror"):
+        if optional not in entry:
+            continue
+        if optional == "calibration_frame":
+            if not isinstance(entry[optional], str) or not entry[optional]:
+                raise CalibrationError(f"{location}.{optional}: expected a non-empty string")
+            result[optional] = entry[optional]
+        elif optional == "image_mirror":
+            result[optional] = _image_mirror(entry[optional], f"{location}.image_mirror")
+        else:
+            result[optional] = _finite_number(entry[optional], f"{location}.{optional}")
     if "rectification_matrix" in entry:
         result["rectification_matrix"] = _matrix(
             entry["rectification_matrix"], f"{location}.rectification_matrix", 3, 3)
@@ -161,6 +278,11 @@ def _hand_eye_entry(name, entry, location, cameras):
     for optional in ("rotation_rms_deg", "translation_rms_m"):
         if optional in entry:
             result[optional] = _finite_number(entry[optional], f"{location}.{optional}")
+    if "image_mirror" in entry:
+        # Wrist hand-eye is solved after one H-unmirror of the raw UVC frame.
+        # Consumers must use prepare_image_for_hand_eye / project_link_points_to_pixels
+        # rather than flipping at every call site.
+        result["image_mirror"] = _image_mirror(entry["image_mirror"], f"{location}.image_mirror")
     return result
 
 

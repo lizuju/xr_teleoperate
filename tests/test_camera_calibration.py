@@ -146,6 +146,23 @@ class CalibrationFileTest(unittest.TestCase):
         broken["hand_eye"]["left_wrist"]["frame"] = ""
         self.assertRejected(broken, "expected the robot link")
 
+    def test_image_mirror_optional_and_validated(self):
+        plain = document()
+        loaded = load_camera_calibration(self.write(plain))
+        self.assertNotIn("image_mirror", loaded["cameras"]["left_wrist"])
+        self.assertNotIn("image_mirror", loaded["hand_eye"]["left_wrist"])
+
+        mirrored = document()
+        mirrored["cameras"]["left_wrist"]["image_mirror"] = "horizontal"
+        mirrored["hand_eye"]["left_wrist"]["image_mirror"] = "horizontal"
+        loaded = load_camera_calibration(self.write(mirrored))
+        self.assertEqual(loaded["cameras"]["left_wrist"]["image_mirror"], "horizontal")
+        self.assertEqual(loaded["hand_eye"]["left_wrist"]["image_mirror"], "horizontal")
+
+        broken = document()
+        broken["hand_eye"]["left_wrist"]["image_mirror"] = "vertical"
+        self.assertRejected(broken, "image_mirror")
+
     def test_board_geometry_is_checked(self):
         broken = document()
         broken["board"] = {"type": "charuco", "squares_x": 10, "squares_y": 7, "square_size_m": 0.030,

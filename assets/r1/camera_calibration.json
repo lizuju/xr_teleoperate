@@ -1,7 +1,7 @@
 {
   "schema": "r1_camera_calibration_v1",
-  "created": "2026-09-20",
-  "note": "DFOPTIX A3 10x7 squares, OpenCV (9,6) inner, 0.030 m; head fisheye @ 544x448; head stereo preserved; left_wrist, right_wrist plumb_bob @ 640x480",
+  "created": "2026-09-22",
+  "note": "DFOPTIX A3 10x7 squares, OpenCV (9,6) inner, 0.030 m; head fisheye @ 544x448; head stereo preserved; left_wrist, right_wrist plumb_bob @ 640x480; hand_eye eye-in-hand (wrist\u2192wrist_yaw_link solved after H-unmirror; image_mirror=horizontal \u2014 use prepare_image_for_hand_eye / project_link_points_to_pixels on raw wrist JPEGs; head\u2192head_yaw_link, no mirror)",
   "board": {
     "type": "checkerboard",
     "squares_x": 9,
@@ -101,7 +101,8 @@
         0.0007704198031986331,
         0.01090156317290466
       ],
-      "reprojection_error_px": 0.16537294171021621
+      "reprojection_error_px": 0.16537294171021621,
+      "image_mirror": "horizontal"
     },
     "right_wrist": {
       "image_size": [
@@ -133,7 +134,8 @@
         0.00265090939676306,
         -0.024012376231223386
       ],
-      "reprojection_error_px": 0.15826237053415992
+      "reprojection_error_px": 0.15826237053415992,
+      "image_mirror": "horizontal"
     }
   },
   "stereo": {
@@ -164,6 +166,122 @@
       ],
       "baseline_m": 0.05909586729503002,
       "epipolar_error_px": 0.2804857951612574
+    }
+  },
+  "hand_eye": {
+    "left_wrist": {
+      "camera": "left_wrist",
+      "frame": "left_wrist_yaw_link",
+      "rotation": [
+        [
+          0.07527333147523452,
+          -0.31773088798374644,
+          0.9451883454580252
+        ],
+        [
+          0.08364622158299022,
+          -0.9425248083619635,
+          -0.3234969787140728
+        ],
+        [
+          0.9936484464756681,
+          0.10341212909182326,
+          -0.044369994063413465
+        ]
+      ],
+      "translation_m": [
+        0.05901569517248163,
+        -0.01058941103796042,
+        -0.02592002083346801
+      ],
+      "rotation_rms_deg": 3.2731237164940525,
+      "translation_rms_m": 0.02457096963825904,
+      "image_mirror": "horizontal"
+    },
+    "right_wrist": {
+      "camera": "right_wrist",
+      "frame": "right_wrist_yaw_link",
+      "rotation": [
+        [
+          0.026602690312924615,
+          -0.17129208816027552,
+          0.9848610650248121
+        ],
+        [
+          -0.009711394119167743,
+          0.9851189680775976,
+          0.17159926444478615
+        ],
+        [
+          -0.9995989124105612,
+          -0.014129376045029535,
+          0.02454332985153651
+        ]
+      ],
+      "translation_m": [
+        0.05667234463226966,
+        0.020505196146020904,
+        0.04638948256183617
+      ],
+      "rotation_rms_deg": 2.21206000577341,
+      "translation_rms_m": 0.017483772480948095,
+      "image_mirror": "horizontal"
+    },
+    "head_left": {
+      "camera": "head_left",
+      "frame": "head_yaw_link",
+      "rotation": [
+        [
+          0.03760558230758093,
+          -0.3729302353306551,
+          0.9270970066587044
+        ],
+        [
+          -0.9989608473475062,
+          0.009876726670289049,
+          0.044493547139248135
+        ],
+        [
+          -0.025749672736946727,
+          -0.9278068170942173,
+          -0.3721712838296871
+        ]
+      ],
+      "translation_m": [
+        0.06513638243073637,
+        0.0413202958002386,
+        -0.019471294856720937
+      ],
+      "rotation_rms_deg": 2.9135347289408053,
+      "translation_rms_m": 0.02375798384192328
+    },
+    "head_right": {
+      "camera": "head_right",
+      "frame": "head_yaw_link",
+      "rotation": [
+        [
+          0.013253882876515672,
+          -0.3763569409007416,
+          0.9263799369721536
+        ],
+        [
+          -0.9997399352294416,
+          0.012206938065856139,
+          0.019262724897801002
+        ],
+        [
+          -0.018557922732019883,
+          -0.926394324086073,
+          -0.3760972743918523
+        ]
+      ],
+      "translation_m": [
+        0.06375613021648986,
+        0.10038601826503098,
+        -0.018184102218074216
+      ],
+      "rotation_rms_deg": 2.9135347289408053,
+      "translation_rms_m": 0.02375798384192328
     }
   }
 }
