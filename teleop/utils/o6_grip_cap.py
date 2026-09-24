@@ -267,6 +267,51 @@ def build_document(
     }
 
 
+def merge_grip_cap_document(existing, incoming):
+    """Merge ``incoming`` side entries into ``existing`` without dropping the other hand.
+
+    Calibrator one-side saves must not wipe a previously recorded opposite hand.
+    Incoming sides overwrite matching keys; other existing sides are kept intact
+    (including ``tau_est_at_save`` / ``q`` metadata). When both hands are present
+    after the merge, ``apply_to`` becomes ``both`` so teleop caps each present side.
+    """
+    incoming_v = validate_document(incoming)
+    if existing is None:
+        return incoming_v
+    existing_v = validate_document(existing)
+    merged_sides = {}
+    for side in SIDES:
+        if side in existing_v["sides"]:
+            merged_sides[side] = dict(existing_v["sides"][side])
+    for side, entry in incoming_v["sides"].items():
+        merged_sides[side] = dict(entry)
+    if "left" in merged_sides and "right" in merged_sides:
+        apply_to = "both"
+    elif "left" in merged_sides:
+        apply_to = "left"
+    else:
+        apply_to = "right"
+    cup = incoming_v.get("cup_mouth_diameter_cm")
+    if cup is None:
+        cup = existing_v.get("cup_mouth_diameter_cm")
+    command_torque = incoming_v.get("command_torque")
+    if command_torque is None:
+        command_torque = existing_v.get("command_torque")
+    return {
+        "schema": SCHEMA,
+        "quantity": QUANTITY,
+        "units": incoming_v.get("units") or existing_v.get("units") or "normalized_q_0_to_1",
+        "axis_names": list(AXIS_NAMES),
+        "cup_mouth_diameter_cm": cup,
+        "apply_to": apply_to,
+        "command_torque": command_torque,
+        "sides": merged_sides,
+        "recorded_at": incoming_v.get("recorded_at") or existing_v.get("recorded_at"),
+        "notes": incoming_v.get("notes") or existing_v.get("notes"),
+        "migrated_from": existing_v.get("migrated_from"),
+    }
+
+
 def save_grip_cap(document, path=None):
     """Atomically write a validated grip-cap document. Returns the path used."""
     validated = validate_document(document)

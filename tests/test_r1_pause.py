@@ -117,6 +117,28 @@ class R1PauseControlIntegrationTest(unittest.TestCase):
         self.sample.motion_data_timestamp = now
         execute(self.nodes, self.ns, loop=True)
 
+    def test_native_head_loss_pauses_until_explicit_resume_and_realigns(self):
+        source = SimpleNamespace(needs_realign=True)
+        source.consume_realign_required = lambda: setattr(source, "needs_realign", False)
+        self.ns["visionpro_source"] = source
+        self.tick(1.0)
+        self.assertTrue(self.state.paused)
+        self.assertEqual(self.requested, self.published)
+        self.assertFalse(source.needs_realign)
+        self.sample.head_pose = pose(1.2, [0.3, -0.2, 1.7])
+        self.sample.left_wrist_pose = pose(1.3, [1.1, 0.8, 0.9])
+        for now in (1.1, 1.2, 1.3):
+            self.tick(now)
+        self.assertTrue(self.state.paused)
+        self.ns["arm_ik"].solve_ik.assert_not_called()
+        self.state.request_resume(1.3)
+        for index in range(1, 6):
+            self.tick(1.3 + index * .1)
+        self.assertFalse(self.state.paused)
+        self.tick(1.9)
+        for target, expected in zip(self.ns["arm_ik"].solve_ik.call_args.args[:2], self.robot_poses):
+            np.testing.assert_allclose(target, expected, atol=1e-12)
+
     def test_pause_freezes_last_published_step_instead_of_far_requested_target(self):
         self.state.pause()
         self.tick(1.0)
@@ -143,6 +165,8 @@ class R1PauseControlIntegrationTest(unittest.TestCase):
         self.assertGreaterEqual(self.ns["arm_ctrl"].hold_targets.call_count, 10)
 
     def test_stable_resume_realigns_without_recenter_or_jump_to_old_reference(self):
+        for workspace in self.ns["wrist_workspaces"]:
+            workspace.offset[:] = [-0.2, 0.03, 0.0]
         self.state.pause()
         self.tick(1.0)
         self.sample.left_wrist_pose = pose(1.3, [1.1, 0.8, 0.9])
@@ -152,6 +176,8 @@ class R1PauseControlIntegrationTest(unittest.TestCase):
         for index in range(1, 6):
             self.tick(1.0 + index * 0.1)
         self.assertFalse(self.state.paused)
+        for workspace in self.ns["wrist_workspaces"]:
+            np.testing.assert_array_equal(workspace.offset, np.zeros(3))
         self.ns["arm_ik"].solve_ik.assert_not_called()
         np.testing.assert_allclose(
             self.ns["arm_ik"].reset_smoothing.call_args.kwargs["reference_q"], self.published["arm_q"],
@@ -164,7 +190,27 @@ class R1PauseControlIntegrationTest(unittest.TestCase):
         self.ns["arm_ctrl"].activate.assert_not_called()
         self.ns["arm_ctrl"].ctrl_head_and_waist_go_home.assert_not_called()
 
+    def test_native_head_loss_during_ik_discards_unpublished_solution(self):
+        source = SimpleNamespace(needs_realign=False)
+        source.consume_realign_required = lambda: setattr(source, "needs_realign", False)
+        self.ns["visionpro_source"] = source
+        def interrupted_ik(*args, **kwargs):
+            source.needs_realign = True
+            return np.ones(14), np.ones(14)
+        self.ns["arm_ik"].solve_ik.side_effect = interrupted_ik
+        self.tick(1.0)
+        self.assertTrue(self.state.paused)
+        self.assertEqual(self.requested, self.published)
+        self.assertEqual(self.ns["capture_mode"], "paused")
+
     def test_pause_during_ik_discards_unpublished_solution(self):
+        workspace = self.ns["wrist_workspaces"][0]
+        extended = self.sample.left_wrist_pose.copy()
+        extended[0, 3] += 0.2
+        workspace.observe(extended, self.sample.left_wrist_pose)
+        offset = workspace.offset.copy()
+        self.sample.left_wrist_pose = extended.copy()
+        self.sample.left_wrist_pose[0, 3] -= 0.005
         def delayed_ik(*args, **kwargs):
             self.state.pause()
             return np.ones(14), np.ones(14)
@@ -174,6 +220,7 @@ class R1PauseControlIntegrationTest(unittest.TestCase):
         self.assertEqual(self.requested, self.published)
         self.assertEqual(self.ns["capture_mode"], "paused")
         self.assertTrue(self.ns["completed"])
+        np.testing.assert_array_equal(workspace.offset, offset)
 
     def test_waist_follow_resume_preserves_fixed_ik_frame_and_held_head(self):
         self.ns["args"].waist_follow = True

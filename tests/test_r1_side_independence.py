@@ -13,6 +13,7 @@ from scipy.spatial.transform import Rotation
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from teleop.robot_control.r1_hand_tracking import R1WristHold, hand_tracking_freshness, hand_tracking_present
+from teleop.robot_control.r1_wrist_workspace import R1WristWorkspace
 
 MAIN = Path(__file__).resolve().parents[1] / "teleop/teleop_hand_and_arm.py"
 
@@ -66,6 +67,7 @@ class SideIndependenceTest(unittest.TestCase):
 
         ns = {
             "np": np, "math": math, "STOP": False, "completed": False,
+            "visionpro_source": None,
             "R1_PAUSE": None, "r1_frozen_generation": -1, "r1_head_q_offset": np.zeros(2),
             "args": SimpleNamespace(
                 waist_follow=False, ee=None, input_mode="hand", motion=False,
@@ -87,6 +89,8 @@ class SideIndependenceTest(unittest.TestCase):
             "r1_robot_right_reference": pose(0.0, [0.35, -0.22, 0.78]),
             "wrist_holds": (R1WristHold(pose(0.0, [0.4, 0.2, 0.8])),
                             R1WristHold(pose(0.0, [0.35, -0.22, 0.78]))),
+            "wrist_workspaces": (R1WristWorkspace(sample.left_wrist_pose),
+                                 R1WristWorkspace(sample.right_wrist_pose)),
             "hand_tracking_freshness": hand_tracking_freshness,
             "hand_tracking_present": hand_tracking_present,
             "held_head_q_target": np.array([0.1, 0.2]),
@@ -151,4 +155,3 @@ class ReadinessFlagTest(unittest.TestCase):
         condition = ast.unparse(ready_guard[0].test)
         self.assertIn("any(", condition)
         self.assertNotIn("all(", condition)
-

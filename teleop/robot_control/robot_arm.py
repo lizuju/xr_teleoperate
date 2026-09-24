@@ -2,6 +2,7 @@ import numpy as np
 import threading
 import time
 from enum import IntEnum
+from collections import deque
 
 from unitree_sdk2py.core.channel import ChannelPublisher, ChannelSubscriber, ChannelFactoryInitialize # dds
 from unitree_sdk2py.idl.unitree_hg.msg.dds_ import ( LowCmd_  as hg_LowCmd, LowState_ as hg_LowState) # idl for g1, h1_2
@@ -66,6 +67,8 @@ class R1_A7_LowState:
         self.mode_machine = mode_machine
         self.sequence = sequence
         self.monotonic_timestamp = monotonic_timestamp
+        self.tick = None
+        self.imu = None
 
 
 class DataBuffer:
@@ -2172,6 +2175,8 @@ class R1_A7_ArmController:
         self.subscribe_running = True
         self.active = False
         self.lowstate_sequence = 0
+        self.recording_history = deque(maxlen=1024)
+        self.recording_lock = threading.Lock()
         self.lowstate_buffer = DataBuffer()
         self.lowstate_sub_ready = False
         self.lowstate_subscriber = ChannelSubscriber(kTopicLowState, hg_LowState)
@@ -2341,6 +2346,18 @@ class R1_A7_ArmController:
             # the subscription and timed out ArmController startup.
             # getattr keeps that thread alive on SDK builds without the field.
             lowstate.motor_state[id].tau = getattr(msg.motor_state[id], "tau_est", 0.0)
+        lowstate.tick = int(msg.tick)
+        lowstate.imu = {
+            name: [float(value) for value in getattr(msg.imu_state, name)]
+            for name in ("quaternion", "gyroscope", "accelerometer", "rpy")
+        }
+        lowstate.imu["temperature"] = int(msg.imu_state.temperature)
+        lowstate.imu["valid"] = bool(
+            0.9 <= np.linalg.norm(lowstate.imu["quaternion"]) <= 1.1
+            and all(np.isfinite(lowstate.imu[name]).all()
+                    for name in ("quaternion", "gyroscope", "accelerometer", "rpy")))
+        with self.recording_lock:
+            self.recording_history.append(lowstate)
         self.lowstate_buffer.SetData(lowstate)
         self.lowstate_sub_ready = True
 
@@ -2631,14 +2648,41 @@ class R1_A7_ArmController:
                 "waist_q": float(self.msg.motor_cmd[R1_A7_JointIndex.kWaistYaw].q),
             }
 
+    @staticmethod
+    def _recording_state(lowstate):
+        measured_torque = [lowstate.motor_state[i].tau for i in R1_A7_JointArmIndex]
+        return {
+            "monotonic_ns": int(lowstate.monotonic_timestamp * 1e9),
+            "sequence": lowstate.sequence,
+            "tick": lowstate.tick,
+            "imu": {key: value[:] if isinstance(value, list) else value
+                    for key, value in lowstate.imu.items()},
+            "q": [float(lowstate.motor_state[i].q) for i in R1_A7_JointArmIndex],
+            "dq": [float(lowstate.motor_state[i].dq) for i in R1_A7_JointArmIndex],
+            "tau": (None if any(value is None for value in measured_torque)
+                    else [float(value) for value in measured_torque]),
+            "head_q": [float(lowstate.motor_state[i].q) for i in R1_A7_JointHeadIndex],
+            "waist_q": float(lowstate.motor_state[R1_A7_JointIndex.kWaistYaw].q),
+        }
+
+    def get_recording_samples(self, target_ns, since_sequence, end_ns):
+        with self.recording_lock:
+            history = [entry for entry in self.recording_history
+                       if int(entry.monotonic_timestamp * 1e9) <= end_ns]
+        if not history:
+            return {"nearest": None, "imu_packets": [], "dropped": 0}
+        nearest = min(history, key=lambda entry: abs(int(entry.monotonic_timestamp * 1e9) - target_ns))
+        pending = history[-1:] if since_sequence is None else [
+            entry for entry in history if entry.sequence > since_sequence]
+        packets = [{"monotonic_ns": int(entry.monotonic_timestamp * 1e9),
+                    "sequence": entry.sequence, "tick": entry.tick, **entry.imu}
+                   for entry in pending]
+        dropped = (max(0, pending[0].sequence - since_sequence - 1)
+                   if since_sequence is not None and pending else 0)
+        return {"nearest": self._recording_state(nearest), "imu_packets": packets, "dropped": dropped}
+
     def get_recording_snapshot(self):
         lowstate = self._get_fresh_lowstate()
-        # Measured joint torque (`tau_est`). Recorded so an episode carries what
-        # the joints actually exerted next to the torque the controller asked
-        # for, which is what separates "the command was ineffective" from "the
-        # command was never reachable". A None would mean the DDS build has no
-        # torque field; report that as absent rather than as a zero reading.
-        measured_torque = [lowstate.motor_state[i].tau for i in R1_A7_JointArmIndex]
         with self.ctrl_lock:
             requested = {
                 "arm_q": self.q_target.tolist(),
@@ -2652,16 +2696,7 @@ class R1_A7_ArmController:
                 for key, value in self.published_command.items()
             }
         return {
-            "state": {
-                "monotonic_ns": int(lowstate.monotonic_timestamp * 1e9),
-                "sequence": lowstate.sequence,
-                "q": [float(lowstate.motor_state[i].q) for i in R1_A7_JointArmIndex],
-                "dq": [float(lowstate.motor_state[i].dq) for i in R1_A7_JointArmIndex],
-                "tau": (None if any(value is None for value in measured_torque)
-                        else [float(value) for value in measured_torque]),
-                "head_q": [float(lowstate.motor_state[i].q) for i in R1_A7_JointHeadIndex],
-                "waist_q": float(lowstate.motor_state[R1_A7_JointIndex.kWaistYaw].q),
-            },
+            "state": self._recording_state(lowstate),
             "requested": requested,
             "published": published,
         }

@@ -2,6 +2,7 @@ import logging
 import math
 import threading
 import time
+from collections import deque
 
 import numpy as np
 from unitree_sdk2py.core.channel import ChannelPublisher, ChannelSubscriber
@@ -28,6 +29,7 @@ class LinkerO6Controller:
         self.right_publisher.Init()
 
         self.state_lock = threading.Lock()
+        self.recording_history = {side: deque(maxlen=256) for side in ("left", "right")}
         self.left_state = None
         self.right_state = None
         self.left_state_count = 0
@@ -190,6 +192,10 @@ class LinkerO6Controller:
             self.left_state_time = now
             self.left_state_error = None
             count = self.left_state_count
+            self.recording_history["left"].append({
+                "q": state.tolist(), "monotonic_ns": int(now * 1e9),
+                "sequence": count, "mode": gate_mode, **aux,
+            })
         if gap is not None and gap >= STATE_TIMEOUT:
             logger.warning("[LINKER O6 FEEDBACK] left: callback gap_ms=%.1f count=%d gate=%d", gap * 1000, count, gate_mode)
 
@@ -210,6 +216,10 @@ class LinkerO6Controller:
             self.right_state_time = now
             self.right_state_error = None
             count = self.right_state_count
+            self.recording_history["right"].append({
+                "q": state.tolist(), "monotonic_ns": int(now * 1e9),
+                "sequence": count, "mode": gate_mode, **aux,
+            })
         if gap is not None and gap >= STATE_TIMEOUT:
             logger.warning("[LINKER O6 FEEDBACK] right: callback gap_ms=%.1f count=%d gate=%d", gap * 1000, count, gate_mode)
 
@@ -411,6 +421,12 @@ class LinkerO6Controller:
         if self.left_action is None or self.right_action is None:
             raise RuntimeError("Linker O6 action is not ready")
         return self.left_action.copy(), self.right_action.copy()
+
+    def get_recording_states_at(self, target_ns, end_ns):
+        with self.state_lock:
+            return {side: min((entry for entry in entries if entry["monotonic_ns"] <= end_ns),
+                              key=lambda entry: abs(entry["monotonic_ns"] - target_ns), default=None)
+                    for side, entries in self.recording_history.items()}
 
     def get_recording_snapshot(self):
         with self.state_lock:

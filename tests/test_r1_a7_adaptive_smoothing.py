@@ -57,6 +57,13 @@ class R1A7AdaptiveSmoothingTest(unittest.TestCase):
         np.testing.assert_array_equal(output[:7], measured[:7])
         self.assertTrue(np.all(output[7:] > previous[7:]))
 
+    def test_workspace_solution_is_independent_of_filter_and_feedback_lag(self):
+        output = self.solve(1.0, np.zeros(14))
+        np.testing.assert_array_equal(output, np.zeros(14))
+        np.testing.assert_array_equal(self.ik.last_raw_q, self.target)
+        output[:] = -1.0
+        np.testing.assert_array_equal(self.ik.last_raw_q, self.target)
+
     def test_long_pause_reseeds_both_arms_from_measured_angles(self):
         self.solve(1.0, np.zeros(14))
         self.solve(1.0 + 1 / 30.0, np.zeros(14))

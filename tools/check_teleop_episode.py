@@ -3,9 +3,12 @@ import argparse
 from collections import Counter
 import json
 import math
+import os
+import sys
 from pathlib import Path
 
 import cv2
+import numpy as np
 
 
 SOURCE_NAMES = ("image", "xr", "left_hand_tracking", "right_hand_tracking", "robot",
@@ -51,6 +54,68 @@ def episode_file(directory, relative):
     return path
 
 
+TRAINING_GROUPS = {"left_arm": 7, "right_arm": 7, "left_ee": 6, "right_ee": 6, "body": 3}
+TRAINING_CAMERAS = {"color_0": "head_left", "color_1": "head_right",
+                    "color_2": "left_wrist", "color_3": "right_wrist"}
+
+
+def training_frame_rejections(frame, info):
+    """Vision/joint BC policy. IMU validity and IMU packet gaps are not inputs."""
+    if info.get("robot") != "R1_A7" or info.get("end_effector") != "linker_o6":
+        return ["unsupported_robot"]
+    sample = frame.get("sample") or {}
+    reasons = []
+    if sample.get("mode") != "following":
+        reasons.append("not_following")
+    now = sample.get("monotonic_ns")
+    if type(now) is not int or now <= 0:
+        return reasons + ["invalid_time"]
+    sources = sample.get("sources") or {}
+    for names, limit_ms, reason in (
+        (("xr", "left_hand_tracking", "right_hand_tracking"), 100, "tracking_stale"),
+        (("robot", "left_hand_feedback", "right_hand_feedback"), 250, "feedback_stale"),
+        (("image", "left_wrist_image", "right_wrist_image"), 500, "image_stale"),
+    ):
+        for name in names:
+            entry = sources.get(name) or {}
+            stamp = entry.get("received_monotonic_ns")
+            if (entry.get("fresh") is not True or type(stamp) is not int
+                    or not 0 < stamp <= now or now - stamp > limit_ms * 1_000_000):
+                reasons.append(reason)
+                break
+    if any(not (frame.get("colors") or {}).get(key) for key in TRAINING_CAMERAS):
+        reasons.append("image_missing")
+    alignment = sample.get("camera_alignment") or {}
+    if alignment.get("aligned") is not True:
+        reasons.append("cameras_unaligned")
+    sensor = sample.get("sensor_alignment") or {}
+    if info.get("sensor_sync") is not None or sensor:
+        if not all(sensor.get(key) is True for key in ("clock_valid", "stereo_aligned", "feedback_aligned")):
+            reasons.append("sensor_unaligned")
+    commands = sample.get("commands") or {}
+    arm = commands.get("arm") or {}
+    hands = (commands.get("hands") or {}).get("published") or {}
+    for command in [arm.get("published"), hands.get("left"), hands.get("right")]:
+        stamp = (command or {}).get("monotonic_ns")
+        if type(stamp) is not int or not 0 <= now - stamp <= 250_000_000:
+            reasons.append("command_inactive")
+            break
+    if any((hands.get(side) or {}).get("mode") != 1 for side in ("left", "right")):
+        if "command_inactive" not in reasons:
+            reasons.append("command_inactive")
+    stamp = (arm.get("requested") or {}).get("monotonic_ns")
+    if type(stamp) is not int or not 0 <= now - stamp <= 250_000_000:
+        reasons.append("request_stale")
+    for field in ("states", "actions"):
+        for group, size in TRAINING_GROUPS.items():
+            values = ((frame.get(field) or {}).get(group) or {}).get("qpos")
+            if (not isinstance(values, list) or len(values) != size
+                    or any(type(v) not in (int, float) or not math.isfinite(v) for v in values)):
+                reasons.append("invalid_" + field)
+                break
+    return reasons
+
+
 def validate_episode(path):
     directory = episode_directory(path)
     report = {"episode": str(directory), "valid": False, "trainable": False, "errors": [],
@@ -60,9 +125,16 @@ def validate_episode(path):
               "command_inactive_frames": 0, "absent_image_frames": 0,
               "measured_torque_frames": 0, "calibration_status": None,
               "camera_alignment_frames": 0, "unaligned_frames": 0,
+              "imu_packets": 0, "imu_dropped_packets": 0,
+              "sensor_sync_frames": 0, "synchronized_following_frames": 0,
+              "imu_invalid_frames": 0, "synchronized_with_imu_frames": 0,
+              "tf_frames": 0, "tf_valid_frames": 0, "tf_aligned_frames": 0,
               "image_reuse": {}, "reused_image_references": 0,
               "repeated_flag_mismatches": 0, "unreferenced_image_files": 0,
-              "sources": {}, "sampling": {}}
+              "sources": {}, "sampling": {},
+              "training_no_imu": {"policy": "r1_vision_joint_bc_v1", "imu_used": False,
+                                  "eligible_frames": 0, "excluded_counts": {}, "segments": [],
+                                  "sampling_gap_boundaries": 0}}
 
     def error(message):
         report["error_count"] += 1
@@ -220,6 +292,7 @@ def validate_episode(path):
         error(f"manifest.frames: {exc}")
         return report
 
+    previous_imu_sequence = None
     previous = {}
     modes = Counter()
     skew_samples = []
@@ -234,6 +307,10 @@ def validate_episode(path):
     dedup_aware = isinstance((manifest.get("info") or {}).get("image_storage"), dict)
     previous_image_paths = {}
     image_files = {}
+    decoded_sizes = {}
+    training_exclusions = Counter()
+    training_previous_ns = None
+    training_previous_idx = None
     with stream:
         for line_number, line in enumerate(stream, 1):
             label = f"line {line_number}"
@@ -278,12 +355,14 @@ def validate_episode(path):
                     image_path = episode_file(directory, relative)
                     if not image_path.is_file():
                         raise ValueError("image does not exist")
-                    pixels = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
-                    if pixels is None:
-                        raise ValueError("image cannot be decoded")
+                    if image_path not in decoded_sizes:
+                        pixels = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+                        if pixels is None:
+                            raise ValueError("image cannot be decoded")
+                        decoded_sizes[image_path] = (pixels.shape[1], pixels.shape[0])
                     expected = (spec["width"], spec["height"]) if spec else size
-                    if expected and (pixels.shape[1], pixels.shape[0]) != expected:
-                        raise ValueError(f"image size {(pixels.shape[1], pixels.shape[0])} differs from {expected}")
+                    if expected and decoded_sizes[image_path] != expected:
+                        raise ValueError(f"image size {decoded_sizes[image_path]} differs from {expected}")
                     report["images_checked"] += 1
                 except (OSError, ValueError, cv2.error) as exc:
                     error(f"{label}.colors.{key}: {exc}")
@@ -547,7 +626,10 @@ def validate_episode(path):
                                   "the anchor stream must be at offset zero")
                         anchor_source = source_data.get(ALIGNMENT_SOURCES.get(anchor, ""))
                         if isinstance(anchor_source, dict) and type(anchor_source.get("received_monotonic_ns")) is int:
-                            if alignment.get("anchor_monotonic_ns") != anchor_source["received_monotonic_ns"]:
+                            anchor_time = ((anchor_source.get("timing") or {}).get("mapped_monotonic_ns")
+                                           if alignment.get("timestamp_basis") == "mapped_source"
+                                           else anchor_source["received_monotonic_ns"])
+                            if alignment.get("anchor_monotonic_ns") != anchor_time:
                                 error(f"{label}.sample.camera_alignment.anchor_monotonic_ns: disagrees with "
                                       f"sample.sources.{ALIGNMENT_SOURCES[anchor]}")
                     # Per-stream offsets live on the sources too; both copies must agree.
@@ -584,9 +666,199 @@ def validate_episode(path):
                     for command in (left_published, right_published)
                 )
                 report["command_inactive_frames"] += not commands_active
-            report["usable_following_frames"] += commands_active and mode == "following" and all(
+            following = commands_active and mode == "following" and all(
                 isinstance(source_data.get(name), dict) and source_data[name].get("fresh") is True
                 for name in required_sources)
+            tf = sample.get("tf")
+            tf_metadata = info.get("tf")
+            if tf is not None or tf_metadata is not None:
+                report["tf_frames"] += 1
+                if not isinstance(tf, dict) or tf.get("schema") != "r1_tf_v1":
+                    error(f"{label}.sample.tf: missing or unknown TF schema")
+                elif not isinstance(tf_metadata, dict) or tf_metadata.get("schema") != "r1_tf_v1":
+                    error(f"{label}.sample.tf: missing TF manifest")
+                else:
+                    robot_state = (sample.get("aligned_states") or {}).get("robot")
+                    anchor_ns = (alignment or {}).get("anchor_monotonic_ns")
+                    if tf.get("root_frame") != "pelvis_link" or tf_metadata.get("root_frame") != "pelvis_link":
+                        error(f"{label}.sample.tf: unexpected root frame")
+                    if tf.get("target_monotonic_ns") != anchor_ns:
+                        error(f"{label}.sample.tf: timestamp differs from camera anchor")
+                    expected_valid = False
+                    if isinstance(robot_state, dict):
+                        values = [robot_state.get("waist_q"), *(robot_state.get("head_q") or []),
+                                  *(robot_state.get("q") or [])]
+                        expected_valid = len(values) == 17 and all(
+                            type(value) in (int, float) and math.isfinite(value) for value in values)
+                        for tf_key, state_key in (("state_sequence", "sequence"), ("state_monotonic_ns", "monotonic_ns")):
+                            if tf.get(tf_key) != robot_state.get(state_key):
+                                error(f"{label}.sample.tf.{tf_key}: differs from measured robot state")
+                    if type(tf.get("valid")) is not bool or tf["valid"] != expected_valid:
+                        error(f"{label}.sample.tf.valid: differs from available joint feedback")
+                    report["tf_valid_frames"] += tf.get("valid") is True
+                    matrices = {}
+                    poses = tf.get("poses_in_root")
+                    if not isinstance(poses, dict):
+                        error(f"{label}.sample.tf.poses_in_root: expected object")
+                    else:
+                        expected_names = {"pelvis_link", *(tf_metadata.get("parents") or {})} if expected_valid else set()
+                        if set(poses) != expected_names:
+                            error(f"{label}.sample.tf.poses_in_root: missing or unexpected frames")
+                        for name, values in poses.items():
+                            try:
+                                matrix = np.asarray(values, dtype=float)
+                                if (matrix.shape != (4, 4) or not np.isfinite(matrix).all()
+                                        or not np.allclose(matrix[3], [0, 0, 0, 1], atol=1e-6)
+                                        or not np.allclose(matrix[:3, :3].T @ matrix[:3, :3], np.eye(3), atol=1e-6)
+                                        or not np.isclose(np.linalg.det(matrix[:3, :3]), 1.0, atol=1e-6)):
+                                    raise ValueError("not a rigid transform")
+                                matrices[name] = matrix
+                            except (TypeError, ValueError):
+                                error(f"{label}.sample.tf.poses_in_root.{name}: invalid SE(3) matrix")
+                        if "pelvis_link" in matrices and not np.allclose(matrices["pelvis_link"], np.eye(4), atol=1e-6):
+                            error(f"{label}.sample.tf: root transform must be identity")
+                        for name, entry in (tf_metadata.get("static_transforms") or {}).items():
+                            if name in matrices and entry.get("parent") in matrices:
+                                try:
+                                    composed = matrices[entry["parent"]] @ np.asarray(entry["matrix"], dtype=float)
+                                    if not np.allclose(matrices[name], composed, atol=1e-6):
+                                        error(f"{label}.sample.tf.{name}: static transform composition mismatch")
+                                except (TypeError, ValueError, KeyError):
+                                    error(f"{label}.sample.tf.{name}: invalid static transform metadata")
+                    offset = None
+                    if isinstance(robot_state, dict) and type(robot_state.get("monotonic_ns")) is int and type(anchor_ns) is int:
+                        offset = (robot_state["monotonic_ns"] - anchor_ns) / 1e6
+                    if tf.get("offset_ms") != offset:
+                        error(f"{label}.sample.tf.offset_ms: differs from measured robot timestamp")
+                    camera_names = ["image"] + [name for name in ("left_wrist_image", "right_wrist_image") if name in source_data]
+                    expected_aligned = bool(expected_valid and offset is not None and abs(offset) <= 25.0
+                                            and (sample.get("sensor_alignment") or {}).get("clock_valid") is True
+                                            and (sample.get("sensor_alignment") or {}).get("stereo_aligned") is True
+                                            and (alignment or {}).get("aligned") is True
+                                            and all(source_data[name].get("fresh") is True for name in camera_names))
+                    if type(tf.get("aligned_to_camera")) is not bool or tf["aligned_to_camera"] != expected_aligned:
+                        error(f"{label}.sample.tf.aligned_to_camera: quality flag mismatch")
+                    report["tf_aligned_frames"] += tf.get("aligned_to_camera") is True
+            sensor = sample.get("sensor_alignment")
+            sensor_usable = False
+            if sensor is not None or info.get("sensor_sync") is not None:
+                if not isinstance(sensor, dict) or sensor.get("schema") != "r1_sensor_sync_v1":
+                    error(f"{label}.sample.sensor_alignment: missing or unknown schema")
+                else:
+                    report["sensor_sync_frames"] += 1
+                    imu = sample.get("imu")
+                    packets = sample.get("imu_packets")
+                    if not isinstance(imu, dict) or not isinstance(packets, list):
+                        error(f"{label}.sample: IMU snapshot and packet list required")
+                        packets = []
+                    imu_valid = isinstance(imu, dict)
+                    for packet in ([imu] if isinstance(imu, dict) else []) + packets:
+                        if not isinstance(packet, dict):
+                            error(f"{label}.sample.imu: expected object")
+                            continue
+                        for key, vector_size in (("quaternion", 4), ("gyroscope", 3), ("accelerometer", 3), ("rpy", 3)):
+                            command_vector(packet.get(key), vector_size, f"{label}.sample.imu.{key}")
+                        quaternion = packet.get("quaternion")
+                        valid_quaternion = (isinstance(quaternion, list) and len(quaternion) == 4
+                                            and all(type(value) in (int, float) and math.isfinite(value)
+                                                    for value in quaternion)
+                                            and 0.9 ** 2 <= sum(value * value for value in quaternion) <= 1.1 ** 2)
+                        imu_valid &= valid_quaternion
+                        if packet.get("valid") is not valid_quaternion:
+                            error(f"{label}.sample.imu.valid: invalid quaternion flag")
+                        for key in ("sequence", "tick", "monotonic_ns", "temperature"):
+                            if type(packet.get(key)) is not int:
+                                error(f"{label}.sample.imu.{key}: expected integer")
+                        stamp = packet.get("monotonic_ns")
+                        if type(stamp) is int and not 0 < stamp <= sample["monotonic_ns"]:
+                            error(f"{label}.sample.imu: timestamp outside recorded history")
+                    if isinstance(imu, dict) and any(imu.get(key) != source_data.get("robot", {}).get(source_key)
+                                                   for key, source_key in (("sequence", "sequence"),
+                                                                          ("monotonic_ns", "received_monotonic_ns"))):
+                        error(f"{label}.sample.imu: does not match robot snapshot")
+                    gaps = 0
+                    for packet in packets:
+                        if not isinstance(packet, dict) or type(packet.get("sequence")) is not int:
+                            continue
+                        sequence = packet["sequence"]
+                        if previous_imu_sequence is not None:
+                            if sequence <= previous_imu_sequence:
+                                error(f"{label}.sample.imu_packets: repeated or reversed sequence")
+                            gaps += max(0, sequence - previous_imu_sequence - 1)
+                        previous_imu_sequence = sequence
+                    report["imu_packets"] += len(packets)
+                    reported_gaps = sensor.get("imu_dropped_packets")
+                    if type(reported_gaps) is not int or reported_gaps != gaps:
+                        error(f"{label}.sample.sensor_alignment: IMU gap count mismatch")
+                    report["imu_dropped_packets"] += gaps
+                    target = sensor.get("target_monotonic_ns")
+                    if not isinstance(alignment, dict) or target != alignment.get("anchor_monotonic_ns"):
+                        error(f"{label}.sample.sensor_alignment: camera anchor mismatch")
+                    aligned = sample.get("aligned_states") or {}
+                    imu_valid = bool(imu_valid and ((aligned.get("robot") or {}).get("imu") or {}).get("valid"))
+                    report["imu_invalid_frames"] += not imu_valid
+                    offsets = sensor.get("feedback_offset_ms") or {}
+                    feedback_ok = True
+                    for name, entry in (("robot", aligned.get("robot")),
+                                        ("left_hand_feedback", (aligned.get("hands") or {}).get("left")),
+                                        ("right_hand_feedback", (aligned.get("hands") or {}).get("right"))):
+                        stamp = (entry or {}).get("monotonic_ns")
+                        if type(stamp) is not int or type(target) is not int:
+                            feedback_ok = False
+                            continue
+                        offset = (stamp - target) / 1e6
+                        if type(offsets.get(name)) not in (int, float) or abs(offsets[name] - offset) > 1e-6:
+                            error(f"{label}.sample.sensor_alignment: {name} offset mismatch")
+                        feedback_ok &= abs(offset) <= 25.0 and stamp <= sample["monotonic_ns"]
+                    camera_entries = [source_data.get("image", {})] + [source_data.get(name, {})
+                                      for name in ("left_wrist_image", "right_wrist_image") if name in source_data]
+                    clock_ok = isinstance(alignment, dict) and alignment.get("timestamp_basis") == "mapped_source"
+                    for entry in camera_entries:
+                        timing = entry.get("timing") or {}
+                        measured = timing.get("clock_measured_monotonic_ns")
+                        uncertainty = timing.get("clock_uncertainty_ns")
+                        clock_ok &= (timing.get("clock_valid") is True and type(measured) is int
+                                     and 0 <= sample["monotonic_ns"] - measured <= 10_000_000_000
+                                     and type(uncertainty) is int and 0 <= uncertainty <= 5_000_000)
+                    eye_skew = (source_data.get("image", {}).get("timing") or {}).get("stereo_skew_ns")
+                    stereo_ok = (type(eye_skew) is int and isinstance(alignment, dict)
+                                 and 0 <= eye_skew / 1e6 <= alignment.get("tolerance_ms", 0))
+                    sensor_usable = bool(clock_ok and stereo_ok and feedback_ok and gaps == 0
+                                         and isinstance(alignment, dict) and alignment.get("aligned") is True
+                                         and all(entry.get("fresh") is True for entry in camera_entries))
+                    for key, expected in (("usable", sensor_usable), ("clock_valid", bool(clock_ok)),
+                                          ("stereo_aligned", stereo_ok), ("feedback_aligned", feedback_ok),
+                                          ("imu_valid", imu_valid), ("usable_with_imu", sensor_usable and imu_valid)):
+                        if type(sensor.get(key)) is not bool or sensor[key] != expected:
+                            error(f"{label}.sample.sensor_alignment.{key}: quality flag mismatch")
+                report["usable_following_frames"] += following and sensor_usable
+                report["synchronized_following_frames"] += following and sensor_usable
+                report["synchronized_with_imu_frames"] += following and sensor_usable and sensor.get("usable_with_imu") is True
+            else:
+                report["usable_following_frames"] += following
+
+            try:
+                rejections = training_frame_rejections(frame, info)
+            except (AttributeError, TypeError, ValueError):
+                rejections = ["malformed_frame"]
+                error(f"{label}: malformed frame for vision/joint training")
+            training_exclusions.update(rejections)
+            training = report["training_no_imu"]
+            idx, stamp = frame.get("idx"), sample.get("monotonic_ns")
+            if not rejections and type(idx) is int:
+                contiguous = (training_previous_idx is not None and idx == training_previous_idx + 1)
+                gap_ok = (training_previous_ns is not None and frequency is not None
+                          and 0 < stamp - training_previous_ns <= 1.5e9 / frequency)
+                if contiguous and not gap_ok:
+                    training["sampling_gap_boundaries"] += 1
+                if contiguous and gap_ok:
+                    training["segments"][-1]["stop_idx"] = idx + 1
+                else:
+                    training["segments"].append({"start_idx": idx, "stop_idx": idx + 1})
+                training["eligible_frames"] += 1
+                training_previous_idx, training_previous_ns = idx, stamp
+            else:
+                training_previous_idx = training_previous_ns = None
 
     if report["frames_checked"] == 0:
         error("frames.jsonl: episode has no frames")
@@ -696,19 +968,68 @@ def validate_episode(path):
         )
     report["valid"] = report["error_count"] == 0
     report["trainable"] = report["valid"] and not report["excluded_reasons"]
+    training = report["training_no_imu"]
+    training["excluded_counts"] = dict(training_exclusions)
+    training["demonstration_eligible"] = (report["valid"] and report["status"] == "complete"
+                                          and report["outcome"] == "success"
+                                          and training["eligible_frames"] > 0)
+    training["timing_basis"] = "mapped_source" if info.get("sensor_sync") else "legacy_host_receive"
+    report["image_fps"] = {key: value.get("fps") for key, value in (info.get("images") or {}).items()}
+    return report
+
+
+def quality_summary(report):
+    training = report["training_no_imu"]
+    total = report["frames_checked"]
+    usable = training["eligible_frames"]
+    percent = 100 * usable / total if total else 0
+    outcome = {"success": "成功", "failure": "失败", "discarded": "丢弃", "unspecified": "未标记"}.get(report.get("outcome"), "未知")
+    status = "通过" if report["valid"] else "未通过"
+    selected = "可筛选导出" if training.get("demonstration_eligible") else "不进入成功示范训练集"
+    fps = ", ".join(f"{TRAINING_CAMERAS.get(k, k)}={v:.1f}" for k, v in report.get("image_fps", {}).items()
+                    if isinstance(v, (int, float))) or "无统计"
+    name = Path(report["episode"]).name
+    return (f"[QUALITY] {name} | 任务={outcome} | 文件检查={status} | {selected}\n"
+            f"[QUALITY] 视觉/关节合格={usable}/{total} ({percent:.1f}%) | "
+            f"追踪保持={report['modes'].get('tracking_hold', 0)} | "
+            f"相机未对齐={report['unaligned_frames']} | 连续片段={len(training['segments'])}\n"
+            f"[QUALITY] 图像实际 FPS: {fps} | IMU 不参与训练\n"
+            f"[QUALITY] 详情: {Path(report['episode']) / 'quality.json'}")
+
+
+def save_quality_report(episode, output):
+    report = validate_episode(episode)
+    temporary = output.with_name('.' + output.name + '.tmp')
+    temporary.write_text(json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False) + "\n", encoding="utf-8")
+    os.replace(temporary, output)
     return report
 
 
 def main():
     parser = argparse.ArgumentParser(description="Validate a v2 teleoperation episode offline; never connects to a robot.")
-    parser.add_argument("episode", type=Path)
+    parser.add_argument("episode", type=Path, nargs="?")
     parser.add_argument("--output", type=Path, help="Also save the JSON report to this path")
+    parser.add_argument("--summary", action="store_true", help="Print a short Chinese quality summary")
+    parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
-    report = validate_episode(args.episode)
-    text = json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False)
-    print(text)
-    if args.output:
-        args.output.write_text(text + "\n", encoding="utf-8")
+    if args.worker:
+        os.nice(5)
+        cv2.setNumThreads(1)
+        for line in sys.stdin:
+            try:
+                directory = Path(json.loads(line))
+                report = save_quality_report(directory, directory / "quality.json")
+                print(quality_summary(report), flush=True)
+            except Exception as exc:
+                print(f"[QUALITY] 质检未完成（原始数据保留）: {line.strip()}: {exc}", file=sys.stderr, flush=True)
+        return 0
+    if args.episode is None:
+        parser.error("episode is required")
+    if args.output or args.summary:
+        report = save_quality_report(args.episode, args.output or episode_directory(args.episode) / "quality.json")
+    else:
+        report = validate_episode(args.episode)
+    print(quality_summary(report) if args.summary else json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False))
     return 1 if not report["valid"] else 0 if report["trainable"] else 2
 
 

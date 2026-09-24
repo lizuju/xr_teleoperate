@@ -19,10 +19,12 @@ sys.path.append(parent_dir)
 
 from teleop.utils.ipc import IPC_Server
 from teleop.utils.xr_record_gate import recording_blocked_by_tracking, tracking_diagnostics
+from teleop.utils.hand_torque_hud import publish_torque_hud
 from teleop.robot_control.r1_head_waist import R1HeadWaistFollower, compensate_wrist_for_waist
 from teleop.robot_control.r1_hand_tracking import (
     R1WristHold, hand_tracking_freshness, hand_tracking_present,
 )
+from teleop.robot_control.r1_wrist_workspace import R1WristWorkspace
 from sshkeyboard import listen_keyboard, stop_listening
 
 def publish_reset_category(category: int, publisher): # Scene Reset signal
@@ -36,6 +38,7 @@ START          = False  # Enable to start robot following VR user motion
 STOP           = False  # Enable to begin system exit procedure
 READY          = False  # Ready to (1) enter START state, (2) enter RECORD_RUNNING state
 RECORD_RUNNING = False  # True if [Recording]
+RECORD_ENABLED = False
 RECORD_TOGGLE  = False  # Toggle recording state
 RECORD_OUTCOME = 'unspecified'
 DRY_RUN_MODE = False
@@ -70,13 +73,22 @@ def on_press(key):
     elif key == 'q':
         START = False
         STOP = True
+        RECORD_TOGGLE = False
     elif key == 'p' and R1_PAUSE is not None:
         R1_PAUSE.pause()
-        logger_mp.info("[R1 PAUSE] Paused; arm, head and hand targets held. [r] requests realigned resume; [q] exits.")
+        if not RECORD_RUNNING:
+            RECORD_TOGGLE = False
+        logger_mp.info("[R1 PAUSE] Paused; targets held. [r] resumes; [s] resumes and starts the next episode when recording is enabled; [q] exits.")
     elif key in ('y', 'n', 'x') and RECORD_RUNNING:
         RECORD_OUTCOME = {'y': 'success', 'n': 'failure', 'x': 'discarded'}[key]
         RECORD_TOGGLE = True
-    elif key == 's' and (START == True or (DRY_RUN_MODE and READY)):
+    elif key == 's' and RECORD_ENABLED and (START or (DRY_RUN_MODE and READY)):
+        if not RECORD_RUNNING and not RECORD_TOGGLE:
+            if R1_PAUSE is not None and R1_PAUSE.paused:
+                R1_PAUSE.request_resume()
+                logger_mp.info("[RECORD] Next episode requested; keep both hands stable to realign and resume first.")
+            else:
+                logger_mp.info("[RECORD] Next episode requested; waiting for any previous save to finish.")
         RECORD_TOGGLE = True
     else:
         logger_mp.warning(f"[on_press] {key} was pressed, but no action is defined for this key.")
@@ -441,7 +453,7 @@ if __name__ == '__main__':
     parser.add_argument('--startup-wrist-align', action='store_true', help='R1_A7: align wrist orientation to the initial Vision Pro pose before following')
     # record mode and task info
     parser.add_argument('--record', action = 'store_true', help = 'Enable data recording mode')
-    parser.add_argument('--record-max-tracking-age-ms', type=float, default=100.0, help='Refuse to start an episode while any tracked XR hand is older than this many milliseconds. 0 disables the gate. Measured 2026-09-18: a bad Wi-Fi evening was left_age_ms p50=106 ms with 7% of frames past 500 ms; a good morning was 24 ms.')
+    parser.add_argument('--record-max-tracking-age-ms', type=float, default=100.0, help='Refuse to start an episode while any tracked XR hand is older than this many milliseconds. 0 disables the gate. Measured 2026-09-18: a bad Wi-Fi evening was left_age_ms p50=106 ms with 7%% of frames past 500 ms; a good morning was 24 ms.')
     parser.add_argument('--task-dir', type = str, default = './utils/data/', help = 'path to save data')
     parser.add_argument('--task-name', type = str, default = 'pick cube', help = 'task file name for recording')
     parser.add_argument('--task-goal', type = str, default = 'pick up cube.', help = 'task goal for recording at json file')
@@ -451,7 +463,7 @@ if __name__ == '__main__':
     parser.add_argument('--workspace-position-tolerance-m', type=float, default=0.05, help='R1_A7: IK position shortfall above which a target counts as outside the reachable workspace')
     parser.add_argument('--workspace-rotation-tolerance-rad', type=float, default=0.15, help='R1_A7: IK rotation shortfall above which a target counts as outside the reachable workspace')
     parser.add_argument('--arm-limit-softness', type=float, default=0.1, help='R1_A7: weight of the soft joint-limit barrier that discourages the arm from riding its limits; 0 disables')
-    parser.add_argument('--arm-posture-weight', type=float, default=0.02, help='R1_A7: weight pulling the arm posture toward the activation posture. This is the term that stops the elbow from drifting into a twisted pose over a session: with 7 DoF and only a wrist pose target there is a free null space and nothing else anchors it. Measured on the real URDF over a 120-frame reach sweep (validate_redundancy.py): 0.0 leaves the elbow travelling 0.685 rad, 0.02 cuts that to 0.629 with position tracking unchanged (+8%%) and wrist orientation error 0.089 -> 0.131 rad, 0.05 cuts it to 0.575 but costs 0.187 rad and starts riding joint limits. 0.02 is the knee of that curve; 0 disables')
+    parser.add_argument('--arm-posture-weight', type=float, default=0.01, help='R1_A7: weight pulling the arm posture toward the activation posture. This is the term that stops the elbow from drifting into a twisted pose over a session: with 7 DoF and only a wrist pose target there is a free null space and nothing else anchors it. Measured on the real URDF over a 120-frame reach sweep (validate_redundancy.py): 0.0 leaves the elbow travelling 0.685 rad, 0.02 cuts that to 0.629 with position tracking unchanged (+8%%) and wrist orientation error 0.089 -> 0.131 rad, 0.05 cuts it to 0.575 but costs 0.187 rad and starts riding joint limits. 0.02 is the knee of that curve; 0 disables')
     parser.add_argument('--arm-velocity-limit', type=float, default=30.0, help='R1_A7: safety cap on how fast the published arm POSITION target may move, in rad/s. 30 ~= off; set 3.0 to run in the conservative capped mode instead of the dq feed-forward.')
     parser.add_argument('--arm-dq-feedforward', choices=['on', 'off'], default='on', help='R1_A7: feed the target velocity into the servo dq field so the arm follows the commanded motion instead of chasing it with start-stop bursts (default on).')
     parser.add_argument('--arm-dq-limit', type=float, default=6.0, help='R1_A7: clamp on the feed-forward velocity in rad/s (safety net, not a tracking limit).')
@@ -459,14 +471,32 @@ if __name__ == '__main__':
     parser.add_argument('--arm-target-velocity-limit', type=float, default=6.0, help='R1_A7: shape the IK joint target to this speed (rad/s) before dq feed-forward is taken from it. Fast XR/IK bursts otherwise become a step the servo chases. 0 disables. 6 matches --arm-dq-limit and the ~5 rad/s the arm delivered with feed-forward on 2026-09-16; this is not the revoked 3.0 position clip.')
     parser.add_argument('--arm-target-accel-limit', type=float, default=40.0, help='R1_A7: how fast the shaped reference may change speed, in rad/s^2. 40 reaches 6 rad/s in 0.15 s. 0 means no acceleration limit. This is the term that removes fast-motion jerk; the velocity ceiling only stretches catch-up after a stale sample.')
     parser.add_argument('--wrist-display', type=str, choices=['auto', 'both', 'left', 'right', 'off'], default='auto', help='Vision Pro wrist camera panels: auto/both show both sides, left/right show one, off disables them. Panels and recording both read the wrist JPEG over ZMQ; wrist WebRTC on PC2 is unused.')
+    parser.add_argument('--hand-torque-hud', choices=['on', 'off'], default='off', help='Draw Linker O6 joint-torque digits on the Vision Pro head view. Default off: the reading is motor current, not contact force, and is not used to decide a grasp or written into recordings. on shows left eye = left hand, right eye = right hand, and prints [XR TORQUE] in the terminal.')
     parser.add_argument('--wrist-panel-distance', type=float, default=1.2, help='Distance of the wrist panels in front of the eyes, in meters')
     parser.add_argument('--wrist-panel-offset', type=float, nargs=2, default=[0.40, 0.40], metavar=('X', 'Y'), help='Wrist panel centre offset in meters; X is mirrored per side, Y is downwards')
     parser.add_argument('--wrist-panel-height', type=float, default=0.26, help='Wrist panel height in meters at --wrist-panel-distance')
     parser.add_argument('--camera-calibration', type=str, default='', help='Camera calibration JSON to embed in every recorded episode. Defaults to assets/r1/camera_calibration.json when that file exists; an explicitly given path must exist and validate.')
     parser.add_argument('--camera-sync-tolerance-ms', type=float, default=25.0, help='R1_A7: cross-camera time spread above which a recorded sample is flagged camera_alignment.aligned=false. Samples are still recorded; filter on the flag downstream.')
 
+    parser.add_argument('--tracking-source', choices=['webxr', 'visionpro'], default='webxr', help='Head/hand input provider; existing WebXR remains the default')
+    parser.add_argument('--visionpro-ip', help='Tracking Streamer IP on the headset Wi-Fi network')
+    parser.add_argument('--visionpro-port', type=int, default=12345)
+    parser.add_argument('--visionpro-python', default=str(Path(parent_dir).parent / '.venv-visionpro/bin/python'), help='Isolated gRPC receiver environment; does not change XR dependencies')
+
     args = parser.parse_args()
     logger_mp.debug(f"args: {args}")
+    if args.tracking_source == 'visionpro':
+        if not args.visionpro_ip:
+            parser.error('--tracking-source visionpro requires --visionpro-ip')
+        if args.arm != 'R1_A7' or args.input_mode != 'hand' or args.ee != 'linker_o6' or args.sim or args.motion:
+            parser.error('Vision Pro input supports R1_A7 hand tracking with Linker O6 in stationary real mode')
+        if args.display_mode != 'pass-through' or args.wrist_display != 'off' or args.hand_torque_hud != 'off':
+            parser.error('Vision Pro input requires --display-mode pass-through --wrist-display off --hand-torque-hud off')
+        if not Path(args.visionpro_python).is_file():
+            parser.error('Vision Pro receiver environment missing; run tools/setup_visionpro_input.sh')
+        if not 0. < args.tracking_timeout <= 0.5:
+            parser.error('Vision Pro input requires 0 < --tracking-timeout <= 0.5 seconds')
+
 
     # Resolved before any robot state is touched; see resolve_run_camera_calibration.
     # Default root is xr_teleoperate (parent of teleop/), not unitree_r1_dev.
@@ -513,6 +543,7 @@ if __name__ == '__main__':
         parser.error("--arm-posture-weight must be finite and non-negative.")
 
     DRY_RUN_MODE = args.dry_run
+    RECORD_ENABLED = args.record
     r1_a7_deferred_real = (
         args.arm == "R1_A7"
         and not args.sim
@@ -562,6 +593,7 @@ if __name__ == '__main__':
     linker_o6_retargeter = None
     img_client = None
     tv_wrapper = None
+    visionpro_source = None
     recorder = None
     r1_capture = None
     failure_reason = None
@@ -574,6 +606,12 @@ if __name__ == '__main__':
     exit_code = 0
 
     try:
+        if args.tracking_source == 'visionpro':
+            from teleop.utils.visionpro_source import VisionProMotionSource
+            visionpro_source = VisionProMotionSource(
+                args.visionpro_ip, args.visionpro_python, args.visionpro_port, args.tracking_timeout,
+            )
+            logger_mp.info('[VISIONPRO] Native passthrough input connected; existing retargeting and IK are retained.')
         if args.arm_diagnostic_dir:
             diagnostic_dir = Path(args.arm_diagnostic_dir).expanduser()
             diagnostic_dir.mkdir(parents=True, exist_ok=True)
@@ -651,6 +689,14 @@ if __name__ == '__main__':
             logger_mp.info(
                 f"[XR WRIST PANELS] disabled (display={args.display_mode}, wrist_display={args.wrist_display})"
             )
+        if args.hand_torque_hud == "on":
+            logger_mp.info(
+                "[XR TORQUE HUD] left window = left O6, right window = right O6; "
+                "digits 0-9 (0.15 torque = 9, typical grasp ~2-5, moving joints show 0); "
+                "same digits print as [XR TORQUE] in this terminal; recordings stay clean"
+            )
+        else:
+            logger_mp.info("[XR TORQUE HUD] disabled")
 
         # televuer_wrapper: obtain hand pose data from the XR device and transmit the robot's head camera image to the XR device.
         from televuer import TeleVuerWrapper
@@ -670,8 +716,12 @@ if __name__ == '__main__':
                                      wrist_panel_offset=tuple(args.wrist_panel_offset),
                                      wrist_panel_aspect=wrist_panel_aspect,
                                      wrist_panel_shape=wrist_panel_shape,
-                                     arm_reference_mode="head_yaw"
+                                     torque_hud=args.hand_torque_hud == "on",
+                                     arm_reference_mode="head_yaw",
+                                     motion_source=visionpro_source,
                                      )
+
+        torque_hud_cache = {}
 
         def grab_wrist_frames():
             """Fetch the wrist frames the XR panels (and recording) need.
@@ -689,6 +739,11 @@ if __name__ == '__main__':
                 right_frame = correct_palm_frame(img_client.get_right_wrist_frame())
                 if right_frame is not None and 'right' in wrist_panels:
                     tv_wrapper.render_wrist_to_xr('right', right_frame.bgr)
+            publish_torque_hud(
+                tv_wrapper, hand_ctrl,
+                enabled=getattr(args, "hand_torque_hud", "off") == "on",
+                cache=torque_hud_cache,
+            )
             return left_frame, right_frame
 
         if args.ee == "linker_o6":
@@ -724,6 +779,7 @@ if __name__ == '__main__':
                     head_img = img_client.get_head_frame()
                     if head_img.bgr is not None:
                         tv_wrapper.render_to_xr(head_img.bgr)
+                grab_wrist_frames()
 
                 if args.record and RECORD_TOGGLE:
                     RECORD_TOGGLE = False
@@ -1033,7 +1089,10 @@ if __name__ == '__main__':
                 image_width //= 2
             if r1_a7_deferred_real and args.ee == "linker_o6":
                 from teleop.utils.r1_capture import R1Capture, capture_metadata
-                metadata = capture_metadata(args, camera_config, linker_o6_retargeter, camera_calibration)
+                from teleop.utils.recording_tf import R1RecordingTF
+                recording_tf = R1RecordingTF(camera_calibration=camera_calibration)
+                metadata = capture_metadata(args, camera_config, linker_o6_retargeter,
+                                            camera_calibration, recording_tf=recording_tf)
                 calibration = metadata["camera_calibration"]
                 logger_mp.info(
                     f"[RECORD] colour streams: {', '.join(sorted(metadata['images']))} "
@@ -1058,6 +1117,7 @@ if __name__ == '__main__':
                                      frequency = args.frequency, 
                                      image_size = (image_width, image_height),
                                      metadata = metadata,
+                                     quality_report = args.arm == "R1_A7" and args.ee == "linker_o6",
                                      rerun_log = not args.headless)
 
         logger_mp.info("----------------------------------------------------------------")
@@ -1067,7 +1127,7 @@ if __name__ == '__main__':
             logger_mp.info("🟢  Press [r] to start syncing the robot with your movements.")
         if args.record:
             logger_mp.info("🟡  Press [s] to START or SAVE recording (toggle cycle).")
-            logger_mp.info("[RECORD] While recording: [y] save success; [n] save failure; [x] discard. [s] leaves outcome unspecified.")
+            logger_mp.info("[RECORD] While recording: [y] save success; [n] save failure; [x] mark discarded and keep all files. [s] saves without a label. Press [s] again for the next episode; no restart needed.")
         else:
             logger_mp.info("🔵  Recording is DISABLED (run with --record to enable).")
         logger_mp.info("🔴  Press [q] to stop and exit the program.")
@@ -1191,7 +1251,7 @@ if __name__ == '__main__':
                     arm_ik.set_redundancy_weights(
                         posture_weight=args.arm_posture_weight,
                         limit_weight=args.arm_limit_softness,
-                        nominal_arm_q=post_recenter_motor_q[:14],
+                        nominal_arm_q=arm_ctrl.get_current_dual_arm_q(),
                     )
                     # Always reported: these two weights are what keep the elbow from
                     # drifting into a twisted pose, and a silent zero here is exactly
@@ -1392,9 +1452,10 @@ if __name__ == '__main__':
         if r1_independent_hands and args.ee in (None, "linker_o6"):
             from teleop.robot_control.r1_pause import R1PauseState
             R1_PAUSE = R1PauseState()
-            logger_mp.info("[R1 CONTROL] [p] pauses and holds; [r] realigns and resumes after stable hands; [q] exits.")
+            logger_mp.info("[R1 CONTROL] [p] pauses and holds; [r] realigns and resumes; when recording is enabled, [s] also starts the next episode after resume; [q] exits.")
         if r1_independent_hands:
             wrist_holds = (R1WristHold(r1_robot_left_reference), R1WristHold(r1_robot_right_reference))
+            wrist_workspaces = (R1WristWorkspace(r1_robot_left_reference), R1WristWorkspace(r1_robot_right_reference))
             held_head_q_target = arm_ctrl.get_current_head_q().copy()
 
         if args.ee == "linker_o6":
@@ -1409,7 +1470,8 @@ if __name__ == '__main__':
             linker_o6_loop = LinkerO6ControlLoop(
                 tv_wrapper.get_tele_data, linker_o6_retargeter, hand_ctrl,
                 args.frequency, args.tracking_timeout, lambda: STOP, save_hand_sample,
-                should_pause=lambda: R1_PAUSE is not None and R1_PAUSE.paused,
+                should_pause=lambda: (R1_PAUSE is not None and R1_PAUSE.paused)
+                or (visionpro_source is not None and visionpro_source.needs_realign),
             )
             linker_o6_loop.start()
 
@@ -1427,7 +1489,8 @@ if __name__ == '__main__':
             r1_capture = R1Capture(arm_ctrl, hand_ctrl, linker_o6_loop,
                                    args.tracking_timeout, camera_config['head_camera']['image_shape'],
                                    wrist_image_shapes=wrist_image_shapes,
-                                   sync_tolerance_ms=args.camera_sync_tolerance_ms)
+                                   sync_tolerance_ms=args.camera_sync_tolerance_ms,
+                                   recording_tf=recording_tf)
             logger_mp.info(
                 f"[RECORD] camera sync: nearest frame to the head frame, "
                 f"tolerance {args.camera_sync_tolerance_ms:.1f} ms"
@@ -1495,8 +1558,12 @@ if __name__ == '__main__':
             if args.record:
                 recorder.raise_if_failed()
             if args.record and RECORD_TOGGLE:
-                RECORD_TOGGLE = False
-                if not RECORD_RUNNING:
+                if not RECORD_RUNNING and (
+                    (R1_PAUSE is not None and R1_PAUSE.paused) or not recorder.is_ready()
+                ):
+                    pass  # Keep the request until realignment and the previous save finish.
+                elif not RECORD_RUNNING:
+                    RECORD_TOGGLE = False
                     reason = recording_blocked_by_tracking(
                         tracking_diagnostics(tv_wrapper),
                         getattr(args, "record_max_tracking_age_ms", 100.0),
@@ -1511,6 +1578,7 @@ if __name__ == '__main__':
                     else:
                         logger_mp.error("Failed to create episode. Recording not started.")
                 else:
+                    RECORD_TOGGLE = False
                     RECORD_RUNNING = False
                     recorder.save_episode(outcome=RECORD_OUTCOME)
                     RECORD_OUTCOME = 'unspecified'
@@ -1519,6 +1587,10 @@ if __name__ == '__main__':
 
             # get xr's tele data
             tele_data = tv_wrapper.get_tele_data()
+            if visionpro_source is not None and visionpro_source.needs_realign:
+                R1_PAUSE.pause()
+                visionpro_source.consume_realign_required()
+                logger_mp.warning('[VISIONPRO] Head tracking or connection interrupted; holding posture. Keep both hands stable and press r/s to realign.')
             capture_mode = "following"
             run_motion = True
             if R1_PAUSE is not None and R1_PAUSE.paused:
@@ -1561,6 +1633,7 @@ if __name__ == '__main__':
                     r1_head_q_offset = np.array(held["head_q"])
                     held_head_q_target = r1_head_q_offset.copy()
                     wrist_holds = (R1WristHold(r1_robot_left_reference), R1WristHold(r1_robot_right_reference))
+                    wrist_workspaces = (R1WristWorkspace(r1_robot_left_reference), R1WristWorkspace(r1_robot_right_reference))
                     arm_ik.reset_smoothing(reference_q=held_q)
                     last_fresh_tele_data = tele_data
                     tracking_hold_active = False
@@ -1578,6 +1651,9 @@ if __name__ == '__main__':
                         logger_mp.info(f"[R1 HAND TRACKING] {side}: {'resumed; position follows fixed reference via IK filter' if present else 'lost; holding target'}")
                     if not present:
                         hold.hold()
+                for workspace, present in zip(wrist_workspaces, hand_present):
+                    if not present:
+                        workspace.hold()
                 if args.waist_follow:
                     if not all(hand_present):
                         arm_ctrl.hold_waist()
@@ -1723,8 +1799,24 @@ if __name__ == '__main__':
                         args.arm_translation_scale,
                     )
                 if r1_independent_hands:
-                    left_wrist_target = wrist_holds[0].prepare(left_wrist_target, hand_present[0])
-                    right_wrist_target = wrist_holds[1].prepare(right_wrist_target, hand_present[1])
+                    raw_wrist_targets = (left_wrist_target.copy(), right_wrist_target.copy())
+                    workspace_tracking = tuple(
+                        present and fresh and hold.tracking
+                        for present, fresh, hold in zip(
+                            hand_present,
+                            hand_tracking_freshness(tele_data, args.tracking_timeout, time.monotonic()),
+                            wrist_holds,
+                        )
+                    )
+                    for workspace, tracked in zip(wrist_workspaces, workspace_tracking):
+                        if not tracked:
+                            workspace.hold()
+                    left_wrist_target, right_wrist_target = (
+                        hold.prepare(workspace.target(raw), present)
+                        for hold, workspace, raw, present in zip(
+                            wrist_holds, wrist_workspaces, raw_wrist_targets, hand_present,
+                        )
+                    )
                     if not all(hand_present):
                         head_q_target = held_head_q_target.copy()
                 left_ik_target = left_wrist_target
@@ -1772,12 +1864,14 @@ if __name__ == '__main__':
             if STOP:
                 break
             if r1_independent_hands and run_motion:
-                present_after_ik = hand_tracking_present(tele_data)
+                post_ik_data = tv_wrapper.get_tele_data() if visionpro_source is not None else tele_data
+                present_after_ik = hand_tracking_present(post_ik_data)
                 if any(before and not after for before, after in zip(hand_present, present_after_ik)):
                     arm_ik.reset_smoothing()
-                    for hold, present in zip(wrist_holds, present_after_ik):
+                    for hold, workspace, present in zip(wrist_holds, wrist_workspaces, present_after_ik):
                         if not present:
                             hold.hold()
+                            workspace.hold()
                     if args.waist_follow:
                         arm_ctrl.hold_waist()
                     tracking_hold_active = True
@@ -1798,6 +1892,10 @@ if __name__ == '__main__':
                 linker_o6_loop.raise_if_failed()
             if STOP:
                 break
+            if visionpro_source is not None and visionpro_source.needs_realign:
+                R1_PAUSE.pause()
+                visionpro_source.consume_realign_required()
+                logger_mp.warning('[VISIONPRO] Tracking interrupted during IK; holding posture until r/s realignment.')
             if R1_PAUSE is not None and R1_PAUSE.paused:
                 capture_mode = "paused"
                 run_motion = False
@@ -1818,6 +1916,20 @@ if __name__ == '__main__':
                     wrist_holds[0].commit(left_wrist_target)
                     wrist_holds[1].commit(right_wrist_target)
                     held_head_q_target = head_q_target.copy()
+                    # Use the optimizer result before filtering, not delayed motor feedback.
+                    workspace_poses = arm_ik.forward_wrist_poses(arm_ik.last_raw_q)
+                    if args.waist_follow and getattr(args, "waist_follow_compensation", "torso") == 'world':
+                        workspace_poses = tuple(
+                            compensate_wrist_for_waist(pose, r1_waist_yaw_reference, waist_yaw_actual)
+                            for pose in workspace_poses
+                        )
+                    for workspace, raw, solved, tracked in zip(
+                        wrist_workspaces, raw_wrist_targets, workspace_poses, workspace_tracking,
+                    ):
+                        if tracked:
+                            workspace.observe(raw, solved)
+                        else:
+                            workspace.hold()
             else:
                 arm_ctrl.hold_targets()
                 held = arm_ctrl.get_recording_snapshot()["requested"]
@@ -1930,6 +2042,8 @@ if __name__ == '__main__':
                     "right_target": right_wrist_target.tolist(),
                     "left_ik_target": left_ik_target.tolist(),
                     "right_ik_target": right_ik_target.tolist(),
+                    "workspace_offset_m": [workspace.offset.tolist() for workspace in wrist_workspaces]
+                    if r1_independent_hands else None,
                     "waist_yaw_actual_rad": waist_yaw_actual,
                     "waist_yaw_target_rad": waist_yaw_target,
                     "head_q_target": head_q_target.tolist(),
@@ -2206,6 +2320,8 @@ if __name__ == '__main__':
         try:
             if tv_wrapper is not None:
                 tv_wrapper.close()
+            elif visionpro_source is not None:
+                visionpro_source.close()
         except Exception as e:
             exit_code = 1
             logger_mp.error(f"Failed to close televuer wrapper: {e}")

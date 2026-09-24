@@ -43,7 +43,7 @@ def color_image_specs(camera_config):
     return specs
 
 
-def capture_metadata(args, camera_config, retargeter, calibration=None):
+def capture_metadata(args, camera_config, retargeter, calibration=None, recording_tf=None):
     from teleop.robot_control.robot_arm import R1_A7_JointArmIndex
 
     root = Path(__file__).resolve().parents[2]
@@ -55,9 +55,13 @@ def capture_metadata(args, camera_config, retargeter, calibration=None):
             versions[package] = None
     code_paths = [root / "teleop/teleop_hand_and_arm.py", Path(__file__),
                   root / "teleop/utils/camera_calibration.py",
+                  root / "teleop/utils/recording_tf.py",
                   root / "teleop/utils/episode_writer.py",
                   root / "teleop/teleimager/src/teleimager/client.py"]
     code_paths += list((root / "teleop/robot_control").glob("*.py"))
+    if getattr(args, "tracking_source", "webxr") == "visionpro":
+        code_paths += [root / "teleop/utils/visionpro_source.py", root / "tools/visionpro_bridge.py",
+                       root / "tools/visionpro_protocol/handtracking.proto"]
     models = {
         "arm": root / "assets/r1/r1_a7.urdf",
         "left_hand": retargeter.left.urdf_path,
@@ -68,9 +72,18 @@ def capture_metadata(args, camera_config, retargeter, calibration=None):
     images = color_image_specs(camera_config)
     return {
         "robot": "R1_A7", "end_effector": "linker_o6",
+        "tf": None if recording_tf is None else recording_tf.metadata,
         "retargeting_method": retargeter.method,
         "retargeting_mapping": retargeter.mapping_name,
         "frequency": args.frequency,
+        "tracking_source": getattr(args, "tracking_source", "webxr"),
+        "tracking_input": ({
+            "protocol_version": 1,
+            "client_upstream_commit": "4c549905c2a8b214d79f7cd88e535101a1ce32af",
+            "mapping": "ARKit first25 -> WebKit per-side joint axes -> existing TeleVuerWrapper",
+            "timestamp_method": "minimum receive-minus-device clock offset; estimated pose age excludes best observed transport delay; not hardware synchronization",
+            "prediction": "reported per tracking diagnostic as prediction_seconds; set app offset to 0 ms for capture",
+        } if getattr(args, "tracking_source", "webxr") == "visionpro" else {"backend": "televuer"}),
         "image": {"width": width // 2, "height": height,
                   "fps": camera_config["head_camera"]["fps"]},
         # `image` above describes the head stereo half only, because the stereo
@@ -78,15 +91,30 @@ def capture_metadata(args, camera_config, retargeter, calibration=None):
         # per colour key actually written to the episode.
         "images": images,
         "camera_sync": {
-            "method": "nearest arrival time to the anchor stream's newest frame",
-            "anchor": "head_image",
+            "method": "minimax nearest frame across newest stream anchors; no sequence rewind",
+            "anchor": "selected per sample",
             "tolerance_ms": float(getattr(args, "camera_sync_tolerance_ms",
                                           CameraSynchronizer.DEFAULT_TOLERANCE_MS)),
             "streams": sorted(images),
-            "note": ("The head stereo pair is one frame off one sensor, so its two eyes are "
-                     "inherently simultaneous. The palm cameras are separate UVC devices on PC2 "
-                     "with no shared trigger, so each sample pairs them to the head frame in "
-                     "hand rather than to the sample clock."),
+            "note": ("PC2 software acquisition times mapped by round trips to Ubuntu monotonic time. "
+                     "Head eyes use separate RTP streams; eye timestamps and skew are preserved. "
+                     "No shared hardware trigger or exposure-time guarantee."),
+        },
+        "sensor_sync": {
+            "schema": "r1_sensor_sync_v1", "feedback_tolerance_ms": 25.0,
+            "clock_uncertainty_limit_ms": 5.0,
+            "method": "nearest received feedback to selected camera anchor; no interpolation or extrapolation",
+            "imu": {"quaternion_order": "wxyz", "gyroscope_unit": "rad/s",
+                    "accelerometer_unit": "m/s^2", "rpy_unit": "rad",
+                    "temperature_unit": "SDK raw int16; temperature scale not verified",
+                    "frame": "Unitree SDK native IMU frame; no extrinsic rotation applied",
+                    "quaternion_reference": "vendor attitude reference; not calibrated to camera/world",
+                    "tick": "raw LowState uint32 device counter; not mapped to host time",
+                    "valid": "finite values and quaternion norm within [0.9, 1.1]; zeros remain raw but invalid",
+                    "packets": "all received DDS packets since previous sample; first sample seeds latest; buffer losses counted"},
+            "clock_mapping": "host_ns = PC2_ns + offset_ns; minimum-delay round-trip estimate",
+            "uncertainty": "half network round trip plus 100 ppm age allowance; excludes sensor/pipeline latency",
+            "xr": "raw received poses only; XR device clock is unavailable and poses are not retimed",
         },
         "joint_names": {
             "left_arm": names[:7], "right_arm": names[7:],
@@ -126,23 +154,19 @@ def capture_metadata(args, camera_config, retargeter, calibration=None):
             "actions": "requested position targets before publisher limiting or hand smoothing",
             "sample.commands": "last successful SDK Write per publisher; not an execution acknowledgement",
             "states": "latest received motor feedback; each source retains its own receive time",
+            "sample.aligned_states": "separate nearest-feedback observations at camera anchor; raw actions unchanged",
+            "sample.imu": "latest SDK IMU with the same receive sequence and tick as robot state",
+            "sample.imu_packets": "unresampled IMU packet batch since previous recording sample",
             "states.*.torque": ("measured joint torque; an empty list means the source exposes no "
                                 "torque, never that the torque was zero"),
             "colors": ("one JPEG per colour key per sample; a missing camera is null, and the "
                        "matching sample.sources entry carries fresh=false"),
         },
         "clock": {"host": socket.gethostname(), "sample.timestamp_ns": "Unix wall clock",
-                  "source_times": "Ubuntu CLOCK_MONOTONIC receive times; not camera exposure times",
-                  "image_sequence": "local received JPEG sequence; repeated=true means reused sample",
-                  "wrist_image_sequence": ("per-side received JPEG sequence; the wrist streams run at "
-                                           "~21-22 fps against a 40 Hz sample loop, so repeated=true "
-                                           "is expected and is not a stall"),
-                  "camera_alignment": ("sources.*.offset_ms is the frame's arrival time minus the "
-                                       "anchor (head) frame's arrival time; sample.camera_alignment.skew_ms "
-                                       "is the spread across cameras. The three streams are independent "
-                                       "devices with no shared trigger and the ZMQ packets carry no "
-                                       "capture timestamp, so these are arrival-time differences, not "
-                                       "exposure-time differences.")},
+                  "source_times": "Ubuntu CLOCK_MONOTONIC receive timestamps are retained",
+                  "image_sequence": "local received JPEG sequence; repeated=true means reused image",
+                  "camera_alignment": "mapped source time when all cameras have clock mappings; otherwise arrival time",
+                  "source_timing": "sources.*.timing preserves PC2 timestamp, clock id, offset, uncertainty and stereo eye skew"},
         "camera_calibration": camera_calibration_metadata(
             calibration, expected_cameras(camera_config),
             {spec["camera"]: (spec["width"], spec["height"]) for spec in images.values()}),
@@ -179,7 +203,8 @@ def _end_effector_state(entry):
 class R1Capture:
     def __init__(self, arm_controller, hand_controller, hand_loop, tracking_timeout, image_shape,
                  wrist_image_shapes=None, wrist_timeout=0.5, sync_capacity=8,
-                 sync_tolerance_ms=CameraSynchronizer.DEFAULT_TOLERANCE_MS):
+                 sync_tolerance_ms=CameraSynchronizer.DEFAULT_TOLERANCE_MS, recording_tf=None):
+        self.recording_tf = recording_tf
         self.arm = arm_controller
         self.hand = hand_controller
         self.hand_loop = hand_loop
@@ -191,20 +216,19 @@ class R1Capture:
         # means the episode has only the two head colours.
         self.wrist_image_shapes = {side: tuple(shape) for side, shape in (wrist_image_shapes or {}).items()}
         self.wrist_timeout = wrist_timeout
-        # The head is the anchor: it is the slowest stream (15 Hz against the
-        # palms' ~21-22 Hz) and the one the episode cannot be recorded without,
-        # so anchoring there minimises the worst-case spread across cameras.
         self.sync = CameraSynchronizer(
             ["head"] + [f"{side}_wrist" for side in sorted(self.wrist_image_shapes)],
             anchor="head", capacity=sync_capacity, tolerance_ms=sync_tolerance_ms)
         self.last_image_sequence = None
         self.last_wrist_sequences = {}
         self.wrist_seen = {}
+        self.last_imu_sequence = None
 
     def reset_episode(self):
         self.last_image_sequence = None
         self.last_wrist_sequences = {}
         self.wrist_seen = {}
+        self.last_imu_sequence = None
         self.sync.clear()
 
     def observe(self, image, wrist_images=None):
@@ -237,7 +261,13 @@ class R1Capture:
 
         if image is None or image.bgr is None:
             raise RuntimeError("Capture lost the decoded stereo image; episode is incomplete")
+        self.observe(image, wrist_images)
+        pairing = self.sync.pair(now)
+        if pairing is None or pairing.frames.get("head") is None:
+            raise RuntimeError("Capture stereo image has no valid timestamp; episode is incomplete")
+        image = pairing.frames["head"].payload
         image_source = source(image.received_monotonic_ns, 0.5, sequence=image.sequence)
+        image_source["timing"] = getattr(image, "timing", None)
         if not image_source["fresh"] or image.sequence <= 0:
             raise RuntimeError("Capture stereo image is stale; episode is incomplete")
         if image.bgr.shape != (*self.image_shape, 3):
@@ -291,11 +321,6 @@ class R1Capture:
         # head frame about a quarter of the time, so without this the same JPEG is
         # encoded and written four times over.
         color_sequences = {"color_0": int(image.sequence), "color_1": int(image.sequence)}
-        # Pair every stream around the head frame in hand instead of taking
-        # whatever each palm camera happened to deliver most recently, which
-        # measured a median 31.6 ms apart and 12.8% of samples over 50 ms.
-        self.observe(image, wrist_images)
-        pairing = self.sync.pair(now)
         for side in sorted(self.wrist_image_shapes):
             name = f"{side}_wrist"
             entry = None if pairing is None else pairing.frames.get(name)
@@ -304,6 +329,7 @@ class R1Capture:
             sample = None
             if wrist is not None and wrist.bgr is not None and int(wrist.sequence or 0) > 0:
                 sample = source(wrist.received_monotonic_ns, self.wrist_timeout, sequence=wrist.sequence)
+                sample["timing"] = getattr(wrist, "timing", None)
                 if sample["fresh"]:
                     if wrist.bgr.shape != (*self.wrist_image_shapes[side], 3):
                         raise RuntimeError(f"Capture {side} wrist dimensions changed: {wrist.bgr.shape}")
@@ -329,6 +355,41 @@ class R1Capture:
                 color_sequences[WRIST_COLOR_KEYS[side]] = int(wrist.sequence)
         if pairing is not None:
             image_source["offset_ms"] = float(pairing.offsets_ms.get("head", 0.0))
+        target_ns = pairing.anchor_ns
+        robot_samples = self.arm.get_recording_samples(target_ns, self.last_imu_sequence, now)
+        if robot_samples["imu_packets"]:
+            self.last_imu_sequence = robot_samples["imu_packets"][-1]["sequence"]
+        aligned_robot = robot_samples["nearest"]
+        aligned_hands = self.hand.get_recording_states_at(target_ns, now)
+        aligned_sources = {"robot": aligned_robot,
+                           **{f"{side}_hand_feedback": value for side, value in aligned_hands.items()}}
+        offsets = {name: None if value is None else (value["monotonic_ns"] - target_ns) / 1e6
+                   for name, value in aligned_sources.items()}
+        camera_sources = [sources["image"]] + [sources[f"{side}_wrist_image"]
+                                               for side in sorted(self.wrist_image_shapes)]
+        clock_ok = pairing.timestamp_basis == "mapped_source" and all(
+            (entry.get("timing") or {}).get("clock_valid") is True
+            and 0 <= now - entry["timing"]["clock_measured_monotonic_ns"] <= 10_000_000_000
+            and entry["timing"]["clock_uncertainty_ns"] <= 5_000_000
+            for entry in camera_sources)
+        stereo_ok = (image_source.get("timing") or {}).get("stereo_skew_ns")
+        stereo_ok = stereo_ok is not None and stereo_ok / 1e6 <= self.sync.tolerance_ms
+        feedback_ok = all(value is not None and abs(value) <= 25.0 for value in offsets.values())
+        imu_valid = bool(state["imu"]["valid"] and aligned_robot is not None
+                         and aligned_robot["imu"]["valid"]
+                         and all(packet["valid"] for packet in robot_samples["imu_packets"]))
+        sensor_alignment = {
+            "schema": "r1_sensor_sync_v1", "target_monotonic_ns": target_ns,
+            "feedback_offset_ms": offsets, "feedback_tolerance_ms": 25.0,
+            "clock_valid": bool(clock_ok), "stereo_aligned": bool(stereo_ok),
+            "feedback_aligned": feedback_ok, "imu_valid": imu_valid,
+            "imu_dropped_packets": robot_samples["dropped"],
+            "usable": bool(clock_ok and stereo_ok and feedback_ok
+                           and pairing.skew_ms <= self.sync.tolerance_ms
+                           and all(entry["fresh"] for entry in camera_sources)
+                           and robot_samples["dropped"] == 0),
+        }
+        sensor_alignment["usable_with_imu"] = sensor_alignment["usable"] and imu_valid
         return {
             "colors": colors,
             "color_sequences": color_sequences,
@@ -336,7 +397,17 @@ class R1Capture:
             "actions": actions,
             "sample": {
                 "timestamp_ns": wall, "monotonic_ns": now, "mode": mode, "sources": sources,
-                "camera_alignment": None if pairing is None else self.sync.alignment(pairing),
+                "camera_alignment": self.sync.alignment(pairing),
+                "imu": {"monotonic_ns": state["monotonic_ns"], "sequence": state["sequence"],
+                        "tick": state["tick"], **state["imu"]},
+                "imu_packets": robot_samples["imu_packets"],
+                "aligned_states": {"robot": aligned_robot, "hands": aligned_hands},
+                "sensor_alignment": sensor_alignment,
+                "tf": None if self.recording_tf is None else self.recording_tf.sample(
+                    aligned_robot, target_ns,
+                    sensor_alignment["clock_valid"] and stereo_ok
+                    and pairing.skew_ms <= self.sync.tolerance_ms
+                    and all(entry["fresh"] for entry in camera_sources)),
                 "xr": {
                     "hand_points_frame": "televuer_unitree_hand_wrist_local_meters",
                     "left_hand_points": np.asarray(tele_data.left_hand_pos).tolist(),

@@ -1,0 +1,346 @@
+{
+  "python": {
+    "total": 917,
+    "skipped": 1,
+    "modules": [
+      {
+        "module": "test_arm_bus_monitor",
+        "tests": 12,
+        "skipped": 0
+      },
+      {
+        "module": "test_arm_target_shaper",
+        "tests": 21,
+        "skipped": 0
+      },
+      {
+        "module": "test_calibrate_r1_hand_eye",
+        "tests": 14,
+        "skipped": 0
+      },
+      {
+        "module": "test_calibrate_r1_head_stereo",
+        "tests": 29,
+        "skipped": 0
+      },
+      {
+        "module": "test_calibrate_r1_wrist",
+        "tests": 28,
+        "skipped": 0
+      },
+      {
+        "module": "test_camera_calibration",
+        "tests": 30,
+        "skipped": 0
+      },
+      {
+        "module": "test_check_r1_head_stereo_range",
+        "tests": 21,
+        "skipped": 0
+      },
+      {
+        "module": "test_continuous_capture",
+        "tests": 12,
+        "skipped": 0
+      },
+      {
+        "module": "test_episode_offline_tools",
+        "tests": 24,
+        "skipped": 0
+      },
+      {
+        "module": "test_episode_writer",
+        "tests": 22,
+        "skipped": 0
+      },
+      {
+        "module": "test_frame_sync",
+        "tests": 18,
+        "skipped": 0
+      },
+      {
+        "module": "test_hand_only_dry_run_isolation",
+        "tests": 7,
+        "skipped": 0
+      },
+      {
+        "module": "test_hand_pose_guard",
+        "tests": 7,
+        "skipped": 0
+      },
+      {
+        "module": "test_hand_torque_hud",
+        "tests": 20,
+        "skipped": 0
+      },
+      {
+        "module": "test_image_client_timing",
+        "tests": 8,
+        "skipped": 0
+      },
+      {
+        "module": "test_latency_filters",
+        "tests": 3,
+        "skipped": 0
+      },
+      {
+        "module": "test_linker_o6_control_loop",
+        "tests": 20,
+        "skipped": 0
+      },
+      {
+        "module": "test_linker_o6_controller",
+        "tests": 22,
+        "skipped": 0
+      },
+      {
+        "module": "test_linker_o6_retargeting",
+        "tests": 16,
+        "skipped": 0
+      },
+      {
+        "module": "test_o6_grip_cap",
+        "tests": 19,
+        "skipped": 0
+      },
+      {
+        "module": "test_o6_readonly_contract",
+        "tests": 7,
+        "skipped": 0
+      },
+      {
+        "module": "test_o6_writer_lock",
+        "tests": 6,
+        "skipped": 0
+      },
+      {
+        "module": "test_one_euro_filter",
+        "tests": 12,
+        "skipped": 0
+      },
+      {
+        "module": "test_preview_r1_icecream_lever",
+        "tests": 5,
+        "skipped": 0
+      },
+      {
+        "module": "test_r1_a7_adaptive_smoothing",
+        "tests": 7,
+        "skipped": 0
+      },
+      {
+        "module": "test_r1_a7_arm_live_bridge",
+        "tests": 30,
+        "skipped": 0
+      },
+      {
+        "module": "test_r1_a7_arm_publisher_shadow",
+        "tests": 24,
+        "skipped": 0
+      },
+      {
+        "module": "test_r1_a7_command_watchdog",
+        "tests": 20,
+        "skipped": 0
+      },
+      {
+        "module": "test_r1_a7_feedback_shutdown",
+        "tests": 16,
+        "skipped": 0
+      },
+      {
+        "module": "test_r1_a7_keyboard_deadman",
+        "tests": 12,
+        "skipped": 0
+      },
+      {
+        "module": "test_r1_a7_model_loading",
+        "tests": 1,
+        "skipped": 0
+      },
+      {
+        "module": "test_r1_a7_official_activation",
+        "tests": 17,
+        "skipped": 0
+      },
+      {
+        "module": "test_r1_a7_platform_profile",
+        "tests": 1,
+        "skipped": 0
+      },
+      {
+        "module": "test_r1_a7_redundancy",
+        "tests": 11,
+        "skipped": 0
+      },
+      {
+        "module": "test_r1_a7_waist_controller",
+        "tests": 18,
+        "skipped": 0
+      },
+      {
+        "module": "test_r1_a7_workspace",
+        "tests": 4,
+        "skipped": 0
+      },
+      {
+        "module": "test_r1_capture",
+        "tests": 35,
+        "skipped": 0
+      },
+      {
+        "module": "test_r1_episode_replay",
+        "tests": 9,
+        "skipped": 0
+      },
+      {
+        "module": "test_r1_head_waist",
+        "tests": 19,
+        "skipped": 0
+      },
+      {
+        "module": "test_r1_head_waist_integration",
+        "tests": 28,
+        "skipped": 0
+      },
+      {
+        "module": "test_r1_icecream_lever_replay",
+        "tests": 8,
+        "skipped": 0
+      },
+      {
+        "module": "test_r1_independent_hand_tracking",
+        "tests": 13,
+        "skipped": 0
+      },
+      {
+        "module": "test_r1_pause",
+        "tests": 18,
+        "skipped": 0
+      },
+      {
+        "module": "test_r1_recording_snapshots",
+        "tests": 9,
+        "skipped": 0
+      },
+      {
+        "module": "test_r1_side_independence",
+        "tests": 2,
+        "skipped": 0
+      },
+      {
+        "module": "test_r1_startup_tracking_wait",
+        "tests": 15,
+        "skipped": 0
+      },
+      {
+        "module": "test_r1_teleop_preflight",
+        "tests": 21,
+        "skipped": 0
+      },
+      {
+        "module": "test_r1_waist_compensation",
+        "tests": 12,
+        "skipped": 0
+      },
+      {
+        "module": "test_r1_workspace_saturation",
+        "tests": 7,
+        "skipped": 0
+      },
+      {
+        "module": "test_r1_wrist_calibration",
+        "tests": 2,
+        "skipped": 0
+      },
+      {
+        "module": "test_r1_wrist_panels",
+        "tests": 18,
+        "skipped": 0
+      },
+      {
+        "module": "test_r1_wrist_workspace",
+        "tests": 13,
+        "skipped": 0
+      },
+      {
+        "module": "test_r1_wrist_workspace_model",
+        "tests": 3,
+        "skipped": 0
+      },
+      {
+        "module": "test_recording_shutdown",
+        "tests": 9,
+        "skipped": 0
+      },
+      {
+        "module": "test_recording_tf",
+        "tests": 8,
+        "skipped": 0
+      },
+      {
+        "module": "test_rerun_teleop_episode",
+        "tests": 14,
+        "skipped": 1
+      },
+      {
+        "module": "test_sensor_timing",
+        "tests": 8,
+        "skipped": 0
+      },
+      {
+        "module": "test_teach_r1_icecream_waypoints",
+        "tests": 13,
+        "skipped": 0
+      },
+      {
+        "module": "test_televuer_motion_snapshot",
+        "tests": 18,
+        "skipped": 0
+      },
+      {
+        "module": "test_training_export",
+        "tests": 8,
+        "skipped": 0
+      },
+      {
+        "module": "test_visionpro_backlog",
+        "tests": 8,
+        "skipped": 0
+      },
+      {
+        "module": "test_visionpro_bridge",
+        "tests": 5,
+        "skipped": 0
+      },
+      {
+        "module": "test_visionpro_launchers",
+        "tests": 4,
+        "skipped": 0
+      },
+      {
+        "module": "test_visionpro_legacy_contract",
+        "tests": 7,
+        "skipped": 0
+      },
+      {
+        "module": "test_visionpro_source",
+        "tests": 24,
+        "skipped": 0
+      },
+      {
+        "module": "test_webxr_session_mode",
+        "tests": 5,
+        "skipped": 0
+      },
+      {
+        "module": "test_xr_record_gate",
+        "tests": 10,
+        "skipped": 0
+      }
+    ]
+  },
+  "webxr_behavior_checks": 9,
+  "native_source_commit": "d4fd02fdc767cbf6be98b7b9b94bc7c875f26e54",
+  "native_validation": "Source hashes match the earlier visionOS 27 build and device-install validation; no rebuild or robot motion performed during publication."
+}

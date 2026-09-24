@@ -1,3 +1,4 @@
+import datetime
 import json
 from pathlib import Path
 import tempfile
@@ -60,12 +61,18 @@ class EpisodeWriterTest(unittest.TestCase):
         return entered, release
 
     def manifest(self, index=0):
-        path = self.directory / f"episode_{index:04d}" / "episode.json"
+        path = self.episode_path(index) / "episode.json"
         return json.loads(path.read_text())
 
     def frames(self, index=0):
-        path = self.directory / f"episode_{index:04d}" / "frames.jsonl"
+        path = self.episode_path(index) / "frames.jsonl"
         return [json.loads(line) for line in path.read_text().splitlines()]
+
+    def episode_path(self, index=0):
+        paths = [path for path in self.directory.iterdir()
+                 if path.is_dir() and path.name.split("_")[1] == f"{index:04d}"]
+        self.assertEqual(len(paths), 1)
+        return paths[0]
 
     def test_normal_multiple_episodes_real_jpeg_and_metadata(self):
         writer = self.make_writer(image_size=(544, 448), metadata={"retargeting_method": "vector"})
@@ -86,10 +93,10 @@ class EpisodeWriterTest(unittest.TestCase):
         self.assertEqual(row["sample"], sample)
         self.assertEqual(row["states"]["left_arm"]["qpos"], [0.1])
         for image_path in row["colors"].values():
-            decoded = cv2.imread(str(self.directory / "episode_0000" / image_path))
+            decoded = cv2.imread(str(self.episode_path() / image_path))
             self.assertEqual(decoded.shape, (448, 544, 3))
-        self.assertFalse((self.directory / "episode_0000" / "data.json").exists())
-        self.assertFalse((self.directory / "episode_0000" / ".episode.json.tmp").exists())
+        self.assertFalse((self.episode_path() / "data.json").exists())
+        self.assertFalse((self.episode_path() / ".episode.json.tmp").exists())
         self.assertTrue(writer.create_episode())
         writer.add_item({})
         writer.save_episode(outcome="discarded")
@@ -98,13 +105,82 @@ class EpisodeWriterTest(unittest.TestCase):
         self.assertEqual(self.frames(1)[0]["idx"], 0)
         self.assertEqual(self.manifest(), first)
 
+    def test_three_outcomes_keep_files_and_reset_metadata_with_system_timestamps(self):
+        metadata = {"images": {"color_0": {"fps": 30}, "color_2": {"fps": 30}}}
+        writer = self.make_writer(image_size=(16, 16), frequency=40, metadata=metadata)
+        pixels = np.full((16, 16, 3), 80, dtype=np.uint8)
+        clock_start = datetime.datetime.now().astimezone().replace(hour=23, minute=58, second=0, microsecond=123456)
+        times = [clock_start + datetime.timedelta(minutes=index) for index in range(6)]
+        outcomes = ("success", "failure", "discarded")
+        schedules = ((0, 1_000_000_000, 2_000_000_000), (0, 500_000_000, 1_000_000_000), (0,))
+        manifests = []
+        with mock.patch.object(episode_writer.datetime, "datetime") as system_clock:
+            system_clock.now.side_effect = times
+            for index, outcome in enumerate(outcomes):
+                self.assertTrue(writer.create_episode())
+                for frame, timestamp in enumerate(schedules[index]):
+                    colors = {"color_0": pixels, "color_2": pixels} if index == 0 else {"color_0": pixels}
+                    sequences = {key: 1 if index == 0 else frame + 1 for key in colors}
+                    writer.add_item(colors, sample={"timestamp_ns": timestamp}, color_sequences=sequences)
+                writer.save_episode(outcome)
+                self.wait_until(writer.is_ready)
+                manifests.append(self.manifest(index))
+
+        for index, manifest in enumerate(manifests):
+            start, saved = times[index * 2:index * 2 + 2]
+            self.assertEqual(manifest["started_at"], start.isoformat())
+            self.assertEqual(manifest["saved_at"], saved.isoformat())
+            self.assertIsNotNone(datetime.datetime.fromisoformat(manifest["saved_at"]).utcoffset())
+            self.assertEqual(manifest["info"]["date"], start.date().isoformat())
+            self.assertEqual((manifest["status"], manifest["outcome"]), ("complete", outcomes[index]))
+            self.assertEqual(self.episode_path(index).name, f"episode_{index:04d}_{saved:%Y%m%d_%H%M%S_%f}")
+            rows = self.frames(index)
+            self.assertEqual([row["idx"] for row in rows], list(range(len(schedules[index]))))
+            for row in rows:
+                for relative in row["colors"].values():
+                    self.assertIsNotNone(cv2.imread(str(self.episode_path(index) / relative)))
+
+        first, second, third = [manifest["info"] for manifest in manifests]
+        self.assertEqual(first["image"]["fps"], 0.5)
+        self.assertEqual(first["image_storage"]["reused_images"], 4)
+        self.assertEqual(second["image"]["fps"], 3)
+        self.assertEqual(second["image"]["declared_fps"], 40)
+        self.assertEqual(second["images"]["color_0"]["declared_fps"], 30)
+        self.assertEqual(second["images"]["color_2"], {"fps": 30})
+        self.assertEqual(second["image_storage"]["reused_images"], 0)
+        self.assertEqual(third["image"], {"width": 16, "height": 16, "fps": 40})
+        self.assertEqual(third["images"], metadata["images"])
+        self.assertNotIn("image_storage", third)
+        self.assertEqual(metadata, {"images": {"color_0": {"fps": 30}, "color_2": {"fps": 30}}})
+        self.assertEqual([self.manifest(index) for index in range(3)], manifests)
+
+    def test_restarted_writer_advances_past_legacy_and_timestamp_directories(self):
+        for name in ("episode_0003", "episode_0007_20260920_101530_123456"):
+            directory = self.directory / name
+            directory.mkdir(parents=True)
+            (directory / "existing.txt").write_text(name)
+        saved_at = datetime.datetime.now().astimezone()
+        with mock.patch.object(episode_writer.datetime, "datetime") as system_clock:
+            system_clock.now.return_value = saved_at
+            for index in (8, 9):
+                writer = self.make_writer()
+                writer.create_episode()
+                writer.add_item({})
+                writer.save_episode("success")
+                writer.close()
+                self.assertEqual(self.manifest(index)["episode_id"], index)
+                self.assertEqual(self.episode_path(index).name, f"episode_{index:04d}_{saved_at:%Y%m%d_%H%M%S_%f}")
+        self.assertEqual(len(list(self.directory.iterdir())), 4)
+        for name in ("episode_0003", "episode_0007_20260920_101530_123456"):
+            self.assertEqual((self.directory / name / "existing.txt").read_text(), name)
+
     def test_depth_is_declared_only_when_depth_frames_are_recorded(self):
         writer = self.make_writer(image_size=(544, 448))
         writer.create_episode()
         writer.add_item({"color_0": np.zeros((448, 544, 3), dtype=np.uint8)})
         writer.save_episode(outcome="success")
         self.wait_until(writer.is_ready)
-        episode = self.directory / "episode_0000"
+        episode = self.episode_path()
         # Advertising depth while every sample carries depths=null makes a
         # consumer believe a modality exists that was never recorded.
         self.assertIsNone(self.manifest()["info"]["depth"])
@@ -117,7 +193,7 @@ class EpisodeWriterTest(unittest.TestCase):
         with_depth.save_episode(outcome="success")
         self.wait_until(with_depth.is_ready)
         self.assertEqual(self.manifest(1)["info"]["depth"], {"width": 544, "height": 448, "fps": 30})
-        self.assertTrue((self.directory / "episode_0001" / "depths").is_dir())
+        self.assertTrue((self.episode_path(1) / "depths").is_dir())
 
     def test_null_colour_keeps_the_key_without_writing_a_file(self):
         writer = self.make_writer(image_size=(16, 16))
@@ -129,12 +205,12 @@ class EpisodeWriterTest(unittest.TestCase):
         row = self.frames()[0]
         self.assertIsNone(row["colors"]["color_2"])
         self.assertTrue(row["colors"]["color_0"].endswith("_color_0.jpg"))
-        self.assertFalse((self.directory / "episode_0000" / "colors" / "000000_color_2.jpg").exists())
-        self.assertEqual(sorted(path.name for path in (self.directory / "episode_0000" / "colors").iterdir()),
+        self.assertFalse((self.episode_path() / "colors" / "000000_color_2.jpg").exists())
+        self.assertEqual(sorted(path.name for path in (self.episode_path() / "colors").iterdir()),
                          ["000000_color_0.jpg", "000000_color_1.jpg"])
 
     def colour_files(self, index=0):
-        return sorted(path.name for path in (self.directory / f"episode_{index:04d}" / "colors").iterdir())
+        return sorted(path.name for path in (self.episode_path(index) / "colors").iterdir())
 
     def test_a_repeated_camera_sequence_is_stored_once_and_referenced_again(self):
         # The 40 Hz sample loop sees a fresh head frame about a quarter of the
@@ -196,7 +272,7 @@ class EpisodeWriterTest(unittest.TestCase):
         # has to be written again under its own directory.
         self.assertEqual(self.colour_files(0), ["000000_color_0.jpg"])
         self.assertEqual(self.colour_files(1), ["000000_color_0.jpg"])
-        self.assertTrue((self.directory / "episode_0001" / "colors" / "000000_color_0.jpg").is_file())
+        self.assertTrue((self.episode_path(1) / "colors" / "000000_color_0.jpg").is_file())
 
     def test_manifest_reports_the_measured_rate_and_keeps_the_declared_one(self):
         writer = self.make_writer(
@@ -259,7 +335,7 @@ class EpisodeWriterTest(unittest.TestCase):
         release.set()
         writer.close()
         row = self.frames()[0]
-        saved = cv2.imread(str(self.directory / "episode_0000" / row["colors"]["color_0"]))
+        saved = cv2.imread(str(self.episode_path() / row["colors"]["color_0"]))
         self.assertEqual(int(saved[0, 0, 0]), 60)
         self.assertEqual(row["states"]["left_arm"]["qpos"], [0.1])
         self.assertEqual(row["sample"]["sources"]["xr"]["sequence"], 3)

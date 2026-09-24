@@ -2,7 +2,7 @@
 # R1_A7 实机遥操（Vector）— 2026-09-15
 #
 # 这里固定了 R1_A7 的启动参数，并把「大臂限速」做成默认值：
-#   ARM_POSTURE_WEIGHT  把手臂姿态拉回激活时姿态的权重，默认 0.02 —— 这是防「手肘扭住」的那一项。
+#   ARM_POSTURE_WEIGHT  把手臂姿态拉回激活时姿态的权重，默认 0.01 —— 这是防「手肘扭住」的那一项。
 #                       7 自由度只有腕部位姿目标，存在一个自由的零空间，不锚住它肘就会慢慢漂到怪角度。
 #                       实测（validate_redundancy.py，真实 URDF，120 帧扫掠）：0.0 时肘行程 0.685 rad，
 #                       0.02 降到 0.629 而位置跟踪基本不变（+8%）、腕部姿态误差 0.089→0.131 rad；
@@ -60,8 +60,15 @@
 #                       标定结果会写进每个 episode 的 info.camera_calibration，供后面数采/训练使用。
 #
 # 例：
-#   ./teleop/run_r1_a7_vector.sh                        # 日常遥操（dq 前馈 on，目标整形 6 rad/s / 40 rad/s^2）
+#   ./teleop/run_r1_a7_vector.sh                        # 日常遥操（默认 immersive；dq 前馈 on，目标整形 6 rad/s / 40 rad/s^2）
+#   ./teleop/run_r1_a7_vector.sh --display-mode ego           # 后缀覆盖：第一人称小窗 + 周围透传
+#   ./teleop/run_r1_a7_vector.sh --display-mode pass-through  # 后缀覆盖：纯透传（无机器人相机平面）
+#   ./teleop/run_r1_a7_vector.sh --check-only                 # 只跑预检，不启遥操
 #   ARM_DIAG_HZ=40 ARM_DIAG_DIR=$HOME/r1-diag ./teleop/run_r1_a7_vector.sh
+#
+# 显示模式：脚本硬编码 --display-mode immersive，额外参数经末尾 "$@" 转发；
+# argparse 后写覆盖先写。直接在命令后追加 --display-mode ego|pass-through，
+# 不要加单独的裸 "--"（会结束选项解析，后面的 mode 进不了 argparse）。
 set -euo pipefail
 
 check_only=false
@@ -111,7 +118,7 @@ exec "$python" -u teleop_hand_and_arm.py \
   --wrist-display "${WRIST_DISPLAY:-off}" \
   --arm-translation-scale "${ARM_TRANSLATION_SCALE:-0.87}" \
   --arm-limit-softness "${ARM_LIMIT_SOFTNESS:-0.1}" \
-  --arm-posture-weight "${ARM_POSTURE_WEIGHT:-0.02}" \
+  --arm-posture-weight "${ARM_POSTURE_WEIGHT:-0.01}" \
   --arm-velocity-limit "${ARM_VELOCITY_LIMIT:-30.0}" \
   --arm-dq-feedforward "${ARM_DQ_FEEDFORWARD:-on}" \
   --arm-dq-limit "${ARM_DQ_LIMIT:-6.0}" \

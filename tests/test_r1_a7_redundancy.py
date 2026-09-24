@@ -1,7 +1,9 @@
 import ast
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 import unittest
+from unittest.mock import Mock
 
 import numpy as np
 
@@ -128,7 +130,7 @@ class ElbowDriftGuardDefaultTest(unittest.TestCase):
                        / "teleop" / "teleop_hand_and_arm.py").read_text(encoding="utf-8")
 
     def test_the_nominal_posture_term_is_enabled_by_default(self):
-        self.assertIn("--arm-posture-weight', type=float, default=0.02", self.source)
+        self.assertIn("--arm-posture-weight', type=float, default=0.01", self.source)
 
     def test_the_soft_limit_barrier_stays_on(self):
         self.assertIn("--arm-limit-softness', type=float, default=0.1", self.source)
@@ -139,13 +141,26 @@ class ElbowDriftGuardDefaultTest(unittest.TestCase):
         self.assertIn("elbow drift protection OFF", self.source)
 
     def test_both_weights_reach_the_solver(self):
-        self.assertIn("posture_weight=args.arm_posture_weight", self.source)
-        self.assertIn("limit_weight=args.arm_limit_softness", self.source)
-        self.assertIn("nominal_arm_q=post_recenter_motor_q[:14]", self.source)
+        tree = ast.parse(self.source)
+        node = next(node for node in ast.walk(tree) if isinstance(node, ast.Expr)
+                    and isinstance(node.value, ast.Call)
+                    and isinstance(node.value.func, ast.Attribute)
+                    and node.value.func.attr == "set_redundancy_weights")
+        motor_q = np.arange(32, dtype=float) / 10
+        arm_q = motor_q[15:29].copy()
+        controller = Mock(get_current_dual_arm_q=Mock(return_value=arm_q))
+        ik = load_setter(14)
+        exec(compile(ast.Module(body=[node], type_ignores=[]), "activation", "exec"), {
+            "arm_ctrl": controller, "arm_ik": ik, "post_recenter_motor_q": motor_q,
+            "args": SimpleNamespace(arm_posture_weight=0.01, arm_limit_softness=0.1),
+        })
+        np.testing.assert_array_equal(ik.opti.values["nominal"], arm_q)
+        self.assertEqual(ik.posture_weight, 0.01)
+        self.assertEqual(ik.limit_weight, 0.1)
 
     def test_the_wrappers_pass_both_weights(self):
         from pathlib import Path
         for name in ("run_r1_a7_vector.sh", "run_r1_a7_capture.sh"):
             script = (Path(__file__).resolve().parents[1] / "teleop" / name).read_text(encoding="utf-8")
-            self.assertIn('--arm-posture-weight "${ARM_POSTURE_WEIGHT:-0.02}"', script)
+            self.assertIn('--arm-posture-weight "${ARM_POSTURE_WEIGHT:-0.01}"', script)
             self.assertIn('--arm-limit-softness "${ARM_LIMIT_SOFTNESS:-0.1}"', script)

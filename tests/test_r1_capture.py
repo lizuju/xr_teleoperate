@@ -30,6 +30,16 @@ class Snapshot:
     def __init__(self, data):
         self.data = data
 
+    def get_recording_samples(self, target_ns, since_sequence, end_ns):
+        state = self.data["state"]
+        packet = {key: state[key] for key in ("monotonic_ns", "sequence", "tick")}
+        packet.update(state["imu"])
+        return {"nearest": copy.deepcopy(state), "dropped": 0,
+                "imu_packets": [packet] if since_sequence != state["sequence"] else []}
+
+    def get_recording_states_at(self, target_ns, end_ns):
+        return copy.deepcopy(self.data["state"])
+
     def get_recording_snapshot(self):
         return copy.deepcopy(self.data)
 
@@ -39,7 +49,9 @@ def build(now, image_shape=(16, 32)):
     arm = Snapshot({
         "state": {"monotonic_ns": now, "sequence": 7, "q": [0.1] * 14,
                   "dq": [0.2] * 14, "tau": [0.05] * 14,
-                  "head_q": [0.3, 0.4], "waist_q": 0.5},
+                  "head_q": [0.3, 0.4], "waist_q": 0.5, "tick": 100,
+                  "imu": {"quaternion": [1.0, 0.0, 0.0, 0.0], "rpy": [0.0]*3,
+                          "gyroscope": [0.1]*3, "accelerometer": [0.0, 0.0, 9.81], "temperature": 30, "valid": True}},
         "requested": {"arm_q": [0.6] * 14, "arm_tau": [0.7] * 14,
                       "head_q": [0.8, 0.9], "waist_q": None, "monotonic_ns": now},
         "published": {"arm_q": [0.55] * 14, "arm_tau": [0.7] * 14,
@@ -194,7 +206,7 @@ class CaptureTests(unittest.TestCase):
             writer.add_item(**self.capture.frame(self.xr, self.image, "paused"))
             writer.save_episode(outcome="success")
             writer.close()
-            episode = Path(directory) / "episode_0000"
+            episode = writer.episode_dir
             report = validate_episode(episode)
             self.assertTrue(report["valid"], report)
             self.assertEqual(report["modes"], {"following": 1, "paused": 1})
@@ -268,14 +280,12 @@ class PalmCaptureTests(unittest.TestCase):
         self.assertEqual(first["color_sequences"]["color_2"], 11)
         self.assertEqual(first["color_sequences"]["color_3"], 12)
         self.assertEqual(first["color_sequences"]["color_0"], first["color_sequences"]["color_1"])
-        # The head frame advances every sample, but a palm frame that did not
-        # update keeps its sequence, so the writer reuses the file it already has
-        # instead of encoding a third identical copy.
+        # Pairing can reuse the head too; pixels and source sequence must agree.
         second = self.sample()
         self.assertEqual(second["color_sequences"]["color_2"], 11)
         self.assertEqual(second["color_sequences"]["color_3"], 12)
-        self.assertNotEqual(second["color_sequences"]["color_0"],
-                            first["color_sequences"]["color_0"])
+        self.assertEqual(second["color_sequences"]["color_0"],
+                         second["sample"]["sources"]["image"]["sequence"])
         self.assertEqual(self.sample(left=palm_at(40, 13, 5))["color_sequences"]["color_2"], 13)
 
     def test_an_absent_palm_frame_carries_no_sequence(self):
@@ -435,7 +445,7 @@ class PalmCaptureTests(unittest.TestCase):
             writer.add_item(**self.sample())
             writer.save_episode(outcome="success")
             writer.close()
-            episode = Path(directory) / "episode_0000"
+            episode = writer.episode_dir
             report = validate_episode(episode)
             self.assertTrue(report["valid"], report["errors"])
             self.assertEqual(report["images_checked"], 8)
@@ -451,7 +461,7 @@ class PalmCaptureTests(unittest.TestCase):
                 "left_hand_feedback", "right_hand_feedback",
                 "left_wrist_image", "right_wrist_image"]))
             self.assertEqual(report["sources"]["right_wrist_image"]["repeated"], 1)
-            self.assertEqual(report["usable_following_frames"], 2)
+            self.assertEqual(report["usable_following_frames"], 0)
             frames = [json.loads(line) for line in (episode / "frames.jsonl").read_text().splitlines()]
             # The second sample reuses the right palm frame rather than dropping
             # the view, and says so.
@@ -472,7 +482,7 @@ class PalmCaptureTests(unittest.TestCase):
             writer.add_item(**self.sample())
             writer.save_episode(outcome="success")
             writer.close()
-            episode = Path(directory) / "episode_0000"
+            episode = writer.episode_dir
             report = validate_episode(episode)
             self.assertTrue(report["valid"], report["errors"])
             self.assertEqual(report["calibration_status"], "calibrated")
@@ -492,7 +502,7 @@ class PalmCaptureTests(unittest.TestCase):
             writer.add_item(**self.sample())
             writer.save_episode(outcome="success")
             writer.close()
-            episode = Path(directory) / "episode_0000"
+            episode = writer.episode_dir
             frames_path = episode / "frames.jsonl"
             frames = [json.loads(line) for line in frames_path.read_text().splitlines()]
             frames[0]["colors"]["color_2"] = None

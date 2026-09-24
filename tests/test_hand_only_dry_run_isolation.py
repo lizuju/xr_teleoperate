@@ -107,7 +107,7 @@ class HandOnlyDryRunIsolationTest(unittest.TestCase):
         self.assertIn("math.isfinite(args.frequency)", self.main_source)
         self.assertIn("math.isfinite(args.tracking_timeout)", self.main_source)
         self.assertIn("listen_keyboard_thread.join(timeout=1.0)", self.main_source)
-        self.assertIn("elif key == 's' and (START == True or (DRY_RUN_MODE and READY)):", self.main_source)
+        self.assertIn("elif key == 's' and RECORD_ENABLED and (START or (DRY_RUN_MODE and READY)):", self.main_source)
 
     def test_dynamic_dry_run_never_imports_or_constructs_control_dependencies(self):
         import_names = []
@@ -243,7 +243,10 @@ class HandOnlyDryRunIsolationTest(unittest.TestCase):
         channel_module.ChannelFactoryInitialize = lambda *args, **kwargs: publisher_calls.append(
             (args, kwargs)
         )
+        hud_module = types.ModuleType("teleop.utils.hand_torque_hud")
+        hud_module.publish_torque_hud = mock.Mock()
         fake_modules = {
+            "teleop.utils.hand_torque_hud": hud_module,
             "logging_mp": logging_module,
             "teleimager": teleimager_module,
             "teleimager.client": image_module,

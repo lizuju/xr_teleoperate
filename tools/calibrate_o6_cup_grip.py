@@ -125,6 +125,47 @@ class CupGripCalibrator:
             self.close_q = start_vector(self.start_close)
             self.last_status = "armed; " + self._status_locked()
 
+    def load_saved(self):
+        """Jump the active hand to the cap already stored on disk.
+
+        One close vector drives every armed side, so a shared ``both`` session
+        only loads when the two saved vectors match. Otherwise pick ``1`` or ``2``.
+        """
+        from teleop.utils.o6_grip_cap import GripCapError, load_grip_cap, max_close_for_side
+
+        try:
+            document = load_grip_cap(self.save_path)
+        except GripCapError as error:
+            with self.lock:
+                self.last_status = f"saved cap unreadable: {error}"
+            return
+        if document is None:
+            with self.lock:
+                self.last_status = f"no saved grip cap at {self.save_path}"
+            return
+        with self.lock:
+            apply_to = self.apply_to
+        if apply_to == "both":
+            left = max_close_for_side(document, "left")
+            right = max_close_for_side(document, "right")
+            if left is None or right is None or not np.allclose(left, right):
+                with self.lock:
+                    self.last_status = "left and right caps differ; press 1 or 2, then g"
+                return
+            loaded = left
+        else:
+            loaded = max_close_for_side(document, apply_to)
+            if loaded is None:
+                with self.lock:
+                    self.last_status = f"no saved cap for {apply_to}"
+                return
+        loaded = np.clip(np.asarray(loaded, dtype=float), 0.0, MAX_CLOSE)
+        with self.lock:
+            self.armed = True
+            self.close_q = loaded
+            self.ever_moved = True
+            self.last_status = "loaded saved cap; " + self._status_locked()
+
     def open_hand(self):
         with self.lock:
             self.armed = False
@@ -165,7 +206,13 @@ class CupGripCalibrator:
             self.last_status = f"active side={apply_to}; " + self._status_locked()
 
     def record(self):
-        from teleop.utils.o6_grip_cap import build_document, save_grip_cap
+        from teleop.utils.o6_grip_cap import (
+            GripCapError,
+            build_document,
+            load_grip_cap,
+            merge_grip_cap_document,
+            save_grip_cap,
+        )
 
         with self.lock:
             ok, reason = can_record(
@@ -183,7 +230,7 @@ class CupGripCalibrator:
         snapshot = self.controller.get_recording_snapshot()
         left_tau = (snapshot.get("state") or {}).get("left", {}).get("torque")
         right_tau = (snapshot.get("state") or {}).get("right", {}).get("torque")
-        document = build_document(
+        incoming = build_document(
             max_close_q=levels.tolist(),
             apply_to=apply_to,
             cup_mouth_diameter_cm=self.cup_mouth_diameter_cm,
@@ -193,12 +240,19 @@ class CupGripCalibrator:
             left_tau_est=left_tau if apply_to in ("both", "left") else None,
             right_tau_est=right_tau if apply_to in ("both", "right") else None,
         )
+        # One-side save must merge into any existing opposite-hand vector.
+        existing = None
+        try:
+            existing = load_grip_cap(self.save_path)
+        except GripCapError:
+            existing = None
+        document = merge_grip_cap_document(existing, incoming)
         path = save_grip_cap(document, self.save_path)
         with self.lock:
             self.saved_path = str(path)
             self.last_status = (
                 f"saved max_close_q={np.round(levels, 3).tolist()} "
-                f"apply_to={apply_to} -> {path}"
+                f"apply_to={document.get('apply_to', apply_to)} -> {path}"
             )
         return path
 
@@ -257,14 +311,17 @@ def _print_help(path):
                 "",
                 "Keys:",
                 "  a     arm hands (all axes start at low close 0.05)",
+                "  g     jump the active side to the saved max (press 1 or 2 first if the",
+                "        two hands differ; does not write the file)",
                 *axis_lines,
                 "  =/.   increase SELECTED axis only (+0.01)",
                 "  -/,   decrease SELECTED axis only (-0.01)",
                 "  ]     fine +0.001 on selected axis",
                 "  [     fine -0.001 on selected axis",
                 "  o     open / release immediately (mode 0)",
-                "  s     SAVE current 6-vector as teleop max",
-                "  1/2/b left only / right only / both (default both; both writes same vector)",
+                "  s     SAVE current 6-vector as teleop max (merges into existing file)",
+                "  1/2/b left only / right only / both (default both; both writes same vector;",
+                "        left/right keep the other hand's prior vector if present)",
                 "  h     reprint this help",
                 "  q     quit (releases; NOT an e-stop — use the robot button)",
                 "",
@@ -368,6 +425,8 @@ def main(argv=None):
             return
         if key in ("a", "A"):
             calibrator.arm()
+        elif key in ("g", "G"):
+            calibrator.load_saved()
         elif key in ("o", "O"):
             calibrator.open_hand()
         elif key in ("=", ".", "+"):

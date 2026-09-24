@@ -8,6 +8,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 import numpy as np
+from teleop.robot_control.r1_wrist_workspace import R1WristWorkspace
 from scipy.spatial.transform import Rotation
 
 try:
@@ -109,11 +110,19 @@ class R1HeadWaistIntegrationTest(unittest.TestCase):
         follower.update.return_value = (np.array([0.2, 0.27]), 1.2)
         ik = Mock()
         ik.solve_ik.return_value = (np.zeros(14), np.zeros(14))
+        ik.last_raw_q = np.full(14, 0.01)
         ik.forward_wrist_poses.return_value = tuple(
             compensate_wrist_for_waist(p, 0.43, 0.17) for p in (self.left, self.right)
         )
+        ik.forward_wrist_poses.side_effect = lambda q: (
+            tuple(p.copy() for p in ik.solve_ik.call_args.args[:2])
+            if np.array_equal(q, ik.last_raw_q) and ik.solve_ik.called
+            else ik.forward_wrist_poses.return_value
+        )
         return {
             "np": np, "math": math, "STOP": False, "completed": False,
+            "visionpro_source": None,
+            "R1WristWorkspace": R1WristWorkspace,
             "R1_PAUSE": None, "r1_frozen_generation": -1, "r1_head_q_offset": np.zeros(2),
             "args": SimpleNamespace(
                 waist_follow=True, ee=None, input_mode="hand", motion=False,
@@ -227,6 +236,7 @@ class R1HeadWaistIntegrationTest(unittest.TestCase):
         ns = self.context()
         ns["r1_independent_hands"] = True
         ns["wrist_holds"] = (R1WristHold(self.left), R1WristHold(self.right))
+        ns["wrist_workspaces"] = (R1WristWorkspace(self.left), R1WristWorkspace(self.right))
         ns["hand_tracking_freshness"] = hand_tracking_freshness
         ns["hand_tracking_present"] = hand_tracking_present
         ns["held_head_q_target"] = np.array([0.1, 0.2])

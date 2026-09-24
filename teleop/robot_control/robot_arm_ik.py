@@ -1778,8 +1778,15 @@ class R1_A7_ArmIK:
             logger_mp.info(f"[R1_A7_ArmIK] >>> Loading cached robot model: {self.cache_path}")
             self.robot, self.reduced_robot = self.load_cache()
         else:
-            logger_mp.info("[R1_A7_ArmIK] >>> Loading URDF (slow)...")
-            self.robot = pin.RobotWrapper.BuildFromURDF(self.urdf_path, self.model_dir)
+            logger_mp.info("[R1_A7_ArmIK] >>> Loading URDF model...")
+            if self.Visualization:
+                self.robot = pin.RobotWrapper.BuildFromURDF(self.urdf_path, self.model_dir)
+            else:
+                # Mesh loading blocks feedback callbacks; IK only uses the rigid-body model.
+                self.robot = pin.RobotWrapper(
+                    pin.buildModelFromUrdf(self.urdf_path),
+                    collision_model=pin.GeometryModel(), visual_model=pin.GeometryModel(),
+                )
 
             self.mixed_jointsToLockIDs = [
                                             "waist_yaw_joint" ,
@@ -2082,6 +2089,7 @@ class R1_A7_ArmIK:
 
             sol_q = self.opti.value(self.var_q)
             timestamp = time.monotonic()
+            self.last_raw_q = sol_q.copy()
             for side, smoothing in enumerate(self.smooth_filters):
                 arm_slice = slice(side * 7, (side + 1) * 7)
                 sol_q[arm_slice] = smoothing.filter(

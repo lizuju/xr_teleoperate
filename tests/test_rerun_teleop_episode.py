@@ -190,6 +190,12 @@ class EpisodeRerunTests(unittest.TestCase):
         items = list(RerunEpisodeReader().iter_episode_data(self.episode))
         self.assertIs(items[0]["colors"]["color_0"], items[1]["colors"]["color_0"])
 
+    def test_number_lookup_reads_timestamped_episode_directory(self):
+        self.episode.rename(self.root / "episode_0001_20260923_180001_123456")
+        items = RerunEpisodeReader(task_dir=str(self.root)).return_episode_data(1)
+        self.assertEqual(len(items), 2)
+        self.assertEqual(items[0]["colors"]["color_0"].shape, (12, 16, 3))
+
     def test_v1_data_json_still_loads(self):
         v1 = self.root / "episode_0002"
         (v1 / "colors").mkdir(parents=True)

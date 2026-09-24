@@ -1,0 +1,64 @@
+syntax = "proto3";
+
+package handtracking;
+
+// Represents a 4x4 transformation matrix for a joint
+message Matrix4x4 {
+  float m00 = 1;
+  float m01 = 2;
+  float m02 = 3;
+  float m03 = 4;
+  float m10 = 5;
+  float m11 = 6;
+  float m12 = 7;
+  float m13 = 8;
+  float m20 = 9;
+  float m21 = 10;
+  float m22 = 11;
+  float m23 = 12;
+  float m30 = 13;
+  float m31 = 14;
+  float m32 = 15;
+  float m33 = 16;
+}
+
+// The skeleton of a hand, comprising multiple 4x4 matrices (one per joint)
+message Skeleton {
+  repeated Matrix4x4 jointMatrices = 1; // Array of 4x4 matrices, expecting 24 per hand based on your structure
+}
+
+// The hand tracking information, including the full 4x4 matrix for the wrist and the skeleton
+message Hand {
+  Matrix4x4 wristMatrix = 1; // 4x4 matrix for the wrist position and orientation
+  Skeleton skeleton = 2; // The hand's skeleton
+}
+
+// The overall hand update message, including data for both hands
+message HandUpdate {
+  Hand left_hand = 1;
+  Hand right_hand = 2;
+  Matrix4x4 Head = 3;
+
+  // R1 tracking protocol v1: source times use the Vision Pro monotonic clock.
+  // sample_time is serialization time; *_time are ARKit anchor timestamps.
+  // A valid hand requires a tracked anchor and all of its first 25 joints.
+  uint32 tracking_protocol_version = 4;
+  double sample_time = 5;
+  double head_time = 6;
+  double left_time = 7;
+  double right_time = 8;
+  bool head_valid = 9;
+  bool left_valid = 10;
+  bool right_valid = 11;
+  double prediction_seconds = 12;
+}
+
+// The hand tracking service definition.
+service HandTrackingService {
+  rpc StreamHandUpdates(HandUpdate) returns (stream HandUpdate) {}
+}
+
+// Acknowledgement message for hand updates
+message HandUpdateAck {
+  string message = 1;
+}

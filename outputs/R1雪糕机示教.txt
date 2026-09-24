@@ -1,0 +1,45 @@
+R1 雪糕机固定点示教（只读记录，schema v2）
+
+机器相对机器人固定。出料口一次位姿；每根拉杆记录抓取、拉到底、等待秒数、抽手、以及文件级转身腰航向。
+平时先走到这些点，不靠模型找。本步不做自动抓、不推臂、不闭手、不跑 VLA / ArUco。
+
+前置
+- 遥操已在另一终端正常跑（Vision Pro 人自己摆姿）。本工具只订阅 rt/lowstate 做 FK。
+- 标记贴好、右手握法拉杆标定完成之前，不要改遥操末端，也不要让手臂自己去抓。
+- 左手杯口握紧上限已有个人文件即可；示教过程不应用、不修改 grip cap。右手暂无 cap。
+
+命令（Ubuntu 生产树；遥操已开时另开终端）
+  cd /home/hnh/unitree_r1_dev/xr_teleoperate
+  /home/hnh/unitree_r1_dev/.venv-xr/bin/python tools/teach_r1_icecream_waypoints.py
+
+键（sshkeyboard，真实映射）
+  1          选 left_cup（左手腕在出料口/杯位；只需抓取位姿）
+  2 / 3 / 4  选 right_lever_1 / _2 / _3
+  s          存选中槽的抓取位姿（grasp）
+  p          存拉到底的完整手腕位姿（pulled；行程 = pulled−grasp）
+  t          将该拉杆 wait_s 设为 3.0 s
+  [ / ]      wait_s −1 / +1 s（必须 > 0，否则拒绝）
+  o          存抽手后位姿（withdraw）
+  y          存文件级 turn_waist_yaw_rad（当前 lowstate 腰航向，弧度）
+  d          旧：只存单位拉向（可选；有 pulled 后不必须）
+  w          原子写盘（保留其他槽；内存中 v1→v2，仅按 w 时落盘）
+  r          从磁盘重载
+  h / ?      帮助
+  q          只退出本示教工具（不是急停）
+
+拉杆 3 推荐顺序（遥操摆姿，本工具只记）
+  1) 键 4 选 right_lever_3
+  2) 抓取位已有则可跳过；要覆盖再 s
+  3) 遥操拉到底 → p
+  4) t（或 [ / ] 调等待秒数）
+  5) 遥操把手抽出 → o
+  6) 遥操转身（脚不动，只转腰）→ y
+  7) w 落盘（不会删 left_cup / 原 grasp；未按 w 则磁盘仍是旧 v1）
+
+文件
+  ~/.config/xr_teleoperate/icecream_waypoints.json
+  schema: icecream_waypoints_v2（个人文件，不进 git）
+  加载旧 v1 时内存升级并保留 left_cup、lever grasp、旧 pull_direction_base
+
+本步未做
+  ArUco / 视觉伺服、自动下拉、自动闭手、自动微调末端、右手 grip cap、遥操末端改写。

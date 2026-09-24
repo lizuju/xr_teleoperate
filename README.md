@@ -1,3 +1,5 @@
+> **R1 部署版本：** [production-20260924 发布与安装说明](docs/releases/production-20260924.md)。
+
 <div align="center">
   <h1 align="center">xr_teleoperate</h1>
   <a href="https://www.unitree.com/" target="_blank">

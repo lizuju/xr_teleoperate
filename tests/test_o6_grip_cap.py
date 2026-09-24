@@ -164,6 +164,54 @@ class O6GripCapModuleTest(unittest.TestCase):
         self.assertNotIn("right", loaded_null["sides"])
         self.assertIsNone(self.module.max_close_for_side(loaded_null, "right"))
 
+    def test_merge_right_keeps_existing_left(self):
+        left = [0.19, 0.48, 0.31, 0.39, 0.41, 0.39]
+        right = [0.25, 0.05, 0.71, 0.73, 0.74, 0.74]
+        existing = self.module.build_document(
+            max_close_q=left,
+            apply_to="left",
+            left_q=left,
+            left_tau_est=[0.01] * 6,
+        )
+        incoming = self.module.build_document(
+            max_close_q=right,
+            apply_to="right",
+            right_q=right,
+            right_tau_est=[0.0, 0.0, 0.0, 0.0, 0.04, 0.0],
+        )
+        merged = self.module.merge_grip_cap_document(existing, incoming)
+        self.assertEqual(merged["apply_to"], "both")
+        self.assertEqual(merged["sides"]["left"]["max_close_q"], left)
+        self.assertEqual(merged["sides"]["right"]["max_close_q"], right)
+        self.assertEqual(merged["sides"]["left"]["tau_est_at_save"], [0.01] * 6)
+        np.testing.assert_allclose(
+            self.module.max_close_for_side(merged, "left"), left
+        )
+        np.testing.assert_allclose(
+            self.module.max_close_for_side(merged, "right"), right
+        )
+
+    def test_merge_left_keeps_existing_right(self):
+        left = [0.19, 0.48, 0.31, 0.39, 0.41, 0.39]
+        right = [0.25, 0.05, 0.71, 0.73, 0.74, 0.74]
+        existing = self.module.build_document(
+            max_close_q=right,
+            apply_to="right",
+            right_q=right,
+            right_tau_est=[0.0] * 6,
+        )
+        incoming = self.module.build_document(
+            max_close_q=left,
+            apply_to="left",
+            left_q=left,
+        )
+        merged = self.module.merge_grip_cap_document(existing, incoming)
+        self.assertEqual(merged["apply_to"], "both")
+        self.assertEqual(merged["sides"]["left"]["max_close_q"], left)
+        self.assertEqual(merged["sides"]["right"]["max_close_q"], right)
+        self.assertEqual(merged["sides"]["right"]["tau_est_at_save"], [0.0] * 6)
+        self.assertNotIn("tau_est_at_save", merged["sides"]["left"])
+
 
 class CupGripCalibratorLogicTest(unittest.TestCase):
     @classmethod
@@ -188,6 +236,39 @@ class CupGripCalibratorLogicTest(unittest.TestCase):
         ok, reason = self.tool.can_record(armed=True, ever_moved=True, close_q=close)
         self.assertTrue(ok)
         self.assertEqual(reason, "ok")
+
+    def test_load_saved_jumps_the_active_side_to_its_cap(self):
+        grip = importlib.import_module("teleop.utils.o6_grip_cap")
+        right = [0.25, 0.05, 0.71, 0.73, 0.74, 0.74]
+        left = [0.19, 0.48, 0.31, 0.39, 0.41, 0.39]
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        path = Path(temporary.name) / "o6_grip_cap.json"
+        document = grip.build_document(max_close_q=right, apply_to="right", right_q=right)
+        document = grip.merge_grip_cap_document(
+            document,
+            grip.build_document(max_close_q=left, apply_to="left", left_q=left),
+        )
+        grip.save_grip_cap(document, path)
+
+        class Dummy:
+            def get_state(self):
+                return np.zeros(6), np.zeros(6)
+
+            def update(self, *args, **kwargs):
+                return None
+
+        calibrator = self.tool.CupGripCalibrator(Dummy(), apply_to="right", save_path=path)
+        calibrator.load_saved()
+        self.assertTrue(calibrator.armed)
+        self.assertTrue(calibrator.ever_moved)
+        np.testing.assert_allclose(calibrator.close_q, right)
+        self.assertIn("loaded saved cap", calibrator.last_status)
+
+        both = self.tool.CupGripCalibrator(Dummy(), apply_to="both", save_path=path)
+        both.load_saved()
+        self.assertFalse(both.armed)
+        self.assertIn("press 1 or 2", both.last_status)
 
     def test_bump_only_changes_selected_axis(self):
         class Dummy:
@@ -235,6 +316,96 @@ class CupGripCalibratorLogicTest(unittest.TestCase):
             self.assertGreater(saved[2], 0.05 + 0.02)
             for index in (0, 1, 3, 4, 5):
                 self.assertAlmostEqual(saved[index], 0.05)
+
+    def test_record_right_keeps_preexisting_left(self):
+        class Dummy:
+            def get_state(self):
+                return np.full(6, 0.11), np.array([0.25, 0.05, 0.71, 0.73, 0.74, 0.74])
+
+            def get_action(self):
+                return np.zeros(6), np.zeros(6)
+
+            def get_recording_snapshot(self):
+                return {
+                    "state": {
+                        "left": {"torque": [0.0] * 6},
+                        "right": {"torque": [0.0, 0.0, 0.0, 0.0, 0.04, 0.0]},
+                    }
+                }
+
+            def update(self, *args, **kwargs):
+                return None
+
+        left = [0.19, 0.48, 0.31, 0.39, 0.41, 0.39]
+        right = [0.25, 0.05, 0.71, 0.73, 0.74, 0.74]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "cap.json"
+            from teleop.utils import o6_grip_cap as grip
+
+            grip.save_grip_cap(
+                grip.build_document(max_close_q=left, apply_to="left", left_q=left),
+                path,
+            )
+            calibrator = self.tool.CupGripCalibrator(
+                Dummy(), apply_to="right", save_path=path
+            )
+            calibrator.arm()
+            calibrator.close_q = np.array(right, dtype=float)
+            calibrator.ever_moved = True
+            saved = calibrator.record()
+            self.assertIsNotNone(saved)
+            loaded = grip.load_grip_cap(path)
+            self.assertEqual(loaded["apply_to"], "both")
+            self.assertEqual(loaded["sides"]["left"]["max_close_q"], left)
+            self.assertEqual(loaded["sides"]["right"]["max_close_q"], right)
+
+    def test_record_left_keeps_preexisting_right(self):
+        class Dummy:
+            def get_state(self):
+                return np.array([0.19, 0.48, 0.31, 0.39, 0.41, 0.39]), np.full(6, 0.22)
+
+            def get_action(self):
+                return np.zeros(6), np.zeros(6)
+
+            def get_recording_snapshot(self):
+                return {
+                    "state": {
+                        "left": {"torque": [0.0] * 6},
+                        "right": {"torque": [0.0] * 6},
+                    }
+                }
+
+            def update(self, *args, **kwargs):
+                return None
+
+        left = [0.19, 0.48, 0.31, 0.39, 0.41, 0.39]
+        right = [0.25, 0.05, 0.71, 0.73, 0.74, 0.74]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "cap.json"
+            from teleop.utils import o6_grip_cap as grip
+
+            grip.save_grip_cap(
+                grip.build_document(
+                    max_close_q=right,
+                    apply_to="right",
+                    right_q=right,
+                    right_tau_est=[0.0, 0.0, 0.0, 0.0039, 0.039, 0.0],
+                ),
+                path,
+            )
+            calibrator = self.tool.CupGripCalibrator(
+                Dummy(), apply_to="left", save_path=path
+            )
+            calibrator.arm()
+            calibrator.close_q = np.array(left, dtype=float)
+            calibrator.ever_moved = True
+            saved = calibrator.record()
+            self.assertIsNotNone(saved)
+            loaded = grip.load_grip_cap(path)
+            self.assertEqual(loaded["apply_to"], "both")
+            self.assertEqual(loaded["sides"]["left"]["max_close_q"], left)
+            self.assertEqual(loaded["sides"]["right"]["max_close_q"], right)
+            self.assertIn("tau_est_at_save", loaded["sides"]["right"])
 
 
 class LinkerO6GripCapIntegrationTest(unittest.TestCase):

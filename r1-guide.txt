@@ -1,0 +1,8 @@
+不加 --display-mode 时仍是 immersive（画面铺满）
+ego = 周围透视 + 中间机器人画面；pass-through = 只有真实环境
+不要单独写裸 `--`
+cd /home/hnh/unitree_r1_dev/xr_teleoperate
+./teleop/run_r1_a7_vector.sh --display-mode ego
+./teleop/run_r1_a7_vector.sh --display-mode pass-through
+./teleop/run_r1_a7_capture.sh 任务名 "任务目标" --display-mode ego
+正常遥操 q 不是急停

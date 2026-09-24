@@ -1,0 +1,47 @@
+# Vision Pro Pass-through 全黑 — arfix6 SOP（2026-09-23）
+
+## 你上次多半还在 arfix4
+
+头显里字是 `arfix4 … layer=none` 且全黑。磁盘与 curl 当时/之后已是 **arfix5**，但 HUD 仍写 arfix4 → Safari 没吃到新 chunk（未退出 XR / 未关页 / 未 `q` 重开 pass-through）。「还是一样，没有变化」与此一致。
+
+## arfix6 改了什么（已读打包进 chunk 的 Three `setSession`）
+
+无独立 `WebXRManager.js`；权威逻辑在 `chunk-Dd3xtWba.*.js` 的 `this.setSession=async function`：
+
+- 有 `XRWebGLBinding.createProjectionLayer` → 走投影层（`de`），`getBaseLayer=()=>de||pe`
+- arfix4 跳过投影层后 `layer=none`：`XRWebGLLayer` 的 `updateRenderState` 未成为活动层
+- arfix5 给 `Tt` 加了 `alpha:true`，但若仍卡旧缓存则无效
+
+**arfix6：**
+
+1. 猴子补丁 `XRWebGLBinding.createProjectionLayer`：init 恒带 `alpha:true`
+2. `setSession` 后 AR：缺 pe / 投影无 alpha → `XRWebGLLayer(alpha:true)` + `updateRenderState`；失败写入 `err=`
+3. sessionstart 后 **rAF×3**，渲染循环前 **~60 帧** 再确保透明层；`makeXRCompatible` 按需调用
+4. 每帧 AR：`scene.background=null`；`setClearColor(0,0,0,0)`；`setClearAlpha(0)`
+5. HUD **巨大 `arfix6`** + `blend` / `layer` / `base` / `layers` / `ctxAlpha` / `err`
+6. 新文件名：`chunk-Dd3xtWba.arfix6.js`（curl 已见；进程未杀）
+
+ego = AR + 小视频面；pass-through = AR + 无视频面；immersive = VR 不变。
+
+**未宣称透传已通**：代码里已挂上强制透明层路径；是否合成出房间要看头显 HUD。
+
+## 重开步骤（无运动 / 非急停）
+
+1. 头显退出 XR 会话
+2. 主机终端按 **`q`** 退出 python（**不是 e-stop**，不回零）
+3. 再启 pass-through，例如：
+   `./teleop/run_r1_a7_vector.sh --display-mode pass-through`
+   （或你现用的 capture 入口 + 同后缀）
+4. Vision Pro Safari **关掉旧页再开**
+   `https://192.168.124.147:8012/`
+5. 进入 Pass-through / AR
+
+## 成功 / 失败
+
+| 现象 | 含义 |
+|------|------|
+| 真实房间 + 巨大字 **`arfix6`** | **成功** |
+| 全黑但能读到 `arfix6 blend=… layer=… err=…` | 把整行抄回来 |
+| 仍是 `arfix4` / `arfix5` 或没有浮动字 | 页没吃到 arfix6：关开页面 / 确认 `q` 后重开 |
+
+未启新遥操杀进程、未动机器人、未 commit。

@@ -11,7 +11,7 @@ import zmq
 
 
 SOURCE = Path(__file__).resolve().parents[1] / "teleop/teleimager/src/teleimager/client.py"
-SPEC = importlib.util.spec_from_file_location("collection_image_client_timing", SOURCE)
+SPEC = importlib.util.spec_from_file_location("teleimager.collection_image_client_timing", SOURCE)
 image_client = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(image_client)
 
@@ -91,7 +91,8 @@ class ImageClientTimingTest(unittest.TestCase):
         entered, release = self.block_decode(second)
         self.publisher.send(second)
         self.assertTrue(entered.wait(1.0))
-        received_ns, sequence, jpg = subscriber._jpg_3ring_buffer.read()
+        received_ns, sequence, jpg, timing = subscriber._jpg_3ring_buffer.read()
+        self.assertEqual(timing, {"clock_valid": False, "timestamp_kind": "host_receive_only"})
         self.assertEqual((sequence, jpg), (2, second))
         self.assertGreater(received_ns, old.received_monotonic_ns)
         for _ in range(20):
@@ -156,7 +157,8 @@ class ImageClientTimingTest(unittest.TestCase):
         self.wait_until(third_is_queued)
         with subscriber._bgr_decode_queue.mutex:
             queued = subscriber._bgr_decode_queue.queue[0]
-            self.assertEqual(queued[1:], (3, third))
+            self.assertEqual(queued[1:3], (3, third))
+            self.assertEqual(queued[3], {"clock_valid": False, "timestamp_kind": "host_receive_only"})
             self.assertEqual(subscriber._bgr_decode_queue.unfinished_tasks, 2)
         release.set()
         self.wait_until(lambda: subscriber.recv().sequence == 3)

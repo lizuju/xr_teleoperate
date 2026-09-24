@@ -1,187 +1,20 @@
-R1_A7 + Linker O6 实机遥操（Ubuntu Host）
-更新：2026-09-18（production-20260918 之后：跟随前馈 + XR 录制门控 + 腕部 WebRTC 关闭）
+R1实机遥操快速使用（抓杯握紧上限摘录）
+完整说明见同目录 r1-guide.txt（本文件原名已改为英文短文件名）。
 
-当前默认（和现场手感对得上的才写在这里；09-15 手册里的旧值不要再用）：
-  入口            ./teleop/run_r1_a7_vector.sh
-                  ./teleop/run_r1_a7_capture.sh 任务名 "任务目标"
-  手臂            ARM_DQ_FEEDFORWARD=on（速度前馈）  ARM_VELOCITY_LIMIT=30 ≈ 不限
-                  ARM_TARGET_VELOCITY_LIMIT=6  ARM_TARGET_ACCEL_LIMIT=40
-                  ARM_TRANSLATION_SCALE=0.87  ARM_POSTURE_WEIGHT=0.02  ARM_LIMIT_SOFTNESS=0.1
-  腰              跟随开，门槛 20°，速度 40°/s，加速度 90°/s²，补偿 torso
-  腕部小窗        WRIST_DISPLAY=off（头显不显示；录制不受影响）
-  跟踪超时        0.5 s    One Euro 3.5 / 12.0 / 1.0    主循环 40 Hz
-  开录门控        RECORD_MAX_TRACKING_AGE_MS=100
-                  按 s 时若 [XR TRACKING] 的 left/right_age_ms 大于 100 ms，拒绝开录。
-                  关掉门控：RECORD_MAX_TRACKING_AGE_MS=0
-  生产 tag        production-20260918  xr 440625d+本次 / televuer 8861dd9 / teleimager 9dceb64
+更新：2026-09-22（icecream teach-in v2 + per-axis grip）
 
-网络（证书和 XR 入口绑的是 Wi-Fi，不是网线）：
-  wlp3s0  Wi-Fi HuaNanHuNo.1   192.168.124.147/24   MAC C0:35:32:1F:E6:47   网关 192.168.124.1
-  eno1    有线机器人网          192.168.123.222/24   连 PC2 192.168.123.164
-  主机侧已把 Wi-Fi 改成静态 192.168.124.147。请再在路由器上为该 MAC 做 DHCP 保留，避免别人抢走这个地址。
-
-腕部画面从哪来（数采要腕部图，关 WebRTC 没关系）：
-  录制 color_2 / color_3  ←  PC2 ZMQ JPEG 55556 / 55557（enable_zmq）
-  头显小窗                 ←  同一路 ZMQ，再画到 XR 场景；默认关小窗
-  腕部 WebRTC 60002/60003  ←  头显不用。关掉只停 H.264 编码，不拆数采。
-
-一、开机后检查服务
-
-在 Ubuntu Host（60001=头部双目 WebRTC 网关，给头显用；55555/55556/55557=头部与左右腕部 JPEG 转发，给录制用；
-60002/60003 是腕部 WebRTC 网关，头显不用，可留可停）：
-  systemctl --user is-active \
-    r1-camera-forward-60000.service \
-    r1-camera-forward-60001.service r1-camera-forward-60002.service r1-camera-forward-60003.service \
-    r1-camera-forward-55555.service r1-camera-forward-55556.service r1-camera-forward-55557.service
-
-在 PC2（另一个终端）：
-  sudo systemctl start r1-linker-hand.service
-  sudo systemctl start r1-teleimager.service
-  systemctl is-active r1-linker-hand.service r1-teleimager.service
-
-Unitree App：开启 Stereo patch PC1，并确认保持开启。
-
-PC2 相机自检（unitree 用户即可，不需要 sudo；三路相机都应在运行）：
-  journalctl -u r1-teleimager.service --no-pager | grep "📷" | tail -3
-  # 期望看到 head_camera rtp_h264_stereo / left_wrist_camera v4l2 / right_wrist_camera v4l2
-
-若腕部相机打不开或服务反复重启：sudo bash /home/unitree/setup_r1_uvc.sh（见第七节）。
-
-二、只做预检（不启动遥操）
-
+抓杯子最大握紧标定（只动手，不动臂；与遥操不要同时开）：
   cd /home/hnh/unitree_r1_dev/xr_teleoperate
-  ./teleop/run_r1_a7_vector.sh --check-only
+  /home/hnh/unitree_r1_dev/.venv-xr/bin/python tools/calibrate_o6_cup_grip.py
 
-预检检查：机器人/O6 反馈、头部双目 JPEG、左右腕部 JPEG（640x480，ZMQ）、头部 WebRTC 60001（可选，502 只告警）。
-腕部 WebRTC 60002/60003 不再作为通过条件。看到 [READY] preflight passed 后再启动。
-（腕部帧可能带 [WARN] ... without the JPEG EOI marker：这是两个腕部相机模组固件的已知特性，
-turbojpeg 正常解码，最多损失最后一行 MCU，不影响面板与录制。）
+键：a 使能（六轴从 0.05 起）  3–8 选轴（thumb_pitch…pinky）  =/. 只加选中轴  -/, 只减选中轴  [/] 细调 ±0.001  o 松开  s 保存六维上限  1/2/b 左/右/双手  q 退出（不是急停）
+保存量：每手 max_close_q[6] ∈ [0,1]，不是牛顿。杯口 9 cm 写进元数据。
+文件：~/.config/xr_teleoperate/o6_grip_cap.json（schema o6_grip_cap_v2）
+下次遥操（`./teleop/run_r1_a7_vector.sh` / capture）自动加载，无需额外环境变量；在 15 ms 平滑前按侧做 elementwise min(q_i, max_i)。`apply_to=left` 且只有 `sides.left` 时只钳左手，右手完全不封顶；缺文件或该侧缺失/null = 该手不钳。旧版标量文件会迁移为六轴同值，请重新标定以分开精度。
 
-三、启动实机遥操
-
+雪糕机固定点示教（只读 v2；遥操另开终端摆姿，本工具不发 lowcmd、不闭手）：
   cd /home/hnh/unitree_r1_dev/xr_teleoperate
-  ./teleop/run_r1_a7_vector.sh
-
-按键：
-  r  准备并开始跟随；暂停后重新对齐并恢复
-  p  暂停并保持当前姿态
-  s  开始/保存录制（开录前看 [XR TRACKING]：age >100 ms 会拒绝，等链路好了再按）
-  y / n / x  成功 / 失败 / 丢弃当前 episode
-  q  停止遥操并退出。q 和 Ctrl+C 都不是急停。
-
-腕部使用相对位姿控制：按 r 时记录机器人腕部姿态与 Vision Pro 腕部姿态，之后按两者的相对旋转和平移跟随；
-没有腕关节直接映射，不加载旋转标定矩阵。腰部跟随已启用，角度与速度保护保留。
-
-大臂跟随（2026-09-18：dq 前馈 on + 目标整形）：
-  电机 dq 跟的是整形后的关节轨迹，不是 IK 的原始台阶。快甩手时 XR/IK 仍会跳，
-  但参考以 40 rad/s^2 爬升、巡航上限 6 rad/s（对齐 dq 限幅，不是已撤销的 3.0 位置限速）。
-    --arm-dq-feedforward {on,off}   默认 on
-    --arm-dq-limit 6.0              前馈速度上限（安全网）
-    --arm-dq-filter 0.5             前馈低通；抖动明显就调小到 0.3
-    --arm-target-velocity-limit 6.0 整形巡航上限；0 = 关掉整形（dq 又会对 IK 台阶求导）
-    --arm-target-accel-limit 40.0   整形加速度；这是去快动作顿挫的那一项
-  临时关掉前馈：ARM_DQ_FEEDFORWARD=off ./teleop/run_r1_a7_vector.sh
-  临时关掉整形：ARM_TARGET_VELOCITY_LIMIT=0 ./teleop/run_r1_a7_vector.sh
-  保守削命令：ARM_DQ_FEEDFORWARD=off ARM_VELOCITY_LIMIT=3.0 ./teleop/run_r1_a7_vector.sh
-  启动日志会打印三行：
-    [R1_A7_ArmController] published arm target speed limit: 30.00 rad/s ...
-    [R1_A7_ArmController] velocity feed-forward (dq): on limit=6.00 rad/s filter=0.50 ...
-    [R1_A7_ArmController] arm target shaper: on velocity=6.00 rad/s accel=40.00 rad/s^2
-
-大臂跟随专项复测（一条命令，自动开 40 Hz 诊断）：
-    ./teleop/run_r1_a7_follow_check.sh
-  跑 1–2 分钟（先慢速小幅活动，再做几次快速往返，最后静置 5 秒），脚本会打印 JSONL 路径。
-  带录制启动同样支持：
-    ARM_DIAG_HZ=40 ARM_DIAG_DIR=$HOME/r1-diag ./teleop/run_r1_a7_capture.sh 任务名 "任务目标"
-
-七之二、录制的数据里有什么（2026-09-15 更新）
-
-每个 episode 现在录 4 路画面（原来只有头部双目 2 路）：
-    color_0 / color_1   头部双目左/右（各 544x448）
-    color_2 / color_3   左手腕 / 右手腕（各 640x480）   ← 新增
-腕部两路是独立相机流（约 23–28 fps，采样循环 30 Hz），所以偶尔会重复用上一帧 —— 这是正常的，
-sample.sources.<side>_wrist_image.repeated=true 会标出来。某一帧相机没跟上时该帧的 color_2/color_3
-记成 null、对应 source 记 fresh=false，不会拿旧帧冒充；开录后相机一次都没出图则会直接报错终止 episode。
-
-关节力矩（tau_est）现在也录进 states.*_arm.torque 了（原来一直是空列表）。
-没有力矩来源时才留空列表，含义是"没有这项数据"，不是"力矩为 0"。
-
-一键体检某个 episode：
-    .venv-xr/bin/python tools/check_teleop_episode.py <episode 目录>
-    # 退出码 0 = 可训练；2 = 有效但要按 sample.sources 过滤帧；1 = 数据坏了
-
-七之三、相机标定怎么带进数据集
-
-标定文件放好后，每个 episode 的 info.camera_calibration 就会带上它（没放也会明确写 status=uncalibrated，
-而不是把字段漏掉）：
-    CAMERA_CALIBRATION=/path/to/camera_calibration.json ./teleop/run_r1_a7_capture.sh 任务名 "任务目标"
-不给这个环境变量时，会自动找 assets/r1/camera_calibration.json —— 存在就读，不存在就按未标定记录。
-显式指定的路径如果不存在或格式不对，程序会在连接机器人**之前**直接退出（退出码 2），不会录出一批
-"看着正常、其实几何是错的" 数据。
-
-格式（schema: r1_camera_calibration_v1）：
-{
-  "schema": "r1_camera_calibration_v1",
-  "created": "2026-09-15",
-  "board": {"type": "checkerboard", "squares_x": 9, "squares_y": 6, "square_size_m": 0.030},
-  "cameras": {
-    "head_left":   {"image_size": [544, 448],
-                    "camera_matrix": [[fx,0,cx],[0,fy,cy],[0,0,1]],
-                    "distortion_model": "plumb_bob",
-                    "distortion_coefficients": [k1,k2,p1,p2,k3],
-                    "reprojection_error_px": 0.21},
-    "head_right":  { ... },
-    "left_wrist":  { ... "image_size": [640, 480] ... },
-    "right_wrist": { ... }
-  },
-  "stereo": {"head": {"left": "head_left", "right": "head_right",
-                      "rotation": [[...]], "translation_m": [x,y,z],
-                      "baseline_m": 0.0605, "epipolar_error_px": 0.31}},
-  "hand_eye": {"left_wrist": {"camera": "left_wrist", "frame": "left_wrist_yaw_link",
-                              "rotation": [[...]], "translation_m": [x,y,z]}}
-}
-camera_matrix 必须是 3x3（最后一行 [0,0,1]，fx/fy > 0）；rotation 必须是正交且 det=+1。
-标定时的分辨率必须和实际推流分辨率一致，不一致会在启动日志和 episode 里报警告。
-
-七之三、腕部画面与头部的时间对齐（2026-09-15 追加）
-
-头部双目是一个传感器的一帧（左右眼天然同时），两个腕部是 PC2 上各自独立的模组，**没有共同触发**。
-所以原来"三路各取最新一帧"的做法，同一个样本里三张图平均要差 35 ms、最差接近 80 ms。
-
-现在改成：**以头部那一帧为锚点，另外两路各取到达时间离它最近的一帧**。
-实测偏度（20 秒，生产 40 Hz 循环）：p50 34.6 ms → 10.1 ms，"相差超过 50 ms" 的样本 13.2% → 5.9%。
-
-头部相机真实帧率是 ~10 fps（2026-09-15 实测）。配置里的 head_camera.fps 只是 teleimager 的
-**重发速率**，不是相机速率 —— 按 JPEG 内容去重后，fps=15/30/60 三种设置下头部都只有 10.0 fps。
-没有硬件或配置手段能让它更快，这就是四路对齐刷新的上限。
-
-fps 仍设成 30（不是 15）：它决定新帧多快被发出去，也就是到达时间戳的量化误差。
-头部帧到达间隔 p95：fps=15 → 174 ms，fps=30 → 133 ms，fps=60 → 117 ms（真实周期约 100 ms）。
-配对用的就是到达时间，所以取 30 把这条尾巴从 74 ms 压到 33 ms。
-
-配对策略用 minimax 选时刻（不再固定头部锚点）—— 同批帧 A/B：p50 27.3 → 9.1 ms，
-"相差超过 50 ms" 的样本 12.0% → 0%。
-
-每个样本会记下对齐情况：
-    sample.camera_alignment = {
-      "anchor": "head", "anchor_monotonic_ns": ...,
-      "offset_ms": {"head": 0.0, "left_wrist": -8.2, "right_wrist": 6.1},
-      "skew_ms": 14.3, "tolerance_ms": 25.0, "aligned": true
-    }
-    --camera-sync-tolerance-ms 25.0   超过这个偏度就把 aligned 标成 false
-超差的样本**照样录**，只是标记出来；要用严格对齐的数据就按 sample.camera_alignment.aligned 过滤
-（离线检查器会报出偏度分布和超差帧数）。
-
-两条限制要知道：
-  1. ZMQ 包不带采集时间戳，只有主机到达时间。所以绝对曝光时间拿不到，每路固定的管线偏置也测不出来
-     （实测左腕相对头部有约 −20 ms 的系统性偏置、右腕约 −2 ms，分不清是模组差异还是真实曝光差）。
-  2. 图像不能插值。配对是"时间上最近邻"，残余偏差如实记录。
-另外：因为要对齐到同一个瞬间，四路画面的实际刷新率被最慢的头部限制在 15 Hz（采样仍是 40 Hz）。
-
-八、腕部方向检查（相对位姿模式）
-
-1. 保持手腕位置基本不动，依次单独做小幅 roll、pitch、yaw，观察机器人腕部姿态是否朝同方向跟随。
-2. 再做绕腕自转（前臂不动，手掌翻转），确认转动方向与幅度合理。
-3. 依次做前臂旋转、肘部抬起等动作，确认腕部不出现明显反向或跳变。
-4. 按 p 暂停，调整双手姿态，按 r 在新的相对零点恢复。
-500 ms 失跟踪保持、逐侧独立保持与恢复、关节范围和已有滤波继续生效。
+  /home/hnh/unitree_r1_dev/.venv-xr/bin/python tools/teach_r1_icecream_waypoints.py
+键：1=left_cup  2/3/4=levers  s=抓取  p=拉到底位姿  t=wait 3s  [/]=wait±1s  o=抽手  y=腰航向  w=写盘  q=退出示教（不是急停）
+文件：~/.config/xr_teleoperate/icecream_waypoints.json（schema icecream_waypoints_v2；加载 v1 保留旧点，仅 w 落盘）
+详述：outputs/R1雪糕机示教.txt。未做：ArUco/自动下拉/自动闭手/自动微调、右手 grip cap。

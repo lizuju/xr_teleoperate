@@ -277,6 +277,12 @@ class RerunEpisodeReader:
 
     def return_episode_data(self, episode_idx):
         episode_dir = Path(self.task_dir) / f"episode_{int(episode_idx):04d}"
+        if not episode_dir.is_dir():
+            matches = list(Path(self.task_dir).glob(episode_dir.name + "_*"))
+            if len(matches) > 1:
+                raise ValueError(f"Multiple directories for episode {episode_idx}; select an explicit path")
+            if matches:
+                episode_dir = matches[0]
         return list(self.iter_episode_data(episode_dir))
 
     def iter_episode_data(self, episode_dir, load_images=True, max_frames=None):

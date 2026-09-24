@@ -1,38 +1,7 @@
-"""Timestamp-based pairing of the independent camera streams.
+"""Pair camera streams by mapped source time when available, otherwise receive time.
 
-The head stereo pair and the two palm cameras are three separate streams from
-two devices. The head pair is one 1088-wide frame off the head sensor, so its
-two eyes are inherently simultaneous; the palms are UVC modules on PC2 that
-nothing triggers together with the head. A sample that simply takes "the latest
-frame from each stream" therefore mixes moments that can be most of a frame
-period apart.
-
-Measured on the live rig (2026-09-15, 20 s, arrivals observed at 200 Hz and
-replayed at the production 40 Hz loop, both policies over the same trace):
-
-    head  15.05 Hz, period p50 66.7 ms / p95 107.0 ms
-    left  22.53 Hz, period p50 33.6 ms / p95  74.3 ms
-    right 20.87 Hz, period p50 34.5 ms / p95  73.4 ms
-
-    latest-frame pairing   skew p50 35.6 ms  p95 71.1 ms  max 106.1 ms  >25 ms 70.7%  >50 ms 14.3%
-    this module            skew p50 11.1 ms  p95 39.2 ms  max  71.6 ms  >25 ms 45.5%  >50 ms  3.4%
-
-So this module keeps a short history per stream and pairs every sample around
-the head frame that anchors it: the head is the slowest stream, so anchoring
-there minimises the worst-case spread. The residual skew is reported per sample
-rather than hidden, because a stall in one stream (head periods reach 107 ms at
-p95) cannot be fixed by choosing a different frame -- only by excluding the
-sample downstream.
-
-Two limits are worth stating plainly:
-
-* The ZMQ packets carry no capture timestamp, so ``received_monotonic_ns`` (the
-  host arrival time) is the only clock available. Pipeline delay is roughly
-  constant per stream, so differences in arrival time are a usable proxy for
-  differences in exposure time, but the absolute exposure time is not
-  recoverable and a constant per-stream pipeline offset is not observable.
-* Images cannot be interpolated. Pairing is nearest-neighbour in time; the
-  residual is recorded so a consumer can filter or weight it.
+Source timestamps describe software acquisition, not sensor exposure. Head eyes
+arrive over independent RTP streams; their source-time spread is recorded too.
 """
 
 from collections import namedtuple
@@ -43,7 +12,7 @@ from collections import namedtuple
 Frame = namedtuple("Frame", "sequence received_monotonic_ns payload")
 
 # The result of pairing one sample across all streams.
-Pairing = namedtuple("Pairing", "anchor anchor_ns frames offsets_ms skew_ms")
+Pairing = namedtuple("Pairing", "anchor anchor_ns frames offsets_ms skew_ms timestamp_basis")
 
 
 class StreamHistory:
@@ -97,7 +66,7 @@ class StreamHistory:
             return None
         return newest
 
-    def nearest(self, target_ns, min_sequence=None):
+    def nearest(self, target_ns, min_sequence=None, source_time=False):
         """Frame whose arrival time is closest to ``target_ns``.
 
         Only frames at or after ``min_sequence`` are eligible, so a stream can
@@ -108,9 +77,17 @@ class StreamHistory:
         candidates = self._frames
         if min_sequence is not None:
             candidates = [frame for frame in candidates if frame.sequence >= min_sequence]
+        if source_time:
+            candidates = [frame for frame in candidates
+                          if (getattr(frame.payload, "timing", None) or {}).get("clock_valid")]
         if not candidates:
-            return self.latest()
-        return min(candidates, key=lambda frame: abs(frame.received_monotonic_ns - target_ns))
+            return None if source_time else self.latest()
+        return min(candidates, key=lambda frame: abs(frame_time(frame, source_time) - target_ns))
+
+
+def frame_time(frame, source_time):
+    return (frame.payload.timing["mapped_monotonic_ns"] if source_time
+            else frame.received_monotonic_ns)
 
 
 class CameraSynchronizer:
@@ -166,16 +143,19 @@ class CameraSynchronizer:
                 candidates.append((name, frame))
         if not candidates:
             return None
+        source_time = len(candidates) == len(self.histories) and all(
+            (getattr(frame.payload, "timing", None) or {}).get("clock_valid")
+            for _, frame in candidates)
         best = None
         for anchor_name, anchor_frame in candidates:
-            target = anchor_frame.received_monotonic_ns
+            target = frame_time(anchor_frame, source_time)
             frames, offsets, worst = {}, {}, 0.0
             for name, history in self.histories.items():
-                frame = history.nearest(target, self.last_used.get(name))
+                frame = history.nearest(target, self.last_used.get(name), source_time)
                 frames[name] = frame
                 if frame is None:
                     continue
-                offset = (frame.received_monotonic_ns - target) / 1e6
+                offset = (frame_time(frame, source_time) - target) / 1e6
                 offsets[name] = offset
                 worst = max(worst, abs(offset))
             if best is None or worst < best[0]:
@@ -186,7 +166,8 @@ class CameraSynchronizer:
                 self.last_used[name] = frame.sequence
         skew = max(offsets.values()) - min(offsets.values()) if len(offsets) > 1 else 0.0
         return Pairing(anchor=anchor_name, anchor_ns=anchor_ns, frames=frames,
-                       offsets_ms=offsets, skew_ms=skew)
+                       offsets_ms=offsets, skew_ms=skew,
+                       timestamp_basis="mapped_source" if source_time else "host_receive")
 
     def alignment(self, pairing):
         """The per-sample alignment block written into the episode."""
@@ -201,6 +182,7 @@ class CameraSynchronizer:
             "aligned": bool(pairing.skew_ms <= self.tolerance_ms),
             "method": ("per-stream frame nearest the instant that minimises the worst "
                        "per-stream distance; no stream is rewound"),
-            "clock": ("host arrival times (CLOCK_MONOTONIC); ZMQ packets carry no capture "
-                      "timestamp, so exposure times are not directly observable"),
+            "timestamp_basis": pairing.timestamp_basis,
+            "complete": all(frame is not None for frame in pairing.frames.values()),
+            "clock": "Ubuntu CLOCK_MONOTONIC; mapped PC2 software acquisition or local receive, not exposure",
         }

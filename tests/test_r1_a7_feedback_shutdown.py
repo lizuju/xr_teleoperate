@@ -1,4 +1,5 @@
 import ast
+from collections import deque
 from contextlib import redirect_stdout
 from enum import IntEnum
 import io
@@ -19,7 +20,10 @@ MAIN_PATH = Path(__file__).resolve().parents[1] / "teleop/teleop_hand_and_arm.py
 
 
 def motor_state(value=0.1):
-    return SimpleNamespace(mode_machine=7, motor_state=[
+    return SimpleNamespace(mode_machine=7, tick=100,
+                           imu_state=SimpleNamespace(quaternion=[1, 0, 0, 0], gyroscope=[0]*3,
+                                                     accelerometer=[0, 0, 9.81], rpy=[0]*3, temperature=30),
+                           motor_state=[
         SimpleNamespace(q=value + index / 100, dq=-index / 1000, tau_est=index / 1000) for index in range(35)
     ])
 
@@ -70,7 +74,7 @@ def load_controller():
                 "R1_A7_JointHeadIndex", "R1_A7_JointIndex", "R1_A7_ArmController"}
     classes = [node for node in tree.body if isinstance(node, ast.ClassDef) and node.name in selected]
     namespace = {
-        "np": np, "threading": threading, "time": time, "IntEnum": IntEnum,
+        "deque": deque, "np": np, "threading": threading, "time": time, "IntEnum": IntEnum,
         "logger_mp": Mock(), "ChannelSubscriber": CallbackSubscriber,
         "ChannelPublisher": Mock(side_effect=AssertionError("No real command initialization allowed")),
         "hg_LowState": object, "R1_A7_Num_Motors": 35, "kTopicLowState": "rt/lowstate",
@@ -83,7 +87,7 @@ def load_controller():
 
 def _load_arm_target_shaper():
     path = ARM_PATH.parent / "arm_target_shaper.py"
-    namespace = {"np": np, "math": math, "time": time}
+    namespace = {"deque": deque, "np": np, "math": math, "time": time}
     exec(compile(path.read_text(encoding="utf-8"), str(path), "exec"), namespace)
     return namespace["ArmTargetShaper"]
 
@@ -163,9 +167,8 @@ class R1A7FeedbackShutdownTest(unittest.TestCase):
     def test_feedback_without_a_torque_field_is_not_fatal(self):
         controller = self.controller_class(deferred_activation=True)
         try:
-            legacy = SimpleNamespace(mode_machine=7, motor_state=[
-                SimpleNamespace(q=0.1 + index / 100, dq=0.0) for index in range(35)
-            ])
+            legacy = motor_state()
+            legacy.motor_state = [SimpleNamespace(q=0.1 + index / 100, dq=0.0) for index in range(35)]
             controller._subscribe_motor_state(legacy)      # must not raise
             np.testing.assert_allclose(controller.get_current_dual_arm_tau(), np.zeros(14))
         finally:

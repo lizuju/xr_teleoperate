@@ -1,4 +1,5 @@
 import ast
+from collections import deque
 from enum import IntEnum
 import math
 from pathlib import Path
@@ -60,7 +61,10 @@ class FakeSubscriber:
 
     def Read(self):
         return types.SimpleNamespace(
-            mode_machine=7,
+            mode_machine=7, tick=100,
+            imu_state=types.SimpleNamespace(quaternion=[1.0, 0.0, 0.0, 0.0],
+                                            gyroscope=[0.0]*3, accelerometer=[0.0, 0.0, 9.81],
+                                            rpy=[0.0]*3, temperature=30),
             motor_state=[
                 types.SimpleNamespace(q=0.01 * index, dq=-0.001 * index, tau_est=0.0)
                 for index in range(35)
@@ -129,6 +133,7 @@ def load_r1_controller_namespace():
         if isinstance(node, ast.ClassDef) and node.name in selected_names
     ]
     namespace = {
+        "deque": deque,
         "np": np,
         "threading": threading,
         "time": time,

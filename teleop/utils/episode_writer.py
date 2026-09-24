@@ -3,6 +3,8 @@ import datetime
 import json
 import logging
 import os
+import subprocess
+import sys
 from pathlib import Path
 from queue import Empty, Queue
 from threading import Lock, Thread
@@ -19,7 +21,7 @@ OUTCOMES = {"unspecified", "success", "failure", "discarded"}
 class EpisodeWriter:
     def __init__(self, task_dir, task_goal=None, task_desc=None, task_steps=None,
                  frequency=30, image_size=(640, 480), depth_size=None, rerun_log=True, metadata=None,
-                 queue_capacity=60):
+                 queue_capacity=60, quality_report=False):
         if queue_capacity <= 0:
             raise ValueError("queue_capacity must be positive")
         self.task_dir = Path(task_dir)
@@ -44,6 +46,7 @@ class EpisodeWriter:
             "sim_state": "",
         }
         self.info.update(deepcopy(metadata or {}))
+        self._base_info = deepcopy(self.info)
         self.rerun_log = rerun_log
         self.rerun_logger = None
         self.item_data_queue = Queue(queue_capacity)
@@ -52,7 +55,11 @@ class EpisodeWriter:
         self._create_pending = False
         self._closed = False
         self._error = None
+        self.quality_report = quality_report
+        self._quality_process = None
         self._outcome = "unspecified"
+        self._started_at = None
+        self._saved_at = None
         self.item_id = -1
         self.episode_id = -1
         self.episode_dir = None
@@ -87,6 +94,8 @@ class EpisodeWriter:
             self._state = "recording"
             self._create_pending = True
             self._outcome = "unspecified"
+            self._started_at = datetime.datetime.now().astimezone()
+            self._saved_at = None
             self.item_id = -1
         return True
 
@@ -141,12 +150,15 @@ class EpisodeWriter:
     def _start_episode(self):
         self.episode_dir = None
         self.task_dir.mkdir(parents=True, exist_ok=True)
-        existing = [int(path.name[8:]) for path in self.task_dir.iterdir()
-                    if path.is_dir() and path.name.startswith("episode_") and path.name[8:].isdigit()]
+        existing = [int(path.name[8:].split("_", 1)[0]) for path in self.task_dir.iterdir()
+                    if path.is_dir() and path.name.startswith("episode_")
+                    and path.name[8:].split("_", 1)[0].isdigit()]
         self.episode_id = max(existing, default=-1) + 1
         episode_dir = self.task_dir / f"episode_{self.episode_id:04d}"
         episode_dir.mkdir()
         self.episode_dir = episode_dir
+        self.info = deepcopy(self._base_info)
+        self.info["date"] = self._started_at.date().isoformat()
         self._frame_count = 0
         self._image_paths = {}
         self._written_images = {}
@@ -177,6 +189,8 @@ class EpisodeWriter:
             "frame_count": self._frame_count,
             "frames": "frames.jsonl",
             "outcome": outcome,
+            "started_at": self._started_at.isoformat(),
+            "saved_at": self._saved_at.isoformat() if self._saved_at is not None else None,
         }
         if error is not None:
             manifest["error"] = str(error)
@@ -294,7 +308,23 @@ class EpisodeWriter:
         self._frames = None
         self.raise_if_failed()
         self._record_measured_image_rates()
+        self._saved_at = datetime.datetime.now().astimezone()
+        saved_dir = self.task_dir / f"episode_{self.episode_id:04d}_{self._saved_at:%Y%m%d_%H%M%S_%f}"
+        self.episode_dir.rename(saved_dir)
+        self.episode_dir = saved_dir
         self._write_manifest("complete")
+        if self.quality_report:
+            try:
+                if self._quality_process is None or self._quality_process.poll() is not None:
+                    checker = Path(__file__).resolve().parents[2] / "tools/check_teleop_episode.py"
+                    self._quality_process = subprocess.Popen(
+                        [sys.executable, "-u", str(checker), "--worker"],
+                        stdin=subprocess.PIPE, text=True, encoding="utf-8",
+                        start_new_session=True)
+                self._quality_process.stdin.write(json.dumps(str(saved_dir.resolve())) + "\n")
+                self._quality_process.stdin.flush()
+            except (OSError, ValueError) as error:
+                logger.warning("[QUALITY] 无法启动质检；数据已保存：%s (%s)", saved_dir, error)
         with self._lock:
             if self._error is not None:
                 raise self._error
@@ -360,6 +390,11 @@ class EpisodeWriter:
             if self._state == "recording":
                 self._state = "saving"
         self.worker_thread.join(timeout=CLOSE_TIMEOUT)
+        if not self.worker_thread.is_alive() and self._quality_process is not None:
+            try:
+                self._quality_process.stdin.close()
+            except OSError:
+                pass
         if self.worker_thread.is_alive():
             with self._lock:
                 if self._error is None:

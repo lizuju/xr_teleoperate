@@ -61,7 +61,7 @@ class R1RecordingSnapshotTests(unittest.TestCase):
         self.hand_time = patch.object(self.hand_module, "time", SimpleNamespace(monotonic=lambda: self.now))
         self.hand_time.start()
         self.addCleanup(self.hand_time.stop)
-        self.hand = self.hand_module.LinkerO6Controller()
+        self.hand = self.hand_module.LinkerO6Controller(apply_grip_cap=False)
         self.hand._on_left_state(hand_fixtures.state_message([0.1] * 6, mode=2))
         self.hand._on_right_state(hand_fixtures.state_message([0.2] * 6, mode=2))
         self.hand.ready = self.hand.active = True
