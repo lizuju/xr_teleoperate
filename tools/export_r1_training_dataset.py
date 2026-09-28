@@ -11,7 +11,8 @@ import h5py
 import numpy as np
 
 from check_teleop_episode import (TRAINING_CAMERAS, TRAINING_GROUPS,
-                                 episode_file, validate_episode)
+                                 TRAINING_TIME_LIMITS, episode_file, training_observation,
+                                 training_timing, validate_episode)
 
 
 IMAGE_HW = (240, 320)
@@ -32,17 +33,18 @@ def export_dataset(source, output, min_frames=40):
     output.mkdir(parents=True)
     (output / "quality").mkdir()
     dataset = {
-        "schema": "r1_act_hdf5_v1", "status": "building", "source": str(source),
+        "schema": "r1_act_hdf5_v2", "status": "building", "source": str(source),
         "state_dim": sum(TRAINING_GROUPS.values()), "action_dim": sum(TRAINING_GROUPS.values()),
         "joint_groups": TRAINING_GROUPS, "camera_names": list(TRAINING_CAMERAS.values()),
         "image_size_hw": list(IMAGE_HW), "image_color_order": "RGB",
         "training_inputs": ["observations/qpos", "observations/images"], "imu_used": False,
         "action_semantics": "Same-row requested qpos before publisher limiting and hand smoothing; no time shift.",
-        "observation_semantics": "Same-row latest received states at the control tick; NOT aligned_states at camera time.",
+        "observation_semantics": "Camera-source-time paired images and aligned_states feedback. Software timestamps, not exposure synchronization.",
         "timing": "Original samples and measured intervals retained; no interpolation. Split at rejected rows and gaps >1.5 nominal periods.",
-        "deployment_contract": "Policy outputs must enter the same target shaping/limiting and hand smoothing path as recorded requests; not direct motor writes.",
-        "hand_request_time": "No separate hand-request timestamp in source; observed at sample time. Publication times are not request times.",
-        "qvel_semantics": "Offline finite differences of qpos using actual sample times; not measured velocity and not a training input.",
+        "deployment_contract": "At each decision tick, pair cameras and historical feedback by the same source-time rules; preserve observation age bounds. Actions remain that tick's requests and enter the recorded target shaping/limiting and hand smoothing path, not direct motor writes.",
+        "hand_request_time": "Recorded paired-target acceptance time and sequence, linked to successful hand publications; not physical execution time.",
+        "time_limits_ms": TRAINING_TIME_LIMITS.copy(),
+        "qvel_semantics": "Finite differences of aligned qpos over decision ticks, including repeated observations; not physical joint velocity or a training input.",
         "image_transform": "OpenCV INTER_AREA resize from each original image to 320x240, then BGR to RGB; original calibration needs the recorded x/y pixel scaling.",
         "min_segment_frames": min_frames, "sources": [], "episodes": [],
         "splits": {"train": [], "val": []}, "split_unit": "original_episode", "split_seed": 42,
@@ -114,8 +116,9 @@ def export_dataset(source, output, min_frames=40):
                 episode_id = len(dataset["episodes"])
                 filename = f"episode_{episode_id}.hdf5"
                 temporary = output / ("." + filename + ".tmp")
-                qpos = np.array([sum((r["states"][g]["qpos"] for g in TRAINING_GROUPS), [])
-                                 for r in selected], dtype=np.float32)
+                observations = [training_observation(r) for r in selected]
+                qpos = np.array([sum((o[g] for g in TRAINING_GROUPS), [])
+                                 for o in observations], dtype=np.float32)
                 actions = np.array([sum((r["actions"][g]["qpos"] for g in TRAINING_GROUPS), [])
                                     for r in selected], dtype=np.float32)
                 if not np.isfinite(qpos).all() or not np.isfinite(actions).all():
@@ -133,6 +136,29 @@ def export_dataset(source, output, min_frames=40):
                     h.create_dataset("source/frame_index", data=[r["idx"] for r in selected])
                     h.create_dataset("source/monotonic_ns", data=stamps)
                     h.create_dataset("source/arm_request_ns", data=[r["sample"]["commands"]["arm"]["requested"]["monotonic_ns"] for r in selected])
+                    h.create_dataset("source/hand_request_ns", data=[r["sample"]["commands"]["hands"]["requested"]["monotonic_ns"] for r in selected])
+                    h.create_dataset("source/hand_request_sequence", data=[r["sample"]["commands"]["hands"]["requested"]["sequence"] for r in selected])
+                    timings = [training_timing(r["sample"]) for r in selected]
+                    h.create_dataset("source/observation_ns", data=[t["observation_ns"] for t in timings])
+                    for kind in ("camera_ns", "feedback_ns", "request_ns"):
+                        for name in timings[0][kind]:
+                            h.create_dataset("source/" + kind + "/" + name, data=[t[kind][name] for t in timings])
+                    for metric in ("observation_skew_ms", "observation_age_ms", "request_skew_ms",
+                                   "arm_observation_delay_ms", "hands_observation_delay_ms"):
+                        h.create_dataset("source/" + metric, data=[t[metric] for t in timings])
+                    for name in timings[0]["camera_ns"]:
+                        for field in ("source_monotonic_ns", "clock_offset_ns", "clock_uncertainty_ns",
+                                      "clock_measured_monotonic_ns"):
+                            h.create_dataset("source/camera_timing/" + name + "/" + field,
+                                             data=[r["sample"]["sources"][name]["timing"][field] for r in selected])
+                        for field in ("clock_id", "timestamp_kind"):
+                            h.create_dataset("source/camera_timing/" + name + "/" + field,
+                                             dtype=h5py.string_dtype("utf-8"),
+                                             data=[r["sample"]["sources"][name]["timing"].get(field, "unknown")
+                                                   for r in selected])
+                    h.create_dataset("source/camera_timing/image/stereo_skew_ns",
+                                     data=[r["sample"]["sources"]["image"]["timing"]["stereo_skew_ns"]
+                                           for r in selected])
                     for name in ("robot", "left_hand_feedback", "right_hand_feedback", "image", "left_wrist_image", "right_wrist_image"):
                         h.create_dataset("source/received_ns/" + name,
                                          data=[r["sample"]["sources"][name]["received_monotonic_ns"] for r in selected])

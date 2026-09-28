@@ -1,0 +1,191 @@
+{
+  "tag": "production-20260928-visionpro",
+  "repositories": {
+    "xr_teleoperate": {
+      "base": "bfbde5dd5de9f799c0c5ac3c4d3662f7bc25a6d4",
+      "files_sha256": {
+        "README.md": "06b93bfac1c538a8e8a70a327bad2138c682e7d516801614c5269b28a077dff3",
+        "deploy/visionpro-video/README.md": "f28ea7cc8d5ad9f84b8d8235f4a8cc3ee584b3894d3433cee81ec8a74c5c8927",
+        "deploy/visionpro-video/r1-camera-forward-60001.service": "9c4f0ed1db003ec4b7483e6ce7da4af46791a058466d9519a8cdc5461359b091",
+        "deploy/visionpro-video/r1_webrtc_gateway.py": "913777036b44904238c34cfdd5e61fb78cc3459df43892e6f01a1ba055321571",
+        "deploy/visionpro-video/requirements-gateway.txt": "2c86681cbba49b904f172664110e356abfc987ca1aadda885f54b4e2b81da469",
+        "docs/releases/production-20260928-visionpro.md": "dc72f7c802abbde0e896dc19716bc17cd56dce9e409691bcfed4f8a17e8ffc78",
+        "outputs/数采质检与ACT训练导出.md": "59d602b14544e8897b407f640e52aed2697cb5afd3dc77f18abafa2b7997f9c8",
+        "teleop/robot_control/robot_hand_linker_o6.py": "b0fc1ba0fcd93ca3a7225a443ca32ec90cf7ae7f2cf1602dfa0003d9197c0ea9",
+        "teleop/teleop_hand_and_arm.py": "7878426abc0231627f54d7e3ee5cba787e676d43b0e72250635f54b3323a6a75",
+        "teleop/utils/act_dataset.py": "5a550b924eac19b3b9e5d2b01fe2322e11afed1565d2b2b08199c51299a55b5c",
+        "teleop/utils/episode_writer.py": "2ac552a5bfe1dbd0db1d370e41f7cc09600745ee6f3e71e1a605bf8bc8ba5abf",
+        "teleop/utils/r1_capture.py": "2a126693b5387f638a38d62fc769708808d11003b3d9011811cef613f7ea3f30",
+        "teleop/utils/teleop_status.py": "81ca2f321e1a0f32c0332ed84656b908bd1a23db065b693a7ce0e2e1eb5ce246",
+        "teleop/utils/visionpro_source.py": "9d21266c68d62cac765d1ad81c67f25c79654e4ba32c53895bf2506843be6e23",
+        "tests/test_r1_capture.py": "25f2ccd948f711b3b069004b3f219fa3f803be19a3c20a20676bca39aa8ef099",
+        "tests/test_r1_pause.py": "2facc281d3fe68241944b6aa745ca89b4c7385ddf4cdd3d8759f62b8baebea97",
+        "tests/test_r1_recording_snapshots.py": "d8c7ea82e8f9c408744003086e789010d2a02c8f9826749b152b7449fa125b88",
+        "tests/test_sensor_timing.py": "aa9a4e6fe1a5c0af6ce139cb03f1acf939392cb0dde82f38043f677086ce060d",
+        "tests/test_teleop_status.py": "7011d87daa61aa7e3a3ab519fbba3efcd0d72555190fc8836da5129d16b94d16",
+        "tests/test_training_export.py": "cae1f01cb919b2bc42345f2ef62c51774023d3870172e1fb77af9a178db49dc4",
+        "tests/test_video_gateway_status.py": "9b88d5bad981e7048532b06a3ace46dbd384fb368edcbb32853bbb5fb253f42f",
+        "tests/test_visionpro_backlog.py": "f698747211137d616fa0062a8b6474d142103e957de857c2df65aa8704f3a055",
+        "tests/test_visionpro_bridge.py": "72f53207c3550a4d2a927fec7f98c1bb02ff0b1ec3592390d2e7b767e3b8e0fa",
+        "tests/test_visionpro_source.py": "e3b649e5b790f9c13aed186bfabe87099eeb98a948d9aa67e4dd018024f2dcf0",
+        "tools/check_teleop_episode.py": "da8fe94b69bd646ef22836bf4daf7a593472c50fcd085b04647cde0202ca0177",
+        "tools/export_r1_training_dataset.py": "4e08d43d4440069d5cd4a98d5f71575bddfad0c720c775053471aaaf44daa1b6",
+        "tools/visionpro_bridge.py": "bb2c598e880710efaea8a8c548b2a3f45cf478841b4cda49d261c5e6c2088bba",
+        "tools/visionpro_protocol/README.md": "2ba433a8944ad02fc70a09c7532f3440eedf0ae648968da52bd88fa9991c64b7",
+        "tools/visionpro_protocol/handtracking.proto": "d1f5f344532c7af1546ab1a09a50fd940fdd6168b21f79820f8bc27bb2dfcf38",
+        "tools/visionpro_protocol/handtracking_pb2.py": "a8de212896670256b00e7ecf7073c6c30def4a2bdc503febe867c964519b14c3"
+      }
+    },
+    "VisionProTeleop": {
+      "base": "d4fd02fdc767cbf6be98b7b9b94bc7c875f26e54",
+      "files_sha256": {
+        "README-R1-安装.md": "43ee39934531d64f94f05379decf435ff1bcd28034fd782afe37cf1d09210979",
+        "README.md": "8c8b6a107141fad1824074cb5e7c542666812a38927868ccb2172b6cb9c42a9f",
+        "Tracking Streamer.xcodeproj/project.pbxproj": "4e148a197318c7113c1afe2b9b9053c8b24e8e43191d204d718e821ef8d9c673",
+        "Tracking Streamer/App.swift": "53f0469580dc63149715724192b3e62327ce9d6e22871a0bde1e0d3fc479bc8a",
+        "Tracking Streamer/CombinedStreamingView.swift": "a8ea9703c1f8b0e1e0f76b6cc79fd1ffebf95d04c5be68a53d5936343e3f8abc",
+        "Tracking Streamer/ContentView.swift": "7206c05b06a8a273e6533ffe12202166dea830d0cdcc43cdac9c70141b876836",
+        "Tracking Streamer/GRPCServer.swift": "5ad3ab5248b1132ef7dbb8be9a0dddded3896a9a4c6e170fe92a83b4d102c754",
+        "Tracking Streamer/ImmersiveView.swift": "c0ba84a2a6ca56eab9f8ef81cbe05776af4af8823ba89d7e6aff6982dcac95f1",
+        "Tracking Streamer/MuJoCo/MuJoCoStreamingView.swift": "fe53f4f94dd33eb7a5205f90dd2c049d038d6166381453c0b358d6839f4a773f",
+        "Tracking Streamer/Proto/handtracking.pb.swift": "d1b3404bc803b1cad172aeda2c24d4a187f600a0bbd3a9133aa76d4e674101d4",
+        "Tracking Streamer/RobotFirstPersonView.swift": "a200faaec40fcc1ebf6b1b1e3741165505bffbee7526cdb16b38902ba440f9d9",
+        "Tracking Streamer/RobotOperatorStatus.swift": "0ef02d75072aa1396e4d05c4f3ca7f148902144c9fc5e4fd547ece94c9715fb8",
+        "Tracking Streamer/RobotVideoConnection.swift": "5b9a5b2fe12910a2aec5060a4ffd4443f3748ba4427558d323ea3e1f073e4444",
+        "Tracking Streamer/RobotVideoOptics.metal": "0549004e4041bad7ab99985fb74aaef5b4b5dbea7aca08e9aead1c895bdcbca7",
+        "Tracking Streamer/RobotVideoOptics.swift": "b3961fe56079de39bbdce71b6da4e5851f43352a5d7328d65f005ed3975c2f13",
+        "Tracking Streamer/RobotVideoRootCA.der": "6e6f49cbb31815a2d02a4d82fa02b9633599193274163bcb07480d9861e64c5a",
+        "Tracking Streamer/RobotVideoTiming.swift": "c4b10a113e2b42e0c455aa71ffe861dadb20206af464fda3e7f485d0ade6da06",
+        "Tracking Streamer/Supporting files/RealityKitContent/Sources/RealityKitContent/RealityKitContent.rkassets/RobotStereoCalibrated.usda": "3d38622110fc3a957c7dfc4aa253ee331dbd7189b9ff23c5fe321d8f65d97c50",
+        "Tracking Streamer/head-optics.json": "6275926ad98e864bb20820430fbc44cb8a5fd501840ffa2c8de5ccbcb36ebb5b",
+        "Tracking Streamer/🌐RealityView.swift": "c4e81bb6b5a6f0359cb8c0fccf103bf08197649ae078799165abfc2f1e22422e",
+        "Tracking Streamer/🥽AppModel.swift": "2ec96e1b2319e02e56c296801d0993c4c661466f7bfe42d33c6235c8ca64f401",
+        "avp_stream/grpc_msg/handtracking.pb.swift": "d1b3404bc803b1cad172aeda2c24d4a187f600a0bbd3a9133aa76d4e674101d4",
+        "avp_stream/grpc_msg/handtracking.proto": "b24417f6e24408abbaf760197149b30f1fba6b9df9ea3c3fd66a430432b9bb5e",
+        "tests/native_sender/.gitignore": "2ca99dacdf8870024dce15908b589ab4af26e80f7e1235a6d0f274dc2891efe0",
+        "tests/native_sender/README.md": "8939870b849a091b8358f6050c0ef00d0843424315d3e4b944221ddb2a5ffd9b",
+        "tests/native_sender/Tests.swift": "1765240800c797a542972d49fa67bf1b21dcee44f890be0c75f32b2d7e2b4caa",
+        "tests/native_sender/generate.py": "ade8e310b63689c7ee20a32914485454c5d60d084365c293bdcc549f2a7dcc41"
+      }
+    },
+    "teleimager": {
+      "base": "a884d61752992cc70985d038e20a37f2a6c1b027",
+      "files_sha256": {
+        "pyproject.toml": "0c2d2e6307db356ae74d9e42d0f194d5585f6fa8b5b5193d8b9141652462e90e",
+        "src/teleimager/client.py": "b58f6f2d875507d3707645283344a41c9dd170ba4f759af7f5c282ed51c342fe",
+        "src/teleimager/server.py": "e170715564a4ed6c82dbed77757fc6880aaf42fcac3d07d89e639ff38c34f0dc",
+        "src/teleimager/video_metadata.py": "68e0dba40c61b0ae087f8166190e88215e9561bfe0047e3fa3d66a03ba951574",
+        "tests/test_client_socket_cleanup.py": "224ee3ac4bb41834050d45defa0686403231211f0cfd1d3e9dd4357740faf44e",
+        "tests/test_video_metadata.py": "9ee8e59cbb715885d197a1adc4b798f8f99ea1612ee7de5714de73f941460948",
+        "tests/test_video_metadata_aiortc.py": "c0448e73a1808c368ebeb20306e046ab48a560113ddaac1841ec62ba4d34b426"
+      }
+    }
+  },
+  "companion_commits": {
+    "VisionProTeleop": "82c213acef292218e24826ea03f7762e687182ef",
+    "teleimager": "97025042acd1f8d05cd5de7259d72b1c6b4bde73",
+    "televuer_unchanged": "184b469597c4f94b8b4099c492fb85ee29567bb2"
+  },
+  "release_tests": {
+    "parent_unique_passed": 252,
+    "parent_components": {
+      "main_regression": 232,
+      "isolated_bridge": 14,
+      "gateway_status": 6
+    },
+    "final_video_dependency_recheck_passed": 52,
+    "video_service_passed": 13,
+    "native_sender_passed": 29,
+    "skipped": 0
+  },
+  "previous_device_validation": {
+    "native_build": "passed",
+    "codesign": "passed",
+    "headset_install": "success",
+    "native_display_checks": {
+      "passed": 74,
+      "total": 74
+    },
+    "native_status_checks": {
+      "passed": 10,
+      "total": 10
+    },
+    "headset_readonly_measurement": {
+      "duration_seconds": 60.137270733946934,
+      "decoded_bridge_packets": 5148,
+      "source_sent_rate_hz": 88.75653295115357,
+      "source_packets_first_last": [
+        1,
+        5327
+      ],
+      "diagnostics_versions": [
+        1
+      ],
+      "head_anchor_invalid_packets": 0,
+      "video_invalid_packets": 0,
+      "head_loss_seq_first_last": [
+        5,
+        5
+      ],
+      "stream_ids": [
+        1
+      ],
+      "local_write_wait_ms": {
+        "min": 0.0,
+        "p50": 0.27929166662943317,
+        "p95": 0.33904166684806114,
+        "max": 0.539208333066199
+      },
+      "python_processing_delay_ms": {
+        "min": 0.5216752178966999,
+        "p50": 0.7520981598645449,
+        "p95": 0.802346970885992,
+        "max": 1.3178030494600534
+      },
+      "head_invalid_intervals": [
+        {
+          "start": 0.3762735780328512,
+          "hold_reason_latched": "receive_timeout",
+          "raw_head_anchor_valid": true,
+          "raw_video_ready": true,
+          "receive_age_ms": 253.7020279560238,
+          "mapped_head_age_ms": 255.783767439425,
+          "end": 0.4373726290650666
+        },
+        {
+          "start": 46.135057316860184,
+          "hold_reason_latched": "receive_timeout",
+          "raw_head_anchor_valid": true,
+          "raw_video_ready": true,
+          "receive_age_ms": 236.91761516965926,
+          "mapped_head_age_ms": 253.14811966381967,
+          "end": 46.18611612007953
+        }
+      ],
+      "receive_gaps_over_200ms": [
+        {
+          "elapsed": 0.4307727359700948,
+          "receive_gap_ms": 307.221194030717,
+          "source_sample_gap_ms": 293.63649999959307,
+          "tracking_loss_reason": "receive_timeout"
+        },
+        {
+          "elapsed": 46.18251594994217,
+          "receive_gap_ms": 283.49282196722925,
+          "source_sample_gap_ms": 10.730541666816862,
+          "tracking_loss_reason": "receive_timeout"
+        }
+      ],
+      "interpretation": "Head and video source validity stayed healthy. Pose arrival/age exceeded protection budget at startup and once in the steady window. Hold reason intentionally remains the first failure until explicit realignment. No robot control launched. Sending rate varies with source updates; not a matched before/after experiment."
+    }
+  },
+  "release_scope": {
+    "robot_started": false,
+    "production_checkouts_changed": false,
+    "camera_services_restarted": false,
+    "source_fps": 10,
+    "imu_training_input": false,
+    "training_schema": "r1_act_hdf5_v2"
+  },
+  "sensitive_file_scan": "changed release files: no private-key headers, GitHub token patterns, personal Xcode state or signing profiles"
+}

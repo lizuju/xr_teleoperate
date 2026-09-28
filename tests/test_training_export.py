@@ -16,7 +16,7 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 from check_teleop_episode import (SOURCE_NAMES, TRAINING_GROUPS, TRAINING_CAMERAS,
-                                 training_frame_rejections, validate_episode)
+                                 training_frame_rejections, training_timing, validate_episode)
 from export_r1_training_dataset import export_dataset
 from teleop.utils.act_dataset import R1ACTDataset, load_act_data
 from teleop.utils.episode_writer import EpisodeWriter
@@ -46,6 +46,7 @@ class TrainingExportTests(unittest.TestCase):
         rows = []
         for i in range(count):
             now = 10_000_000_000 + i * 25_000_000
+            anchor = now - 50_000_000
             sources = {n: {"received_monotonic_ns": now, "age_ms": 0.0, "fresh": True, "sequence": i+1}
                        for n in (*SOURCE_NAMES, "left_wrist_image", "right_wrist_image")}
             colors = {}
@@ -55,18 +56,47 @@ class TrainingExportTests(unittest.TestCase):
                 colors[k] = name
             for n in ("image", "left_wrist_image", "right_wrist_image"):
                 sources[n].update(repeated=False, offset_ms=0.0)
+                sources[n]["timing"] = {
+                    "source_monotonic_ns": anchor-1_000_000_000, "mapped_monotonic_ns": anchor,
+                    "clock_offset_ns": 1_000_000_000, "clock_id": "pc2",
+                    "clock_valid": True, "clock_measured_monotonic_ns": now-100_000_000,
+                    "clock_uncertainty_ns": 1000, "stereo_skew_ns": 2_000_000 if n == "image" else None,
+                    "timestamp_kind": "pc2_rtp_decoded_receive" if n == "image" else "pc2_v4l2_dequeue"}
             arm = {"arm_q": [base_value + i*.001]*14, "arm_tau": [0.0]*14,
-                   "head_q": [0.0]*2, "waist_q": 0.0, "monotonic_ns": now, "sequence": i+1}
+                   "head_q": [0.0]*2, "waist_q": 0.0, "monotonic_ns": now-2_000_000, "sequence": i+1}
+            imu = {"monotonic_ns": now, "sequence": i+1, "tick": i,
+                   "quaternion": [1.0, 0.0, 0.0, 0.0], "gyroscope": [0.0]*3,
+                   "accelerometer": [0.0]*3, "rpy": [0.0]*3, "temperature": 30, "valid": True}
+            aligned_value = base_value - .05 + i*.001
             rows.append({"idx": i, "colors": colors,
                          "states": {g: {"qpos": [base_value + i*.001]*n} for g,n in TRAINING_GROUPS.items()},
                          "actions": {g: {"qpos": [base_value + .2 + i*.001]*n} for g,n in TRAINING_GROUPS.items()},
                          "sample": {"timestamp_ns": now + 1_000_000_000_000, "monotonic_ns": now,
                                     "mode": "following", "sources": sources, "xr": {},
+                                    "imu": imu, "imu_packets": [imu],
+                                    "aligned_states": {
+                                        "robot": {"q": [aligned_value]*14, "head_q": [aligned_value]*2,
+                                                  "waist_q": aligned_value, "monotonic_ns": anchor+1_000_000,
+                                                  "imu": imu},
+                                        "hands": {s: {"q": [aligned_value]*6,
+                                                      "monotonic_ns": anchor+offset*1_000_000}
+                                                  for s,offset in (("left",2),("right",-3))}},
+                                    "sensor_alignment": {
+                                        "schema": "r1_sensor_sync_v1", "target_monotonic_ns": anchor,
+                                        "clock_valid": True, "stereo_aligned": True, "feedback_aligned": True,
+                                        "imu_valid": True, "imu_dropped_packets": 0, "usable": True,
+                                        "usable_with_imu": True,
+                                        "feedback_offset_ms": {"robot": 1.0, "left_hand_feedback": 2.0,
+                                                               "right_hand_feedback": -3.0}},
                                     "commands": {"arm": {"requested": arm, "published": copy.deepcopy(arm)},
-                                                 "hands": {"published": {s: {"q": [.3]*6, "mode": 1,
-                                                                             "sequence": i+1, "monotonic_ns": now}
+                                                 "hands": {"requested": {"left_q": [.3]*6, "right_q": [.3]*6,
+                                                                         "monotonic_ns": now-1_000_000, "sequence": i+1},
+                                                           "published": {s: {"q": [.3]*6, "mode": 1,
+                                                                             "sequence": i+1, "request_sequence": i+1,
+                                                                             "monotonic_ns": now}
                                                                           for s in ("left", "right")}}},
-                                    "camera_alignment": {"anchor": "head", "anchor_monotonic_ns": now,
+                                    "camera_alignment": {"anchor": "head", "anchor_monotonic_ns": anchor,
+                                                         "timestamp_basis": "mapped_source",
                                                          "offset_ms": {"head": 0.0, "left_wrist": 0.0, "right_wrist": 0.0},
                                                          "skew_ms": 0.0, "tolerance_ms": 25.0, "aligned": True}}})
         self.write(directory, manifest, rows)
@@ -90,7 +120,17 @@ class TrainingExportTests(unittest.TestCase):
             h.visit(keys.append)
             self.assertFalse(any("imu" in key for key in keys))
             np.testing.assert_allclose(h["action"][0], [.3]*29)
-            np.testing.assert_allclose(h["observations/qpos"][0], [.1]*29)
+            np.testing.assert_allclose(h["observations/qpos"][0], [.05]*29)
+            self.assertEqual(h["source/observation_ns"][0], 9_950_000_000)
+            self.assertEqual(h["source/feedback_ns/robot"][0], 9_951_000_000)
+            self.assertEqual(h["source/hand_request_ns"][0], 9_999_000_000)
+            self.assertEqual(h["source/hand_request_sequence"][0], 1)
+            self.assertEqual(h["source/observation_skew_ms"][0], 5.0)
+            self.assertEqual(h["source/observation_age_ms"][0], 53.0)
+            self.assertEqual(h["source/arm_observation_delay_ms"][0], 48.0)
+            self.assertEqual(h["source/hands_observation_delay_ms"][0], 49.0)
+            self.assertEqual(h["source/camera_timing/image/clock_id"].asstr()[0], "pc2")
+            self.assertEqual(h["source/camera_timing/image/stereo_skew_ns"][0], 2_000_000)
             np.testing.assert_array_equal(h["observations/images/head_left"][0, 0, 0], [200, 60, 20])
         loader = R1ACTDataset(self.output, chunk_size=4)
         images, qpos, actions, padding = loader[6]
@@ -130,6 +170,56 @@ class TrainingExportTests(unittest.TestCase):
         for i in range(2,5):
             self.assertEqual(dataset["sources"][i]["excluded_reason"], "not_success")
 
+    def test_alignment_and_command_times_are_checked_from_actual_stamps(self):
+        _, manifest, rows = self.episode(count=1)
+        original = rows[0]
+        self.assertEqual(training_frame_rejections(original, manifest["info"]), [])
+        mutations = {
+            "missing_wrist_clock": ("camera_clock_invalid", lambda s: s["sources"]["left_wrist_image"].pop("timing")),
+            "request_skew": ("request_skew", lambda s: s["commands"]["hands"]["requested"].update(monotonic_ns=s["monotonic_ns"]-40_000_000)),
+            "missing_request_stamp": ("request_stale", lambda s: s["commands"]["hands"]["requested"].pop("monotonic_ns")),
+            "unpublished_request": ("hand_request_unmatched", lambda s: s["commands"]["hands"]["published"]["left"].update(request_sequence=0)),
+            "publication_before_request": ("hand_request_unmatched", lambda s: s["commands"]["hands"]["published"]["left"].update(monotonic_ns=s["monotonic_ns"]-10_000_000)),
+            "wide_feedback": ("observation_skew", lambda s: s["aligned_states"]["robot"].update(monotonic_ns=s["monotonic_ns"]-90_000_000)),
+            "missing_aligned_hand": ("invalid_aligned_states", lambda s: s["aligned_states"]["hands"].pop("left")),
+            "nan_aligned_hand": ("invalid_aligned_states", lambda s: s["aligned_states"]["hands"]["left"].update(q=[float("nan")]*6)),
+            "future_second_eye": ("observation_skew", lambda s: s["sources"]["image"]["timing"].update(stereo_skew_ns=60_000_000)),
+            "missing_stereo_time": ("observation_skew", lambda s: s["sources"]["image"]["timing"].pop("stereo_skew_ns")),
+            "legacy_basis": ("sensor_unaligned", lambda s: s["camera_alignment"].update(timestamp_basis="host_receive")),
+        }
+        for name, (reason, mutate) in mutations.items():
+            with self.subTest(name=name):
+                row = copy.deepcopy(original)
+                mutate(row["sample"])
+                self.assertIn(reason, training_frame_rejections(row, manifest["info"]))
+
+    def test_fresh_receive_cannot_hide_old_observation_and_report_uses_actual_basis(self):
+        directory, manifest, rows = self.episode(count=1)
+        sample = rows[0]["sample"]
+        for name in ("image", "left_wrist_image", "right_wrist_image"):
+            for field in ("source_monotonic_ns", "mapped_monotonic_ns"):
+                sample["sources"][name]["timing"][field] -= 200_000_000
+        sample["camera_alignment"]["anchor_monotonic_ns"] -= 200_000_000
+        sample["sensor_alignment"]["target_monotonic_ns"] -= 200_000_000
+        for state in (sample["aligned_states"]["robot"], *sample["aligned_states"]["hands"].values()):
+            state["monotonic_ns"] -= 200_000_000
+        self.assertEqual(training_timing(sample)["observation_age_ms"], 253.0)
+        self.assertIn("observation_age", training_frame_rejections(rows[0], manifest["info"]))
+        self.write(directory, manifest, rows)
+        report = validate_episode(directory)
+        self.assertTrue(report["valid"], report["errors"])
+        self.assertEqual(report["training_no_imu"]["eligible_frames"], 0)
+        self.assertEqual(report["training_no_imu"]["timing_basis"], "mapped_source")
+        self.assertEqual(report["training_no_imu"]["timing"]["observation_age_ms"]["p95"], 253.0)
+
+    def test_loader_rejects_previous_observation_semantics(self):
+        self.episode()
+        dataset = export_dataset(self.source, self.output, min_frames=2)
+        dataset["schema"] = "r1_act_hdf5_v1"
+        (self.output / "dataset.json").write_text(json.dumps(dataset))
+        with self.assertRaises(ValueError):
+            R1ACTDataset(self.output)
+
     def test_missing_images_invalid_sources_and_no_overwrite(self):
         directory, manifest, rows = self.episode()
         (directory / rows[0]["colors"]["color_0"]).unlink()
@@ -164,6 +254,8 @@ class TrainingExportTests(unittest.TestCase):
         rows.pop(3)
         for i, r in enumerate(rows):
             r["idx"] = i
+            r["sample"]["imu"]["sequence"] = i+1
+            r["sample"]["sources"]["robot"]["sequence"] = i+1
         manifest["frame_count"] = len(rows)
         self.write(directory, manifest, rows)
         report = validate_episode(directory)
@@ -184,6 +276,7 @@ class TrainingExportTests(unittest.TestCase):
             arm.data["state"]["sequence"] = i+1
             arm.data["state"]["imu"].update(quaternion=[0.0]*4, valid=False)
             timing = {"clock_valid": True, "clock_id": "pc2", "mapped_monotonic_ns": now,
+                      "source_monotonic_ns": now-1_000_000_000, "clock_offset_ns": 1_000_000_000,
                       "clock_measured_monotonic_ns": now, "clock_uncertainty_ns": 1000,
                       "stereo_skew_ns": 0}
             head.timing = timing

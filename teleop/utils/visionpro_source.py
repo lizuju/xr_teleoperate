@@ -55,6 +55,8 @@ class VisionProMotionSource:
         self._ever_head = False
         self._head_live = False
         self._realign_required = False
+        self._hold_reason = None
+        self._source_diagnostics = {}
         self._error = None
         self._prediction = 0.
         self._stream_id = 0
@@ -88,6 +90,7 @@ class VisionProMotionSource:
                     with self._lock:
                         self._connected = False
                         self._realign_required |= self._ever_head
+                        self._latch_hold("connection_lost")
                         self._error = packet["disconnected"]
                         self._refresh(time.monotonic())
                     continue
@@ -99,6 +102,7 @@ class VisionProMotionSource:
             with self._lock:
                 self._connected = False
                 self._realign_required |= self._ever_head
+                self._latch_hold("connection_lost")
                 if self._error is None:
                     self._error = "Tracking Streamer receiver ended; restart the Vision Pro script"
             self._hello.set()
@@ -117,6 +121,7 @@ class VisionProMotionSource:
             stream_id = packet.get("stream_id", self._stream_id)
             if stream_id != self._stream_id:
                 self._realign_required |= self._ever_head
+                self._latch_hold("connection_restarted")
                 self._connected = False
                 self._head_live = False
                 self._packet_time = 0.
@@ -160,6 +165,13 @@ class VisionProMotionSource:
                     timestamps[key] = min(received, anchor_time + offset)
                 validity[key] = valid
             self._anchor_times, self._timestamps, self._valid = anchor_times, timestamps, validity
+            self._source_diagnostics = {
+                key: packet[key] for key in (
+                    "diagnostics_version", "head_anchor_valid", "video_required", "video_ready",
+                    "video_reason", "head_loss_seq", "left_loss_seq", "right_loss_seq",
+                    "last_write_ms", "packets_sent", "head_loss_reason",
+                ) if key in packet
+            } if packet.get("diagnostics_version") == 1 else {}
             self._clock_offset = offset
             if "head" in updates:
                 self._head = updates["head"].copy()
@@ -180,6 +192,7 @@ class VisionProMotionSource:
             lost = packet.get("tracking_lost", ())
             if "head" in lost:
                 self._realign_required |= self._ever_head
+                self._latch_hold(packet.get("tracking_loss_reason") or "tracking_interrupted")
             for side in ("left", "right"):
                 if side in lost:
                     self._hand_loss_seq[side] += 1
@@ -196,6 +209,7 @@ class VisionProMotionSource:
         head_live = connected and self._valid["head"] and 0. <= now - self._timestamps["head"] <= self.timeout
         if self._head_live and not head_live:
             self._realign_required = True
+            self._latch_hold(self._head_failure_reason(now))
         self._head_live = head_live
         self._ever_head |= head_live
         for side in ("left", "right"):
@@ -204,6 +218,45 @@ class VisionProMotionSource:
         stamps = [self._snapshot[f"{side}_hand_timestamp"] for side in ("left", "right")]
         self._snapshot["motion_data_ready"] = any(stamps)
         self._snapshot["motion_data_timestamp"] = min(stamps)
+
+    def _head_failure_reason(self, now):
+        if not self._connected:
+            return "connection_lost"
+        if now - self._received > self.timeout:
+            return "receive_timeout"
+        if ((self._packet_time and self._clock_offset is not None
+             and now - (self._packet_time + self._clock_offset) > self.timeout)
+                or (self._timestamps["head"] and now - self._timestamps["head"] > self.timeout)):
+            return "input_stale"
+        if self._source_diagnostics.get("diagnostics_version") == 1:
+            if not self._source_diagnostics["head_anchor_valid"]:
+                return "head_untracked"
+            if self._source_diagnostics["video_required"] and not self._source_diagnostics["video_ready"]:
+                return "video_" + (self._source_diagnostics["video_reason"] or "unavailable")
+        return "tracking_interrupted"
+
+    def _latch_hold(self, reason):
+        if self._ever_head and self._hold_reason is None:
+            self._hold_reason = reason
+
+    def get_hold_reason(self, latched_only=False):
+        with self._lock:
+            now = time.monotonic()
+            self._refresh(now)
+            if self._hold_reason is not None or latched_only:
+                return self._hold_reason
+            if not self._head_live:
+                return self._head_failure_reason(now)
+            missing = [side for side in ("left", "right") if not self._snapshot[f"{side}_hand_timestamp"]]
+            if missing:
+                return "both_hands_lost" if len(missing) == 2 else missing[0] + "_hand_lost"
+            return None
+
+    def clear_hold_reason(self):
+        with self._lock:
+            self._refresh(time.monotonic())
+            if not self._realign_required:
+                self._hold_reason = None
 
     @property
     def head_pose(self):
@@ -252,6 +305,11 @@ class VisionProMotionSource:
                       "prediction_seconds": self._prediction,
                       "stream_id": self._stream_id, "frames_coalesced": self._frames_coalesced,
                       "motion_sample_seq": self._snapshot["motion_sample_seq"]}
+            result.update(self._source_diagnostics)
+            result["hold_reason"] = self._hold_reason
+            result["receive_age_ms"] = (now - self._received) * 1000. if self._received else None
+            result["source_age_ms"] = ((now - self._packet_time - self._clock_offset) * 1000.
+                                       if self._clock_offset is not None else None)
             for side in ("left", "right"):
                 stamp = self._snapshot[f"{side}_hand_timestamp"]
                 result[f"{side}_age_ms"] = (now - stamp) * 1000. if stamp else None

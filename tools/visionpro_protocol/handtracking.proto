@@ -51,6 +51,17 @@ message HandUpdate {
   bool left_valid = 10;
   bool right_valid = 11;
   double prediction_seconds = 12;
+  uint32 diagnostics_version = 13;
+  bool head_anchor_valid = 14;
+  bool video_required = 15;
+  bool video_ready = 16;
+  string video_reason = 17;
+  uint64 head_loss_seq = 18;
+  uint64 left_loss_seq = 19;
+  uint64 right_loss_seq = 20;
+  double last_write_ms = 21;
+  uint64 packets_sent = 22;
+  string head_loss_reason = 23;
 }
 
 // The hand tracking service definition.

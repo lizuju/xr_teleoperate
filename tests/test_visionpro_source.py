@@ -362,6 +362,100 @@ class VisionProMotionSourceTest(unittest.TestCase):
         self.source.accept_packet(latest)
         self.assertFalse(self.source.get_hand_motion_snapshot()["motion_data_ready"])
 
+    def test_reason_uses_original_head_and_video_state_only_when_versioned(self):
+        for fields, reason in (
+            ({"diagnostics_version": 1, "head_anchor_valid": False,
+              "video_required": True, "video_ready": False, "video_reason": "source_stale"}, "head_untracked"),
+            ({"diagnostics_version": 1, "head_anchor_valid": True,
+              "video_required": True, "video_ready": False, "video_reason": "clock_expired"}, "video_clock_expired"),
+            ({"head_anchor_valid": False, "video_required": True}, "tracking_interrupted"),
+        ):
+            with self.subTest(reason=reason):
+                self.clock.return_value = 100.
+                source = visionpro_source.VisionProMotionSource(None, None)
+                source.accept_packet(packet())
+                self.clock.return_value = 100.05
+                data = packet(50.05, 100.05)
+                data.update(fields, head_valid=False)
+                source.accept_packet(data)
+                self.assertEqual(source.get_hold_reason(), reason)
+
+    def test_latched_reason_survives_new_good_data_and_event_consumption(self):
+        self.source.accept_packet(packet())
+        self.clock.return_value = 100.05
+        data = packet(50.05, 100.05)
+        data.update(tracking_lost=["head"], tracking_loss_reason="video_source_stale")
+        self.source.accept_packet(data)
+        self.source.clear_hold_reason()
+        self.assertEqual(self.source.get_hold_reason(), "video_source_stale")
+        self.assertTrue(self.source.consume_realign_required())
+        self.clock.return_value = 100.1
+        self.source.accept_packet(packet(50.1, 100.1))
+        self.assertEqual(self.source.get_hold_reason(), "video_source_stale")
+        self.source.clear_hold_reason()
+        self.assertIsNone(self.source.get_hold_reason())
+
+    def test_timeout_reason_survives_valid_packet_that_arrives_after_gap(self):
+        self.source.accept_packet(packet())
+        self.clock.return_value = 100.4
+        self.source.accept_packet(packet(50.4, 100.4))
+        self.assertTrue(self.source.get_hand_motion_snapshot()["motion_data_ready"])
+        self.assertEqual(self.source.get_hold_reason(), "receive_timeout")
+
+    def test_source_age_reason_precedes_video_failure_on_delayed_input(self):
+        self.source.accept_packet(packet())
+        self.clock.return_value = 100.1
+        data = packet(50.01, 100.1)
+        data.update(clock_offset=49.7, diagnostics_version=1, head_anchor_valid=True,
+                    video_required=True, video_ready=False, video_reason="source_stale")
+        self.source.accept_packet(data)
+        self.assertEqual(self.source.get_hold_reason(), "input_stale")
+
+    def test_reconnection_reason_is_latched_until_explicit_realign(self):
+        self.source.accept_packet(packet())
+        self.clock.return_value = 100.1
+        data = packet(10., 100.1)
+        data["stream_id"] = 2
+        self.source.accept_packet(data)
+        self.assertEqual(self.source.get_hold_reason(), "connection_restarted")
+        self.source.consume_realign_required()
+        self.assertEqual(self.source.get_hold_reason(), "connection_restarted")
+        self.source.clear_hold_reason()
+        self.assertIsNone(self.source.get_hold_reason())
+
+    def test_hand_only_hold_remains_automatic_and_does_not_latch_global_pause(self):
+        data = packet()
+        data["left_valid"] = False
+        self.source.accept_packet(data)
+        self.assertEqual(self.source.get_hold_reason(), "left_hand_lost")
+        self.assertIsNone(self.source.get_hold_reason(latched_only=True))
+        self.assertFalse(self.source.needs_realign)
+        self.clock.return_value = 100.1
+        self.source.accept_packet(packet(50.1, 100.1))
+        self.assertIsNone(self.source.get_hold_reason())
+
+    def test_first_latched_reason_is_not_replaced_by_later_different_fault(self):
+        self.source.accept_packet(packet())
+        self.clock.return_value = 100.05
+        data = packet(50.05, 100.05)
+        data.update(tracking_lost=["head"], tracking_loss_reason="head_untracked")
+        self.source.accept_packet(data)
+        self.source.consume_realign_required()
+        self.clock.return_value = 100.5
+        self.assertEqual(self.source.get_hold_reason(), "head_untracked")
+
+    def test_clearing_reason_does_not_swallow_fault_during_resume(self):
+        self.source.accept_packet(packet())
+        self.clock.return_value = 100.3
+        self.source.get_hand_motion_snapshot()
+        self.source.consume_realign_required()
+        self.clock.return_value = 100.31
+        self.source.accept_packet(packet(50.31, 100.31))
+        self.clock.return_value = 100.6
+        self.source.clear_hold_reason()
+        self.assertTrue(self.source.needs_realign)
+        self.assertEqual(self.source.get_hold_reason(), "receive_timeout")
+
 
 if __name__ == "__main__":
     unittest.main()

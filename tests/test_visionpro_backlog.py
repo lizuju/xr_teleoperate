@@ -95,6 +95,84 @@ class LatestTrackingTest(unittest.TestCase):
         self.assertEqual(self.pending.take(), (None, {"error": "invalid protocol"}))
         self.assertEqual(self.pending.take(), (None, None))
 
+    def test_source_loss_counts_preserve_invalid_frames_skipped_before_network(self):
+        self.pending.offer(message(diagnostics_version=1, head_anchor_valid=True,
+                                   head_loss_seq=5, left_loss_seq=9), 100.)
+        self.assertEqual(self.pending.take()[1]["tracking_lost"], [])
+        self.pending.offer(message(50.01, diagnostics_version=1, head_anchor_valid=True,
+                                   head_loss_seq=7, left_loss_seq=10,
+                                   head_loss_reason="video_source_stale"), 100.01)
+        latest, data = self.pending.take()
+        self.assertTrue(latest.head_valid)
+        self.assertEqual(data["tracking_lost"], ["head", "left"])
+        self.assertEqual(data["tracking_loss_reason"], "video_source_stale")
+        self.pending.offer(message(50.02, diagnostics_version=1, head_anchor_valid=True,
+                                   head_loss_seq=7, left_loss_seq=10), 100.02)
+        self.assertEqual(self.pending.take()[1]["tracking_lost"], [])
+
+    def test_diagnostics_first_packet_is_baseline_and_legacy_defaults_are_ignored(self):
+        self.pending.offer(message(), 100.)
+        self.pending.offer(message(50.01, diagnostics_version=1, head_anchor_valid=True,
+                                   head_loss_seq=88), 100.01)
+        self.assertEqual(self.pending.take()[1]["tracking_lost"], [])
+        self.pending.offer(message(50.02), 100.02)
+        self.pending.offer(message(50.03, diagnostics_version=1, head_anchor_valid=True,
+                                   head_loss_seq=89, head_loss_reason="head_untracked"), 100.03)
+        data = self.pending.take()[1]
+        self.assertEqual(data["tracking_lost"], ["head"])
+        self.assertEqual(data["tracking_loss_reason"], "head_untracked")
+
+    def test_source_counter_regression_is_rejected_but_reconnection_resets_baseline(self):
+        self.pending.offer(message(diagnostics_version=1, head_anchor_valid=True, left_loss_seq=4), 100.)
+        self.pending.take()
+        with self.assertRaisesRegex(ValueError, "counter moved backwards"):
+            self.pending.offer(message(50.01, diagnostics_version=1, head_anchor_valid=True,
+                                       left_loss_seq=3), 100.01)
+        self.pending.disconnect("reconnecting")
+        self.pending.begin_stream(2)
+        self.pending.offer(message(10., diagnostics_version=1, head_anchor_valid=True), 100.02)
+        self.pending.take()
+        data = self.pending.take()[1]
+        self.assertNotIn("left", data["tracking_lost"])
+
+    def test_coalescing_preserves_original_invalid_reason_after_recovery(self):
+        self.pending.offer(message(), 100.)
+        self.pending.take()
+        self.pending.offer(message(50.01, head_valid=False, diagnostics_version=1,
+                                   head_anchor_valid=True, video_required=True,
+                                   video_ready=False, video_reason="clock_expired"), 100.01)
+        self.pending.offer(message(50.02, diagnostics_version=1, head_anchor_valid=True,
+                                   video_required=True, video_ready=True), 100.02)
+        data = self.pending.take()[1]
+        self.assertEqual(data["tracking_loss_reason"], "video_clock_expired")
+        self.pending.offer(message(50.03), 100.03)
+        self.assertNotIn("tracking_loss_reason", self.pending.take()[1])
+
+    def test_timeout_and_source_age_take_priority_over_video_or_head_diagnostics(self):
+        for mode, expected in (("gap", "receive_timeout"), ("old_anchor", "input_stale"),
+                               ("delayed", "input_stale")):
+            with self.subTest(mode=mode):
+                pending = LatestTracking(.25)
+                pending.offer(message(), 100.)
+                pending.take()
+                if mode == "gap":
+                    sample, received, anchor = 50.3, 100.3, 50.3
+                elif mode == "old_anchor":
+                    sample, received, anchor = 50.1, 100.1, 49.7
+                else:
+                    sample, received, anchor = 50.01, 100.1, 50.01
+                    pending.offset = 49.7
+                pending.offer(message(sample, head_time=anchor, diagnostics_version=1,
+                                      head_anchor_valid=False, head_loss_seq=1,
+                                      head_loss_reason="video_source_stale"), received)
+                self.assertEqual(pending.take()[1]["tracking_loss_reason"], expected)
+
+    def test_raw_head_loss_takes_priority_over_video_failure(self):
+        self.pending.offer(message(head_valid=False, diagnostics_version=1,
+                                   head_anchor_valid=False, video_required=True,
+                                   video_reason="source_stale"), 100.)
+        self.assertEqual(self.pending.take()[1]["tracking_loss_reason"], "head_untracked")
+
 
 if __name__ == "__main__":
     unittest.main()

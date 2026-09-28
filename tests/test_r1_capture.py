@@ -61,9 +61,10 @@ def build(now, image_shape=(16, 32)):
     hand = Snapshot({
         "state": {side: {"q": [0.1] * 6, "monotonic_ns": now,
                          "sequence": 3, "mode": 1} for side in ("left", "right")},
-        "requested": {"left_q": [0.9] * 6, "right_q": [0.8] * 6},
+        "requested": {"left_q": [0.9] * 6, "right_q": [0.8] * 6,
+                      "monotonic_ns": now, "sequence": 4},
         "published": {side: {"q": [0.6] * 6, "monotonic_ns": now,
-                             "sequence": 4, "mode": 1} for side in ("left", "right")},
+                             "sequence": 4, "request_sequence": 4, "mode": 1} for side in ("left", "right")},
     })
     inputs = {side: {"received_monotonic_ns": now - 10_000_000,
                      "points": np.ones((25, 3)).tolist()} for side in ("left", "right")}

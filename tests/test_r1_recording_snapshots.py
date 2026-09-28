@@ -140,6 +140,8 @@ class R1RecordingSnapshotTests(unittest.TestCase):
         self.hand.update([0.9] * 6, [0.8] * 6)
         snapshot = self.hand.get_recording_snapshot()
         self.assertEqual(snapshot["requested"]["left_q"], [0.9] * 6)
+        self.assertEqual(snapshot["requested"]["monotonic_ns"], 50_000_000_000)
+        self.assertEqual(snapshot["requested"]["sequence"], 1)
         self.assertEqual(snapshot["state"]["left"]["q"], [0.1] * 6)
         self.assertTrue(0.1 < snapshot["published"]["left"]["q"][0] < 0.9)
         self.assertTrue(0.2 < snapshot["published"]["right"]["q"][0] < 0.8)
@@ -148,12 +150,14 @@ class R1RecordingSnapshotTests(unittest.TestCase):
             self.assertEqual(snapshot["published"][side]["q"], [command.q for command in message.cmds])
             self.assertEqual(snapshot["published"][side]["mode"], message.cmds[0].mode)
             self.assertEqual(snapshot["published"][side]["sequence"], 1)
+            self.assertEqual(snapshot["published"][side]["request_sequence"], 1)
 
     def test_hand_snapshot_read_does_not_publish_refresh_or_share_mutable_values(self):
         self.hand.update([0.9] * 6, [0.8] * 6)
         before = self.hand.get_recording_snapshot()
         timestamps = (self.hand.action_time, self.hand.left_state_time, self.hand.right_state_time)
         counts = [len(publisher.writes) for publisher in hand_fixtures.FakePublisher.instances]
+        self.now += 0.01
         for _ in range(3):
             self.assertEqual(self.hand.get_recording_snapshot(), before)
         self.assertEqual([len(publisher.writes) for publisher in hand_fixtures.FakePublisher.instances], counts)
@@ -191,7 +195,14 @@ class R1RecordingSnapshotTests(unittest.TestCase):
                 self.assertGreater(after["published"][successful_side]["monotonic_ns"],
                                    before["published"][successful_side]["monotonic_ns"])
                 self.assertEqual(after["state"], before["state"])
-                self.assertEqual(after["requested"], {"left_q": [0.8] * 6, "right_q": [0.9] * 6})
+                self.assertEqual(after["requested"], {
+                    "left_q": [0.8] * 6, "right_q": [0.9] * 6,
+                    "monotonic_ns": int(self.now * 1e9),
+                    "sequence": before["requested"]["sequence"] + 1})
+                self.assertEqual(after["published"][successful_side]["request_sequence"],
+                                 after["requested"]["sequence"])
+                self.assertNotEqual(after["published"][failing_side]["request_sequence"],
+                                    after["requested"]["sequence"])
 
     def test_hand_transport_exception_preserves_that_side_snapshot(self):
         self.hand.update([0.5] * 6, [0.6] * 6)

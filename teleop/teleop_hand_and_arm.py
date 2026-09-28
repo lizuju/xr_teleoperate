@@ -359,12 +359,13 @@ class PalmFrame:
     so an in-place swap would be applied twice.
     """
 
-    __slots__ = ("bgr", "sequence", "received_monotonic_ns")
+    __slots__ = ("bgr", "sequence", "received_monotonic_ns", "timing")
 
     def __init__(self, frame):
         self.bgr = np.ascontiguousarray(frame.bgr[:, :, ::-1])
         self.sequence = frame.sequence
         self.received_monotonic_ns = frame.received_monotonic_ns
+        self.timing = frame.timing
 
 
 def correct_palm_frame(frame):
@@ -604,8 +605,13 @@ if __name__ == '__main__':
     live_writer_lock_file = None
     live_sequence = 0
     exit_code = 0
+    native_status = None
 
     try:
+        if args.tracking_source == 'visionpro' and r1_a7_deferred_real:
+            from teleop.utils.teleop_status import TeleopStatusPublisher
+            native_status = TeleopStatusPublisher()
+            native_status.submit("waiting", record_enabled=args.record)
         if args.tracking_source == 'visionpro':
             from teleop.utils.visionpro_source import VisionProMotionSource
             visionpro_source = VisionProMotionSource(
@@ -1154,6 +1160,9 @@ if __name__ == '__main__':
             time.sleep(0.033)
             if STOP:
                 break
+            if native_status is not None:
+                native_status.submit("preparing" if r1_start_requested else "waiting",
+                                     recorder, args.record)
             if r1_a7_anchored:
                 arm_ctrl.raise_if_failed()
             if r1_a7_deferred_real and time.monotonic() >= tracking_diagnostic_next_time:
@@ -1590,7 +1599,7 @@ if __name__ == '__main__':
             if visionpro_source is not None and visionpro_source.needs_realign:
                 R1_PAUSE.pause()
                 visionpro_source.consume_realign_required()
-                logger_mp.warning('[VISIONPRO] Head tracking or connection interrupted; holding posture. Keep both hands stable and press r/s to realign.')
+                logger_mp.warning('[VISIONPRO] Input interrupted (%s); holding posture. Keep both hands stable and press r/s to realign.', visionpro_source.get_hold_reason())
             capture_mode = "following"
             run_motion = True
             if R1_PAUSE is not None and R1_PAUSE.paused:
@@ -1638,6 +1647,8 @@ if __name__ == '__main__':
                     last_fresh_tele_data = tele_data
                     tracking_hold_active = False
                     if R1_PAUSE.complete_resume(resume_generation):
+                        if visionpro_source is not None:
+                            visionpro_source.clear_hold_reason()
                         logger_mp.info("[R1 PAUSE] References realigned at held targets; following resumes next frame.")
             if r1_independent_hands:
                 raw_hand_present = hand_tracking_present(tele_data)
@@ -1895,7 +1906,7 @@ if __name__ == '__main__':
             if visionpro_source is not None and visionpro_source.needs_realign:
                 R1_PAUSE.pause()
                 visionpro_source.consume_realign_required()
-                logger_mp.warning('[VISIONPRO] Tracking interrupted during IK; holding posture until r/s realignment.')
+                logger_mp.warning('[VISIONPRO] Input interrupted during IK (%s); holding posture until r/s realignment.', visionpro_source.get_hold_reason())
             if R1_PAUSE is not None and R1_PAUSE.paused:
                 capture_mode = "paused"
                 run_motion = False
@@ -2238,6 +2249,18 @@ if __name__ == '__main__':
                     else:
                         recorder.add_item(colors=colors, depths=depths, states=states, actions=actions)
 
+            if native_status is not None:
+                motion_status = "stopped" if STOP else capture_mode
+                hold_reason = None
+                if R1_PAUSE is not None and R1_PAUSE.paused and not STOP:
+                    hold_reason = visionpro_source.get_hold_reason(latched_only=True)
+                    motion_status = "tracking_hold" if hold_reason else "paused"
+                elif motion_status == "following" and not run_motion:
+                    motion_status = "tracking_hold"
+                if motion_status == "tracking_hold" and hold_reason is None:
+                    hold_reason = visionpro_source.get_hold_reason() or "tracking_interrupted"
+                native_status.submit(motion_status, recorder, args.record, hold_reason=hold_reason)
+
             current_time = time.time()
             time_elapsed = current_time - start_time
             sleep_time = max(0, (1 / args.frequency) - time_elapsed)
@@ -2255,6 +2278,10 @@ if __name__ == '__main__':
         active_exception = sys.exc_info()[1]
         if isinstance(active_exception, SystemExit) and active_exception.code not in (None, 0):
             exit_code = active_exception.code if isinstance(active_exception.code, int) else 1
+        if native_status is not None:
+            native_status.submit("failed" if exit_code else "stopped", recorder, args.record,
+                                 failure_reason or (f"Teleoperation exited ({exit_code})" if exit_code else None),
+                                 force=True)
         try:
             # One readable line per session: a long single-side tracking loss is
             # otherwise only visible by digging through the alignment JSONL.
@@ -2371,5 +2398,8 @@ if __name__ == '__main__':
             logger_mp.error(f"Failed to close R1_A7 alignment diagnostics: {e}")
         if live_writer_lock_file is not None:
             live_writer_lock_file.close()
+        if native_status is not None:
+            native_status.close(recorder, args.record,
+                                failure_reason or (f"Teleoperation exited ({exit_code})" if exit_code else None))
         logger_mp.info("✅ Finally, exiting program.")
         raise SystemExit(exit_code)

@@ -1,0 +1,13 @@
+[Unit]
+Description=R1 head camera WebRTC signaling gateway
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/unitree_r1_dev/.venv-xr/bin/python -u %h/unitree_r1_dev/xr_teleoperate/deploy/visionpro-video/r1_webrtc_gateway.py
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target

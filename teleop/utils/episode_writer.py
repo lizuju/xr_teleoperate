@@ -60,6 +60,8 @@ class EpisodeWriter:
         self._outcome = "unspecified"
         self._started_at = None
         self._saved_at = None
+        self._current_episode = None
+        self._last_saved = None
         self.item_id = -1
         self.episode_id = -1
         self.episode_dir = None
@@ -86,6 +88,17 @@ class EpisodeWriter:
         with self._lock:
             return self._state == "idle" and not self._closed
 
+    def status_snapshot(self):
+        with self._lock:
+            state = "failed" if self._error is not None else self._state
+            return {
+                "state": state,
+                "episode": deepcopy(self._current_episode) if state != "idle" else None,
+                "frames_accepted": self.item_id + 1 if state != "idle" else 0,
+                "last_saved": deepcopy(self._last_saved),
+                "error": str(self._error) if self._error is not None else None,
+            }
+
     def create_episode(self):
         self.raise_if_failed()
         with self._lock:
@@ -96,6 +109,7 @@ class EpisodeWriter:
             self._outcome = "unspecified"
             self._started_at = datetime.datetime.now().astimezone()
             self._saved_at = None
+            self._current_episode = None
             self.item_id = -1
         return True
 
@@ -171,6 +185,8 @@ class EpisodeWriter:
             (episode_dir / name).mkdir()
         self._frames = (episode_dir / "frames.jsonl").open("x", encoding="utf-8")
         self._write_manifest("recording")
+        with self._lock:
+            self._current_episode = {"id": self.episode_id, "name": episode_dir.name}
         self.raise_if_failed()
         if self.rerun_log and self.rerun_logger is None:
             from .rerun_visualizer import RerunLogger
@@ -328,6 +344,11 @@ class EpisodeWriter:
         with self._lock:
             if self._error is not None:
                 raise self._error
+            self._last_saved = {
+                "id": self.episode_id, "name": self.episode_dir.name,
+                "outcome": self._outcome, "saved_at": self._saved_at.isoformat(),
+                "frames": self._frame_count,
+            }
             self._state = "idle"
         logger.info("Saved episode: %s (%d frames)", self.episode_dir, self._frame_count)
 

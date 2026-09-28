@@ -114,7 +114,8 @@ def capture_metadata(args, camera_config, retargeter, calibration=None, recordin
                     "packets": "all received DDS packets since previous sample; first sample seeds latest; buffer losses counted"},
             "clock_mapping": "host_ns = PC2_ns + offset_ns; minimum-delay round-trip estimate",
             "uncertainty": "half network round trip plus 100 ppm age allowance; excludes sensor/pipeline latency",
-            "xr": "raw received poses only; XR device clock is unavailable and poses are not retimed",
+            "xr": ("WebXR: Ubuntu event receive time. Native: estimated mapping from device anchor time; "
+                   "minimum transport delay remains unknown. XR poses are not retimed to images."),
         },
         "joint_names": {
             "left_arm": names[:7], "right_arm": names[7:],
@@ -155,6 +156,7 @@ def capture_metadata(args, camera_config, retargeter, calibration=None, recordin
             "sample.commands": "last successful SDK Write per publisher; not an execution acknowledgement",
             "states": "latest received motor feedback; each source retains its own receive time",
             "sample.aligned_states": "separate nearest-feedback observations at camera anchor; raw actions unchanged",
+            "hand_request_time": "Ubuntu monotonic time of accepted paired hand targets; sequence links successful publications",
             "sample.imu": "latest SDK IMU with the same receive sequence and tick as robot state",
             "sample.imu_packets": "unresampled IMU packet batch since previous recording sample",
             "states.*.torque": ("measured joint torque; an empty list means the source exposes no "

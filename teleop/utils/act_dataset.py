@@ -13,7 +13,7 @@ class R1ACTDataset(Dataset):
     def __init__(self, root, split="train", chunk_size=40):
         self.root = Path(root)
         self.metadata = json.loads((self.root / "dataset.json").read_text())
-        if self.metadata.get("schema") != "r1_act_hdf5_v1" or self.metadata.get("status") != "complete":
+        if self.metadata.get("schema") != "r1_act_hdf5_v2" or self.metadata.get("status") != "complete":
             raise ValueError("Dataset export is not complete or has an unknown schema")
         if split not in ("train", "val") or chunk_size <= 0:
             raise ValueError("Use train/val and a positive chunk_size")

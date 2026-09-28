@@ -87,6 +87,31 @@ class RecordingHistoryTests(unittest.TestCase):
 
 
 class CaptureTimingTests(unittest.TestCase):
+    def test_palm_color_correction_preserves_source_time_through_capture(self):
+        tree = ast.parse((ROOT / 'teleop/teleop_hand_and_arm.py').read_text())
+        nodes = [node for node in tree.body if isinstance(node, (ast.ClassDef, ast.FunctionDef))
+                 and node.name in ('PalmFrame', 'correct_palm_frame')]
+        namespace = {'np': np}
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), '<palm>', 'exec'), namespace)
+        now = time.monotonic_ns()
+        arm, hand, loop, xr, head = build(now)
+        head.timing = {'clock_valid': True, 'mapped_monotonic_ns': now-10_000_000,
+                       'clock_measured_monotonic_ns': now-20_000_000,
+                       'clock_uncertainty_ns': 1000, 'stereo_skew_ns': 1000}
+        wrist = SimpleNamespace(sequence=1, received_monotonic_ns=now,
+                                bgr=np.full((8, 16, 3), [20, 60, 200], np.uint8),
+                                timing=dict(head.timing, mapped_monotonic_ns=now-9_000_000))
+        corrected = namespace['correct_palm_frame'](wrist)
+        self.assertIs(corrected.timing, wrist.timing)
+        np.testing.assert_array_equal(wrist.bgr[0, 0], [20, 60, 200])
+        capture = R1Capture(arm, hand, loop, .25, (16, 32),
+                            wrist_image_shapes={'left': (8, 16), 'right': (8, 16)})
+        result = capture.frame(xr, head, 'following', {'left': corrected, 'right': corrected})
+        self.assertEqual(result['sample']['camera_alignment']['timestamp_basis'], 'mapped_source')
+        for side in ('left', 'right'):
+            self.assertEqual(result['sample']['sources'][side+'_wrist_image']['timing'], wrist.timing)
+        np.testing.assert_array_equal(result['colors']['color_2'][0, 0], [200, 60, 20])
+
     def test_source_time_drives_pairing_and_selected_head_pixels(self):
         now = time.monotonic_ns()
         arm, hand, loop, xr, head = build(now)
@@ -194,7 +219,8 @@ class CameraSourceTests(unittest.TestCase):
         for name in ('V4L2Camera','GstStereoRtpCamera'):
             camera=ns[name]()
             camera._enable_zmq=True;camera._enable_webrtc=False
-            camera._source_sequence=0;camera._clock_id='pc2';camera._ready=threading.Event()
+            camera._source_sequence=0;camera._clock_id='pc2';camera._source_epoch='capture-1'
+            camera._ready=threading.Event()
             camera._zmq_buffer=Buffer()
             if name=='V4L2Camera':
                 camera.container=object();camera._passthrough=True
@@ -213,4 +239,5 @@ class CameraSourceTests(unittest.TestCase):
             self.assertLessEqual(meta['source_monotonic_ns'],time.monotonic_ns())
             if name=='GstStereoRtpCamera':
                 self.assertEqual(int(pixels[0,-1,0]),102)
+                self.assertEqual(meta['source_epoch'], 'capture-1')
                 self.assertAlmostEqual(meta['stereo_skew_ns']/1e6,2,places=3)

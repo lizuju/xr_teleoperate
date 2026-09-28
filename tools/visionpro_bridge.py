@@ -23,6 +23,7 @@ class LatestTracking:
         self.event = None
         self.finished = False
         self.lost = set()
+        self.head_loss_reason = None
         self.coalesced = 0
         self.begin_stream(0)
 
@@ -35,6 +36,7 @@ class LatestTracking:
             self.anchors = {key: 0. for key in ("head", "left", "right")}
             self.timestamps = dict(self.anchors)
             self.live = {key: False for key in self.anchors}
+            self.source_loss_seq = None
 
     def offer(self, message, received):
         if message.tracking_protocol_version != 1:
@@ -49,8 +51,22 @@ class LatestTracking:
             offset = received - sample
             offset = offset if self.offset is None else min(offset, self.offset)
             lost = set()
+            head_reason = None
             if self.received and received - self.received > self.timeout:
                 lost.add("head")
+                head_reason = "receive_timeout"
+            source_loss_seq = None
+            source_head_loss_reason = None
+            if message.diagnostics_version == 1:
+                source_loss_seq = {key: getattr(message, f"{key}_loss_seq") for key in self.anchors}
+                if self.source_loss_seq is not None:
+                    for key, sequence in source_loss_seq.items():
+                        if sequence < self.source_loss_seq[key]:
+                            raise ValueError(f"{key} loss counter moved backwards")
+                        if sequence > self.source_loss_seq[key]:
+                            lost.add(key)
+                            if key == "head":
+                                source_head_loss_reason = message.head_loss_reason or "tracking_interrupted"
             for key in self.anchors:
                 anchor = getattr(message, f"{key}_time")
                 if not math.isfinite(anchor):
@@ -62,14 +78,29 @@ class LatestTracking:
                     raise ValueError(f"{key} tracking clock moved backwards")
                 if self.live[key] and received - self.timestamps[key] > self.timeout:
                     lost.add(key)
+                    if key == "head" and head_reason is None:
+                        head_reason = "input_stale"
                 if valid and anchor > self.anchors[key]:
                     self.anchors[key] = anchor
                     self.timestamps[key] = min(received, anchor + offset)
                 live = valid and 0. <= received - self.timestamps[key] <= self.timeout
                 if not live:
                     lost.add(key)
+                    if key == "head" and head_reason is None:
+                        if (anchor > 0. and age > self.timeout) or (valid and received - self.timestamps[key] > self.timeout):
+                            head_reason = "input_stale"
+                        elif message.diagnostics_version == 1 and not message.head_anchor_valid:
+                            head_reason = "head_untracked"
+                        elif message.diagnostics_version == 1 and message.video_required and not message.video_ready:
+                            head_reason = "video_" + (message.video_reason or "unavailable")
+                        else:
+                            head_reason = "tracking_interrupted"
                 self.live[key] = live
             self.lost.update(lost)
+            if self.head_loss_reason is None:
+                self.head_loss_reason = head_reason or source_head_loss_reason
+            if source_loss_seq is not None:
+                self.source_loss_seq = source_loss_seq
             self.offset, self.sample, self.received = offset, sample, received
             if self.latest is not None:
                 self.coalesced += 1
@@ -80,6 +111,8 @@ class LatestTracking:
         with self.condition:
             self.latest = None
             self.lost.add("head")
+            if self.head_loss_reason is None:
+                self.head_loss_reason = "connection_lost"
             self.event = {"error" if fatal else "disconnected": reason}
             self.finished = fatal
             self.condition.notify()
@@ -96,8 +129,11 @@ class LatestTracking:
             packet = {"received_monotonic": received, "stream_id": self.stream_id,
                       "clock_offset": self.offset, "tracking_lost": sorted(self.lost),
                       "frames_coalesced": self.coalesced}
+            if self.head_loss_reason is not None:
+                packet["tracking_loss_reason"] = self.head_loss_reason
             self.latest = None
             self.lost.clear()
+            self.head_loss_reason = None
             return message, packet
 
 
@@ -157,6 +193,11 @@ def main():
             for field in ("tracking_protocol_version", "sample_time", "head_time", "left_time", "right_time",
                           "head_valid", "left_valid", "right_valid", "prediction_seconds"):
                 packet[field] = getattr(message, field)
+            if message.diagnostics_version == 1:
+                for field in ("diagnostics_version", "head_anchor_valid", "video_required", "video_ready",
+                              "video_reason", "head_loss_seq", "left_loss_seq", "right_loss_seq",
+                              "last_write_ms", "packets_sent", "head_loss_reason"):
+                    packet[field] = getattr(message, field)
             for side in ("left", "right"):
                 hand = getattr(message, f"{side}_hand")
                 packet[f"{side}_wrist"] = matrix(hand.wristMatrix)

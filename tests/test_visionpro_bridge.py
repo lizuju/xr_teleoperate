@@ -40,6 +40,16 @@ def stream(request, context):
             sample_time=now, head_time=anchor, left_time=anchor, right_time=anchor,
             head_valid=True, left_valid=True, right_valid=True,
         )
+        if mode == 'source_loss':
+            message.diagnostics_version = 1
+            message.head_anchor_valid = True
+            message.video_required = message.video_ready = True
+            message.video_reason = 'ready'
+            message.last_write_ms = 0.3
+            message.packets_sent = 10
+            if now - initial > .15:
+                message.head_loss_seq = message.left_loss_seq = 1
+                message.head_loss_reason = 'video_source_stale'
         identity(message.Head, y=1.6)
         for side, x in (('left', -.3), ('right', .3)):
             hand = getattr(message, side + '_hand')
@@ -128,6 +138,25 @@ class VisionProBridgeTest(unittest.TestCase):
         self.assertTrue(source.needs_realign)
         self.assertTrue(source.consume_realign_required())
         self.assertFalse(source.needs_realign)
+
+    def test_versioned_diagnostics_and_hidden_loss_survive_full_bridge(self):
+        source = self.connect("source_loss")
+        deadline = time.monotonic() + 2.
+        while not source.needs_realign and time.monotonic() < deadline:
+            time.sleep(.01)
+        self.assertTrue(source.needs_realign)
+        self.assertEqual(source.get_hold_reason(), "video_source_stale")
+        diagnostics = source.get_tracking_diagnostics()
+        self.assertTrue(diagnostics["head_tracking"])
+        self.assertEqual(diagnostics["diagnostics_version"], 1)
+        self.assertEqual(diagnostics["head_loss_seq"], 1)
+        self.assertEqual(diagnostics["last_write_ms"], .3)
+        self.assertEqual(source.get_hand_motion_snapshot()["left_hand_timestamp"], 0.)
+        self.assertGreater(source.get_hand_motion_snapshot()["left_hand_timestamp"], 0.)
+        self.assertTrue(source.consume_realign_required())
+        self.assertEqual(source.get_hold_reason(), "video_source_stale")
+        source.clear_hold_reason()
+        self.assertIsNone(source.get_hold_reason())
 
 
 if __name__ == "__main__":

@@ -46,6 +46,8 @@ class LinkerO6Controller:
         self.right_action = None
         self.action_time = None
         self.requested_targets = None
+        self.requested_monotonic_ns = None
+        self.requested_sequence = 0
         self.published_commands = {"left": None, "right": None}
         self.published_sequences = {"left": 0, "right": 0}
         self.ready = False
@@ -259,7 +261,7 @@ class LinkerO6Controller:
             command.tau = torque
         return message
 
-    def _write_pair(self, left_values, right_values, modes, speed, torque):
+    def _write_pair(self, left_values, right_values, modes, speed, torque, request_sequence=None):
         error = None
         for side, publisher, message in (
             (
@@ -285,6 +287,7 @@ class LinkerO6Controller:
                         "speed": float(message.cmds[0].dq),
                         "monotonic_ns": int(time.monotonic() * 1e9),
                         "sequence": self.published_sequences[side],
+                        "request_sequence": request_sequence,
                     }
             except Exception as write_error:
                 if error is None:
@@ -336,7 +339,10 @@ class LinkerO6Controller:
         left_state, right_state, _, _, _, _ = self._state_snapshot()
         self.left_action = left_state
         self.right_action = right_state
-        self.requested_targets = (left_state.copy(), right_state.copy())
+        with self.state_lock:
+            self.requested_targets = (left_state.copy(), right_state.copy())
+            self.requested_monotonic_ns = int(time.monotonic() * 1e9)
+            self.requested_sequence += 1
         self.action_time = time.monotonic()
         self.active = True
 
@@ -349,6 +355,9 @@ class LinkerO6Controller:
         right = self._capped_target(self._values(right_target, "right target"), "right")
         with self.state_lock:
             self.requested_targets = (left.copy(), right.copy())
+            self.requested_monotonic_ns = int(time.monotonic() * 1e9)
+            self.requested_sequence += 1
+            request_sequence = self.requested_sequence
         left_state, right_state, left_state_time, right_state_time, left_mode, right_mode = self._state_snapshot()
         now = time.monotonic()
         if (
@@ -400,7 +409,8 @@ class LinkerO6Controller:
             modes.append(1 if enabled else 0)
             release_times.append(None if enabled else (released_at if released_at is not None else now))
         torque = self._command_torque
-        self._write_pair(*targets, modes=modes, speed=1.0, torque=torque)
+        self._write_pair(*targets, modes=modes, speed=1.0, torque=torque,
+                         request_sequence=request_sequence)
         for side, before, after in zip(("left", "right"), self.release_times, release_times):
             if before is None and after is not None:
                 logger.info("[LINKER O6] %s: holding; automatic recovery pending", side)
@@ -452,6 +462,8 @@ class LinkerO6Controller:
                 "requested": None if self.requested_targets is None else {
                     "left_q": self.requested_targets[0].tolist(),
                     "right_q": self.requested_targets[1].tolist(),
+                    "monotonic_ns": self.requested_monotonic_ns,
+                    "sequence": self.requested_sequence,
                 },
                 "published": {
                     side: None if command is None else {

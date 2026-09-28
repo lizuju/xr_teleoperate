@@ -118,7 +118,8 @@ class R1PauseControlIntegrationTest(unittest.TestCase):
         execute(self.nodes, self.ns, loop=True)
 
     def test_native_head_loss_pauses_until_explicit_resume_and_realigns(self):
-        source = SimpleNamespace(needs_realign=True)
+        source = SimpleNamespace(needs_realign=True, get_hold_reason=Mock(return_value="head_untracked"),
+                                 clear_hold_reason=Mock())
         source.consume_realign_required = lambda: setattr(source, "needs_realign", False)
         self.ns["visionpro_source"] = source
         self.tick(1.0)
@@ -135,6 +136,7 @@ class R1PauseControlIntegrationTest(unittest.TestCase):
         for index in range(1, 6):
             self.tick(1.3 + index * .1)
         self.assertFalse(self.state.paused)
+        source.clear_hold_reason.assert_called_once_with()
         self.tick(1.9)
         for target, expected in zip(self.ns["arm_ik"].solve_ik.call_args.args[:2], self.robot_poses):
             np.testing.assert_allclose(target, expected, atol=1e-12)
@@ -191,7 +193,8 @@ class R1PauseControlIntegrationTest(unittest.TestCase):
         self.ns["arm_ctrl"].ctrl_head_and_waist_go_home.assert_not_called()
 
     def test_native_head_loss_during_ik_discards_unpublished_solution(self):
-        source = SimpleNamespace(needs_realign=False)
+        source = SimpleNamespace(needs_realign=False, get_hold_reason=Mock(return_value="head_untracked"),
+                                 clear_hold_reason=Mock())
         source.consume_realign_required = lambda: setattr(source, "needs_realign", False)
         self.ns["visionpro_source"] = source
         def interrupted_ik(*args, **kwargs):
