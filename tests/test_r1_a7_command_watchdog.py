@@ -334,6 +334,141 @@ class R1A7VelocityFeedforwardTest(unittest.TestCase):
         _, dq = self.published[-1]
         self.assertLess(abs(dq[0]), 0.02, "a hold must not keep the last commanded speed running")
 
+    def test_equal_elapsed_time_gives_equal_filter_response_despite_tick_jitter(self):
+        outputs = []
+        for intervals in ([.025]*4, [.0125]*8, [.01, .04, .015, .035]):
+            self.controller._dq_feedforward[:] = 0.
+            self.controller._dq_feedforward_previous = None
+            self.controller._dq_feedforward_previous_at = None
+            self.controller._dq_feedforward_updated_at = None
+            start = self.now
+            self.submit(0.)
+            elapsed = 0.
+            for dt in intervals:
+                elapsed += dt
+                self.now = start + elapsed
+                self.submit(2.*elapsed)
+            outputs.append(self.controller._dq_feedforward.copy())
+        for output in outputs:
+            np.testing.assert_allclose(output, 2.*(1.-.5**4), atol=1e-10)
+
+    def test_decay_depends_on_elapsed_time_not_number_of_publisher_calls(self):
+        self.controller.dq_feedforward_filter = 1.
+        self.submit(0.)
+        self.now += .025
+        self.submit(.05)
+        updated_at = self.now
+        self.now = updated_at + .16
+        self.state.monotonic_timestamp = self.now
+        self.tick()
+        sparse = self.published[-1][1].copy()
+        self.controller._dq_feedforward[:] = 2.
+        for age in np.arange(.104, .161, .004):
+            self.now = updated_at + float(age)
+            self.state.monotonic_timestamp = self.now
+            self.tick()
+        np.testing.assert_allclose(self.published[-1][1], sparse, atol=1e-10)
+        np.testing.assert_allclose(sparse, 2.*.85**15, atol=1e-10)
+
+    def test_hold_removes_velocity_immediately_and_resume_does_not_reuse_it(self):
+        self.submit(0.)
+        self.now += .025
+        self.submit(.05)
+        self.tick()
+        self.assertGreater(self.published[-1][1][0], 0.)
+        self.now += .004
+        self.controller.hold_targets()
+        self.tick()
+        np.testing.assert_array_equal(self.published[-1][1], np.zeros(14))
+        for _ in range(2):
+            self.now += .025
+            self.submit(.05)
+            self.tick()
+            np.testing.assert_array_equal(self.published[-1][1], np.zeros(14))
+
+    def test_first_update_after_long_gap_does_not_reuse_old_velocity(self):
+        self.submit(0.)
+        self.now += .025
+        self.submit(.05)
+        self.now += .2
+        self.state.monotonic_timestamp = self.now
+        self.submit(.1)
+        self.tick()
+        np.testing.assert_array_equal(self.published[-1][1], np.zeros(14))
+        self.now += .025
+        self.submit(.15)
+        self.tick()
+        self.assertGreater(self.published[-1][1][0], 0.)
+
+    def test_shaping_and_feedforward_share_one_control_timestamp(self):
+        self.controller.target_shaper.velocity_limit = 2.
+        def clock():
+            self.now += .001
+            return self.now
+        self.namespace["time"].monotonic = clock
+        for include_head in (False, True):
+            with self.subTest(include_head=include_head):
+                for target in (0., .1):
+                    self.now += .025
+                    if include_head:
+                        self.controller.ctrl_dual_arm_and_head(
+                            np.full(14, target), np.zeros(14), [0., 0.],
+                            waist_yaw_target=.1,
+                        )
+                        self.assertEqual(
+                            self.controller.waist_target_updated_at,
+                            self.controller.target_updated_at,
+                        )
+                    else:
+                        self.controller.ctrl_dual_arm(np.full(14, target), np.zeros(14))
+                    self.assertEqual(
+                        self.controller.target_shaper.last_time,
+                        self.controller._dq_feedforward_previous_at,
+                    )
+                    self.assertEqual(
+                        self.controller._dq_feedforward_previous_at,
+                        self.controller.target_updated_at,
+                    )
+
+    def test_held_target_keeps_ramping_and_a_recovered_burst_stays_bounded(self):
+        shaper = self.controller.target_shaper
+        shaper.velocity_limit = 2.
+        shaper.accel_limit = 8.
+        self.controller.dq_feedforward_filter = 1.
+        self.submit(0.)
+        previous = self.controller.q_target.copy()
+        for interval, target in ((.025, 1.), (.025, 1.), (.04, 1.), (.2, 3.), (.025, 3.)):
+            self.now += interval
+            self.state.monotonic_timestamp = self.now
+            self.submit(target)
+            self.tick()
+            position, velocity = self.published[-1]
+            self.assertTrue(np.all(position > previous))
+            self.assertTrue(np.all(position - previous <= 2.*min(interval, .1) + 1e-9))
+            if interval > .1:
+                np.testing.assert_array_equal(velocity, np.zeros(14))
+            else:
+                np.testing.assert_allclose(velocity, (position - previous) / interval, atol=1e-9)
+            previous = position
+
+    def test_stale_publisher_snapshot_cannot_decay_newer_target_velocity(self):
+        self.controller.dq_feedforward_filter = 1.
+        self.submit(0.)
+        self.now += .025
+        self.submit(.05)
+        self.now += .15
+        self.state.monotonic_timestamp = self.now
+        fresh_velocity = np.full(14, .75)
+        def clip_and_receive_new_target(target, velocity_limit):
+            self.controller._dq_feedforward = fresh_velocity.copy()
+            self.controller._dq_feedforward_updated_at = self.now
+            return target
+        self.controller.simulation_mode = False
+        self.controller.clip_arm_q_target = clip_and_receive_new_target
+        self.tick()
+        np.testing.assert_array_equal(self.controller._dq_feedforward, fresh_velocity)
+        np.testing.assert_allclose(self.published[-1][1], 2.*.85**12.5, atol=1e-10)
+
     def test_feedforward_can_be_switched_off(self):
         """--arm-dq-feedforward off must restore the old dq=0 command exactly."""
         controller = self.namespace["R1_A7_ArmController"](

@@ -2434,14 +2434,13 @@ class R1_A7_ArmController:
                         dtype=np.float64,
                     )
 
-            # Velocity feed-forward, decayed to zero when no fresh target arrives so that
-            # a hold really holds instead of letting the last commanded speed run on.
-            if dq_feedforward_updated_at is not None and (
-                (time.monotonic() - dq_feedforward_updated_at) > self.dq_feedforward_timeout
-            ):
-                with self.ctrl_lock:
-                    self._dq_feedforward = self._dq_feedforward * self.dq_feedforward_decay
-                    dq_feedforward = self._dq_feedforward.copy()
+            if dq_feedforward_updated_at is not None:
+                decay_age = max(
+                    0.0, time.monotonic() - dq_feedforward_updated_at - self.dq_feedforward_timeout,
+                )
+                # Preserve the 250 Hz decay rate using elapsed time. Decay only this
+                # snapshot; a newer target may already have replaced shared state.
+                dq_feedforward *= self.dq_feedforward_decay ** (decay_age / 0.004)
 
             for idx, id in enumerate(R1_A7_JointArmIndex):
                 self.msg.motor_cmd[id].q = cliped_arm_q_target[idx]
@@ -2496,7 +2495,7 @@ class R1_A7_ArmController:
             sleep_time = max(0, (self.control_dt - all_t_elapsed))
             time.sleep(sleep_time)
 
-    def _update_dq_feedforward(self, q_target):
+    def _update_dq_feedforward(self, q_target, now):
         """Low-passed derivative of the (shaped) arm target, used as velocity feed-forward.
 
         Differentiating the raw IK step turns a Vision Pro burst into a velocity
@@ -2508,25 +2507,31 @@ class R1_A7_ArmController:
         # feed-forward state, and this must stay a no-op there.
         if not getattr(self, "dq_feedforward_enabled", False):
             return
-        now = time.monotonic()
         previous = self._dq_feedforward_previous
         previous_at = self._dq_feedforward_previous_at
         if previous is not None and previous_at is not None:
             interval = now - previous_at
-            if interval > 0.0:
+            if interval <= 0.0:
+                return
+            if interval > self.dq_feedforward_timeout:
+                self._dq_feedforward = np.zeros(14)
+                self._dq_feedforward_updated_at = None
+            else:
                 raw = (np.asarray(q_target, dtype=np.float64) - previous) / interval
                 raw = np.clip(raw, -self.dq_feedforward_limit, self.dq_feedforward_limit)
-                alpha = self.dq_feedforward_filter
+                # The configured gain describes a 40 Hz update; preserve its time
+                # constant when target updates arrive at irregular intervals.
+                alpha = 1.0 - (1.0 - self.dq_feedforward_filter) ** (interval / 0.025)
                 self._dq_feedforward = alpha * raw + (1.0 - alpha) * self._dq_feedforward
                 self._dq_feedforward_updated_at = now
         self._dq_feedforward_previous = np.array(q_target, dtype=np.float64, copy=True)
         self._dq_feedforward_previous_at = now
 
-    def _shape_arm_target(self, q_target):
+    def _shape_arm_target(self, q_target, now):
         shaper = getattr(self, "target_shaper", None)
         if shaper is None:
             return np.array(q_target, dtype=np.float64, copy=True)
-        return shaper.shape(q_target, now=time.monotonic())
+        return shaper.shape(q_target, now=now)
 
     def reset_target_shaper(self, reference_q=None):
         shaper = getattr(self, "target_shaper", None)
@@ -2551,11 +2556,12 @@ class R1_A7_ArmController:
         self.raise_if_failed()
         with self.ctrl_lock:
             self._check_target_freshness(self.target_updated_at)
-            shaped = self._shape_arm_target(q_target)
-            self._update_dq_feedforward(shaped)
+            now = time.monotonic()
+            shaped = self._shape_arm_target(q_target, now)
+            self._update_dq_feedforward(shaped, now)
             self.q_target = shaped
             self.tauff_target = tauff_target
-            self.target_updated_at = time.monotonic()
+            self.target_updated_at = now
 
     def ctrl_dual_arm_and_head(self, q_target, tauff_target, head_q_target, waist_yaw_target=None):
         '''Set arm, head, and optional waist targets from one tracking sample.'''
@@ -2577,15 +2583,16 @@ class R1_A7_ArmController:
             ))
         with self.ctrl_lock:
             self._check_target_freshness(self.target_updated_at)
-            shaped = self._shape_arm_target(q_target)
-            self._update_dq_feedforward(shaped)
+            now = time.monotonic()
+            shaped = self._shape_arm_target(q_target, now)
+            self._update_dq_feedforward(shaped, now)
             self.q_target = shaped
             self.tauff_target = tauff_target
             self.head_q_target = head_q_target
-            self.target_updated_at = time.monotonic()
+            self.target_updated_at = now
             if waist_yaw_target is not None:
                 self.waist_yaw_target = waist_yaw_target
-                self.waist_target_updated_at = time.monotonic()
+                self.waist_target_updated_at = now
                 self.waist_target_sequence += 1
                 self.waist_hold_requested = False
 
@@ -2600,6 +2607,10 @@ class R1_A7_ArmController:
             self._check_target_freshness(self.target_updated_at)
             if self.target_updated_at is not None:
                 self.target_updated_at = time.monotonic()
+            self._dq_feedforward = np.zeros(14)
+            self._dq_feedforward_previous = None
+            self._dq_feedforward_previous_at = None
+            self._dq_feedforward_updated_at = None
             shaper = getattr(self, "target_shaper", None)
             if shaper is not None:
                 shaper.reset(self.q_target)
