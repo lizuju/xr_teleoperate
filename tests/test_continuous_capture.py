@@ -257,6 +257,38 @@ class ContinuousCaptureTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "disk full"):
                 self.tick()
 
+    def test_auto_recovery_after_saved_episode_does_not_start_another_episode(self):
+        self.start()
+        self.writer.add_item({})
+        self.pause.pause(input_lost=True, now=1.)
+        self.key("n")
+        self.tick()
+        self.wait_ready()
+        for index in range(1, 6):
+            now = 1. + index * .1
+            sample = SimpleNamespace(motion_data_ready=True,
+                                     left_hand_timestamp=now, right_hand_timestamp=now)
+            token = self.pause.poll_resume(sample, .5, now)
+        self.assertTrue(self.pause.complete_resume(token))
+        self.tick()
+        self.assertFalse(self.ns["RECORD_TOGGLE"])
+        self.assertFalse(self.ns["RECORD_RUNNING"])
+        self.assertEqual(self.ns["r1_capture"].reset_episode.call_count, 1)
+        self.assertEqual(len(list(self.directory.glob("episode_*"))), 1)
+
+    def test_manual_p_cancels_auto_recovery_and_pending_episode(self):
+        self.pause.pause(input_lost=True, now=1.)
+        self.key("s")
+        self.assertTrue(self.ns["RECORD_TOGGLE"])
+        self.key("p")
+        self.pause.pause(input_lost=True, now=2.)
+        self.tick()
+        self.assertTrue(self.pause.paused)
+        self.assertIsNone(self.pause.resume_after)
+        self.assertFalse(self.pause.input_hold)
+        self.assertFalse(self.ns["RECORD_TOGGLE"])
+        self.assertFalse(self.ns["RECORD_RUNNING"])
+
 
 if __name__ == "__main__":
     unittest.main()

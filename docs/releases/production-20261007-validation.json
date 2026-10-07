@@ -1,0 +1,121 @@
+{
+  "tag": "production-20261007",
+  "date": "2026-10-07",
+  "parent_base": "10808c110e7a4acd9ce89a4ef3a41dff16e81398",
+  "native_commit": "12be52ae679977f6ebdd04968fc6837b4e1ca8db",
+  "python": {
+    "cwd": "/tmp/r1-release-20261007",
+    "base": "10808c110e7a4acd9ce89a4ef3a41dff16e81398",
+    "groups": {
+      "A-source-snapshot": {
+        "tests": 52,
+        "seconds": 6.198,
+        "skipped": 0,
+        "passed": true,
+        "log": "/tmp/r1-release-20261007-validation/A-source-snapshot.log"
+      },
+      "B-bridge-recovery": {
+        "tests": 31,
+        "seconds": 8.728,
+        "skipped": 0,
+        "passed": true,
+        "log": "/tmp/r1-release-20261007-validation/B-bridge-recovery.log"
+      },
+      "C-control-legacy": {
+        "tests": 93,
+        "seconds": 4.539,
+        "skipped": 0,
+        "passed": true,
+        "log": "/tmp/r1-release-20261007-validation/C-control-legacy.log"
+      },
+      "D-timing-grip": {
+        "tests": 28,
+        "seconds": 0.143,
+        "skipped": 0,
+        "passed": true,
+        "log": "/tmp/r1-release-20261007-validation/D-timing-grip.log"
+      }
+    },
+    "total_passed": 204,
+    "total_skipped": 0,
+    "submodules": {
+      "teleop/teleimager": {
+        "head": "97025042acd1f8d05cd5de7259d72b1c6b4bde73",
+        "clean": true
+      },
+      "teleop/televuer": {
+        "head": "184b469597c4f94b8b4099c492fb85ee29567bb2",
+        "clean": true
+      },
+      "teleop/robot_control/dex-retargeting": {
+        "head": "d7753d38c9ff11f80bafea6cd168351fd3db9b0e",
+        "clean": true
+      }
+    },
+    "tested_source_sha256": {
+      "teleop/robot_control/r1_pause.py": "5e3c6c77d941ac60dfd1a597ad39c8712dd141c7ee8fb98ccc8112da88f12ef4",
+      "teleop/teleop_hand_and_arm.py": "07bc259b9977fef523625e638b039df26de8c89dd4c15d1a6deab9b242c90637",
+      "teleop/utils/visionpro_source.py": "15ccdf881c5c7a1aae6daa517d1172ba84791a9c3cf9dc9f518297b379811bda",
+      "tools/check_visionpro_input.py": "fe2fbb39953d5d6524414b782235d8934c6f48b3b698cd9c45ab9d73e0e57921",
+      "tools/visionpro_bridge.py": "cb67dfd44bf7e2efd4fb9628a417133fd2fe42f649a8bb5d1e3e035a4a1f994a",
+      "tests/test_sensor_timing.py": "aa9a4e6fe1a5c0af6ce139cb03f1acf939392cb0dde82f38043f677086ce060d",
+      "tests/test_visionpro_backlog.py": "1922e925c3b2c7af961b05b53486f74647d5d7bd5dd04e4fe26909660a5f4d42",
+      "tests/test_visionpro_bridge.py": "9a9a278a01e40792035dbce581fb6716a2c408fd4909683300bc21a41c4230d1",
+      "tests/test_visionpro_diagnostics.py": "01090da55a0c61fb0ef7bc72ff11876b9874a352836a5f8d3873ecd352814b48",
+      "tests/test_visionpro_launchers.py": "8b8c77cdd48ea5b064b7e13e440dae5c0302e08f46e412a63d41e7a214e66dfe",
+      "tests/test_visionpro_legacy_contract.py": "223c3388e0bd07423363e1b32fa756d9e9a51176097f3036c5bbc2ef55784257",
+      "tests/test_visionpro_recovery.py": "b96ff11adc1731f79b4050f12c53ca4a98f1e20f1d6cc1f054c9704767e7ef8f",
+      "tests/test_visionpro_snapshot.py": "d47d9b53c67a8529b96be530f0b9c4f2c6b4410c9bf7f927569cb8e94013586f",
+      "tests/test_visionpro_source.py": "df7412b1a1e27393efe42b8252adbf285525398ebf92cb8269e636ff5dfc4ce6"
+    },
+    "snapshot_slots_after_tests": [],
+    "robot_started": false
+  },
+  "native": {
+    "display_checks_passed": 87,
+    "failed": 0,
+    "source_sha256": "2d9ac8f9effa8df9b208ff6899728d20969fbeb47e13329a96a99673fc7c1720",
+    "matches_installed_source": true,
+    "new_device_install_during_release": false
+  },
+  "release_files_sha256": {
+    "README.md": "f7f9fe4f26f8f1c677405d281ca7b93d149beef863e46573c7649768e4ee90ec",
+    "docs/releases/production-20261007.md": "2aac52a65f3a378dcc1f0e13796e4709c799c2a5083957d61f52113731f1c175",
+    "outputs/VisionProTeleop透视接入.md": "2ba646e6ae3e3d5c9a13641d222983a64bbc8752a18b63d1cc78c8dadc2377c1",
+    "outputs/数采质检与ACT训练导出.md": "467545af721c1b1e8630e7edee7dfdc54f70de937f1f446e80e269c7c5ebadbe",
+    "teleop/robot_control/r1_pause.py": "5e3c6c77d941ac60dfd1a597ad39c8712dd141c7ee8fb98ccc8112da88f12ef4",
+    "teleop/teleop_hand_and_arm.py": "07bc259b9977fef523625e638b039df26de8c89dd4c15d1a6deab9b242c90637",
+    "teleop/utils/visionpro_source.py": "15ccdf881c5c7a1aae6daa517d1172ba84791a9c3cf9dc9f518297b379811bda",
+    "tests/test_continuous_capture.py": "6edfa6fb66ee5799cc36b09046e528f572def345e4083b46b48635bc38820667",
+    "tests/test_r1_pause.py": "487b068d3a752b2572ff1ecd6ec6c1960f7dc19473a5ba6be0aa645392234859",
+    "tests/test_teleop_status.py": "ee46cf5df89225a1441b3f359509db6cd795d3a72539ec4cef8e36c389f6aae6",
+    "tests/test_visionpro_backlog.py": "1922e925c3b2c7af961b05b53486f74647d5d7bd5dd04e4fe26909660a5f4d42",
+    "tests/test_visionpro_bridge.py": "9a9a278a01e40792035dbce581fb6716a2c408fd4909683300bc21a41c4230d1",
+    "tests/test_visionpro_diagnostics.py": "01090da55a0c61fb0ef7bc72ff11876b9874a352836a5f8d3873ecd352814b48",
+    "tests/test_visionpro_recovery.py": "b96ff11adc1731f79b4050f12c53ca4a98f1e20f1d6cc1f054c9704767e7ef8f",
+    "tests/test_visionpro_snapshot.py": "d47d9b53c67a8529b96be530f0b9c4f2c6b4410c9bf7f927569cb8e94013586f",
+    "tests/test_visionpro_source.py": "df7412b1a1e27393efe42b8252adbf285525398ebf92cb8269e636ff5dfc4ce6",
+    "tools/check_visionpro_input.py": "fe2fbb39953d5d6524414b782235d8934c6f48b3b698cd9c45ab9d73e0e57921",
+    "tools/visionpro_bridge.py": "cb67dfd44bf7e2efd4fb9628a417133fd2fe42f649a8bb5d1e3e035a4a1f994a",
+    "tools/visionpro_protocol/README.md": "108dd8c521ada040980cbcdbe970f2830b669979a7bdfc52ebc4a9a113ffa7a9"
+  },
+  "runtime_checkout_changed_during_release": false,
+  "robot_started": false,
+  "camera_services_restarted": false,
+  "grip_cap": {
+    "change": "previously backed up and removed user configuration; no source change needed",
+    "left": null,
+    "right": null,
+    "command_torque": 1.0,
+    "normalized_joint_range": [
+      0,
+      1
+    ]
+  },
+  "preserved_remote_fixes": [
+    "teleimager clock socket cleanup and video source metadata",
+    "camera source_epoch test coverage",
+    "full protocol diagnostics documentation"
+  ],
+  "sensitive_file_scan": "changed release files checked for private-key headers and GitHub token patterns; personal signing profiles and Xcode user state excluded"
+}

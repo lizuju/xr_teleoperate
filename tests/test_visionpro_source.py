@@ -2,6 +2,7 @@ from copy import deepcopy
 from pathlib import Path
 import sys
 import threading
+import tempfile
 import unittest
 from unittest import mock
 
@@ -49,6 +50,29 @@ class VisionProMotionSourceTest(unittest.TestCase):
             self.assertEqual(sample[f"{side}_hand_timestamp"], 0.0)
             self.assertAlmostEqual(np.linalg.det(sample[f"{side}_arm_pose"]), 1.0)
         self.assertFalse(self.source.consume_realign_required())
+
+    def test_pipeline_delay_is_reported_without_restamping_or_mutating_packet(self):
+        data = packet(sample=50., received=100.)
+        data.update(bridge_emit_monotonic=100.02, receiver_json_ms=2.,
+                    transport={"upstream_age_ms": 80., "bridge_pending_ms": 20.})
+        before = deepcopy(data)
+        self.clock.side_effect = [100.05, 100.06]
+        self.source.accept_packet(data)
+        self.clock.side_effect = None
+        self.clock.return_value = 100.06
+        diagnostics = self.source.get_tracking_diagnostics()
+        self.assertAlmostEqual(diagnostics["transport"]["bridge_to_receiver_ms"], 30.)
+        self.assertAlmostEqual(diagnostics["transport"]["receiver_processing_ms"], 10.)
+        self.assertAlmostEqual(diagnostics["left_age_ms"], 60.)
+        self.assertEqual(data, before)
+        diagnostics["transport"]["receiver_max_ms"]["bridge_to_receiver_ms"] = 999.
+        self.clock.return_value = 100.07
+        fresh = packet(sample=50.07, received=100.07)
+        fresh.update(bridge_emit_monotonic=100.07, transport={"bridge_pending_ms": 0.})
+        self.source.accept_packet(fresh)
+        transport = self.source.get_tracking_diagnostics()["transport"]
+        self.assertAlmostEqual(transport["bridge_to_receiver_ms"], 0.)
+        self.assertAlmostEqual(transport["receiver_max_ms"]["bridge_to_receiver_ms"], 30.)
 
     def test_native_axes_match_webxr_for_both_hands(self):
         data = packet()
@@ -342,12 +366,12 @@ class VisionProMotionSourceTest(unittest.TestCase):
             self.assertEqual(reads[0]["right_hand_timestamp"], 100.)
             self.assertEqual(reads[1]["left_hand_timestamp"], 100.)
 
-    def test_reconnected_stream_resets_clocks_but_requires_explicit_realignment(self):
+    def test_reconnected_stream_preserves_clock_and_requires_explicit_realignment(self):
         initial = packet()
         initial["stream_id"] = 1
         self.source.accept_packet(initial)
         self.clock.return_value = 100.1
-        recovered = packet(10., 100.1)
+        recovered = packet(50.1, 100.1)
         recovered["stream_id"] = 2
         self.source.accept_packet(recovered)
         self.assertTrue(self.source.get_hand_motion_snapshot()["motion_data_ready"])
@@ -355,6 +379,76 @@ class VisionProMotionSourceTest(unittest.TestCase):
         self.assertTrue(self.source.needs_realign)
         self.assertTrue(self.source.consume_realign_required())
         self.assertFalse(self.source.needs_realign)
+
+    def test_reconnect_does_not_restamp_delayed_first_packet(self):
+        initial = packet()
+        initial["stream_id"] = 1
+        self.source.accept_packet(initial)
+        self.clock.return_value = 101.
+        delayed = packet(50.2, 101.)
+        delayed["stream_id"] = 2
+        self.source.accept_packet(delayed)
+        self.assertFalse(self.source.get_hand_motion_snapshot()["motion_data_ready"])
+        self.assertEqual(self.source._clock_offset, 50.)
+        self.assertTrue(self.source.needs_realign)
+        self.clock.return_value = 101.1
+        fresh = packet(51.1, 101.1)
+        fresh["stream_id"] = 2
+        self.source.accept_packet(fresh)
+        self.assertTrue(self.source.get_hand_motion_snapshot()["motion_data_ready"])
+        self.assertTrue(self.source.needs_realign)
+
+    def test_peer_clock_reset_requires_a_new_receiver(self):
+        self.source.accept_packet(packet())
+        self.clock.return_value = 100.1
+        reset = packet(10., 100.1)
+        reset["stream_id"] = 2
+        with self.assertRaisesRegex(ValueError, "restart the receiver"):
+            self.source.accept_packet(reset)
+        self.assertFalse(self.source.get_hand_motion_snapshot()["motion_data_ready"])
+        self.assertTrue(self.source.needs_realign)
+
+    def test_recovery_event_retains_reason_and_counters_without_new_pose(self):
+        self.source.accept_packet(packet())
+        self.clock.return_value = 100.1
+        event = {"disconnected": "Pose stream stalled; reconnecting",
+                 "tracking_loss_reason": "input_stale",
+                 "transport": {"reconnect_count": 1, "reconnect_reason": "source_stale"}}
+        with tempfile.TemporaryDirectory() as folder:
+            self.source._snapshot_path = Path(folder) / "snapshot.json"
+            self.source._snapshot_path.write_text(visionpro_source.json.dumps(event))
+            self.source._process = mock.Mock()
+            self.source._process.poll.return_value = 0
+            self.source._read()
+        diagnostics = self.source.get_tracking_diagnostics()
+        self.assertFalse(diagnostics["head_tracking"])
+        self.assertEqual(diagnostics["hold_reason"], "input_stale")
+        self.assertEqual(diagnostics["transport"]["reconnect_count"], 1)
+        self.assertTrue(self.source.needs_realign)
+
+    def test_overwritten_loss_is_seen_once_per_consumer_with_latest_pose(self):
+        initial = packet()
+        initial["tracking_loss_seq"] = dict(head=0, left=0, right=0)
+        initial["bridge_publish_seq"] = 1
+        self.source.accept_packet(initial)
+        self.clock.return_value = 100.1
+        latest = packet(50.1, 100.1)
+        latest.update(tracking_loss_seq=dict(head=1, left=2, right=0),
+                      tracking_loss_reason="video_source_stale", bridge_publish_seq=15)
+        self.source.accept_packet(latest)
+        self.assertTrue(self.source.needs_realign)
+        first = self.source.get_hand_motion_snapshot()
+        self.assertEqual(first["left_hand_timestamp"], 0.)
+        self.assertGreater(first["right_hand_timestamp"], 0.)
+        self.assertGreater(self.source.get_hand_motion_snapshot()["left_hand_timestamp"], 0.)
+        self.source.consume_realign_required()
+        self.clock.return_value = 100.12
+        latest.update(sample_time=50.12, received_monotonic=100.12,
+                      head_time=50.12, left_time=50.12, right_time=50.12, bridge_publish_seq=16)
+        self.source.accept_packet(latest)
+        self.assertFalse(self.source.needs_realign)
+        self.assertGreater(self.source.get_hand_motion_snapshot()["left_hand_timestamp"], 0.)
+        self.assertEqual(self.source.get_tracking_diagnostics()["transport"]["snapshots_skipped"], 13)
 
     def test_bridge_best_offset_prevents_delayed_newest_packet_becoming_fresh(self):
         latest = packet(50., 100.)
@@ -414,7 +508,7 @@ class VisionProMotionSourceTest(unittest.TestCase):
     def test_reconnection_reason_is_latched_until_explicit_realign(self):
         self.source.accept_packet(packet())
         self.clock.return_value = 100.1
-        data = packet(10., 100.1)
+        data = packet(50.1, 100.1)
         data["stream_id"] = 2
         self.source.accept_packet(data)
         self.assertEqual(self.source.get_hold_reason(), "connection_restarted")

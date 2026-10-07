@@ -73,6 +73,56 @@ class R1PauseStateTest(unittest.TestCase):
         self.assertFalse(self.state.complete_resume(token))
         self.assertTrue(self.state.paused)
 
+    def test_native_input_hold_automatically_requests_stable_recovery(self):
+        self.state.pause(input_lost=True, now=1.0)
+        self.assertTrue(self.state.input_hold)
+        self.assertEqual(self.state.resume_after, 1.0)
+        token = self.stable_frames()
+        self.assertTrue(self.state.complete_resume(token))
+        self.assertFalse(self.state.paused)
+        self.assertFalse(self.state.input_hold)
+
+    def test_new_input_loss_cancels_ready_token_and_preserves_following_intent(self):
+        self.state.pause(input_lost=True, now=1.0)
+        token = self.stable_frames()
+        self.state.pause(input_lost=True, now=1.6)
+        self.assertFalse(self.state.complete_resume(token))
+        self.assertTrue(self.state.input_hold)
+        self.assertEqual(self.state.resume_after, 1.6)
+        self.assertEqual(self.state.samples, 0)
+        self.assertTrue(self.state.complete_resume(self.stable_frames(1.6)))
+
+    def test_manual_pause_cancels_auto_recovery_and_survives_further_input_loss(self):
+        self.state.pause(input_lost=True, now=1.0)
+        token = self.stable_frames()
+        self.state.pause()
+        self.assertFalse(self.state.complete_resume(token))
+        self.state.pause(input_lost=True, now=1.6)
+        self.assertFalse(self.state.input_hold)
+        self.assertIsNone(self.state.resume_after)
+        self.assertIsNone(self.stable_frames(1.6))
+        self.assertTrue(self.state.paused)
+
+    def test_explicit_resume_intent_survives_subsequent_input_interruption(self):
+        self.state.pause()
+        self.state.request_resume(1.0)
+        self.state.pause(input_lost=True, now=1.2)
+        self.assertTrue(self.state.input_hold)
+        self.assertEqual(self.state.resume_after, 1.2)
+        self.assertTrue(self.state.complete_resume(self.stable_frames(1.2)))
+
+    def test_auto_recovery_needs_valid_fresh_hands_and_full_stability_time(self):
+        self.state.pause(input_lost=True, now=1.0)
+        for now in (1.01, 1.02, 1.03, 1.04, 1.05):
+            self.assertIsNone(self.state.poll_resume(tracked_sample(now), .5, now))
+        sample = tracked_sample(1.1)
+        sample.motion_data_ready = False
+        self.assertIsNone(self.state.poll_resume(sample, .5, 1.1))
+        self.assertEqual(self.state.samples, 0)
+        self.assertIsNone(self.state.poll_resume(tracked_sample(1.1), .5, 1.7))
+        self.assertEqual(self.state.samples, 0)
+        self.assertTrue(self.state.complete_resume(self.stable_frames(1.7)))
+
 
 class R1PauseControlIntegrationTest(unittest.TestCase):
     def setUp(self):
@@ -117,13 +167,14 @@ class R1PauseControlIntegrationTest(unittest.TestCase):
         self.sample.motion_data_timestamp = now
         execute(self.nodes, self.ns, loop=True)
 
-    def test_native_head_loss_pauses_until_explicit_resume_and_realigns(self):
+    def test_native_head_loss_automatically_realigns_at_held_pose_without_jump(self):
         source = SimpleNamespace(needs_realign=True, get_hold_reason=Mock(return_value="head_untracked"),
                                  clear_hold_reason=Mock())
         source.consume_realign_required = lambda: setattr(source, "needs_realign", False)
         self.ns["visionpro_source"] = source
         self.tick(1.0)
         self.assertTrue(self.state.paused)
+        self.assertTrue(self.state.input_hold)
         self.assertEqual(self.requested, self.published)
         self.assertFalse(source.needs_realign)
         self.sample.head_pose = pose(1.2, [0.3, -0.2, 1.7])
@@ -132,14 +183,68 @@ class R1PauseControlIntegrationTest(unittest.TestCase):
             self.tick(now)
         self.assertTrue(self.state.paused)
         self.ns["arm_ik"].solve_ik.assert_not_called()
-        self.state.request_resume(1.3)
-        for index in range(1, 6):
-            self.tick(1.3 + index * .1)
+        for now in (1.4, 1.5):
+            self.tick(now)
         self.assertFalse(self.state.paused)
         source.clear_hold_reason.assert_called_once_with()
-        self.tick(1.9)
+        self.tick(1.6)
         for target, expected in zip(self.ns["arm_ik"].solve_ik.call_args.args[:2], self.robot_poses):
             np.testing.assert_allclose(target, expected, atol=1e-12)
+
+    def test_native_input_loss_after_manual_pause_does_not_restore_following(self):
+        source = SimpleNamespace(needs_realign=True, get_hold_reason=Mock(return_value="receive_timeout"),
+                                 clear_hold_reason=Mock())
+        source.consume_realign_required = lambda: setattr(source, "needs_realign", False)
+        self.ns["visionpro_source"] = source
+        self.state.pause()
+        for now in (1., 1.1, 1.2, 1.3, 1.4, 1.5):
+            self.tick(now)
+        self.assertTrue(self.state.paused)
+        self.assertFalse(self.state.input_hold)
+        self.assertEqual(self.requested, self.published)
+        self.ns["arm_ik"].solve_ik.assert_not_called()
+        source.clear_hold_reason.assert_not_called()
+
+    def test_native_new_loss_during_alignment_restarts_auto_recovery(self):
+        source = SimpleNamespace(needs_realign=True, get_hold_reason=Mock(return_value="input_stale"),
+                                 clear_hold_reason=Mock())
+        source.consume_realign_required = lambda: setattr(source, "needs_realign", False)
+        self.ns["visionpro_source"] = source
+        for now in (1., 1.1, 1.2, 1.3, 1.4):
+            self.tick(now)
+        generation = self.state.generation
+
+        def interrupt_alignment(*_args, **_kwargs):
+            source.needs_realign = True
+
+        self.ns["arm_ik"].reset_smoothing.side_effect = interrupt_alignment
+        self.tick(1.5)
+        self.assertTrue(self.state.paused)
+        self.assertTrue(self.state.input_hold)
+        self.assertGreater(self.state.generation, generation)
+        self.assertEqual(self.state.resume_after, 1.5)
+        self.assertEqual(self.requested, self.published)
+        self.ns["arm_ik"].solve_ik.assert_not_called()
+        self.ns["arm_ik"].reset_smoothing.side_effect = None
+        for now in (1.6, 1.7, 1.8, 1.9, 2.):
+            self.tick(now)
+        self.assertFalse(self.state.paused)
+
+    def test_manual_pause_during_auto_alignment_cancels_following(self):
+        source = SimpleNamespace(needs_realign=True, get_hold_reason=Mock(return_value="input_stale"),
+                                 clear_hold_reason=Mock())
+        source.consume_realign_required = lambda: setattr(source, "needs_realign", False)
+        self.ns["visionpro_source"] = source
+        for now in (1., 1.1, 1.2, 1.3, 1.4):
+            self.tick(now)
+        self.ns["arm_ik"].reset_smoothing.side_effect = lambda **_: self.state.pause()
+        self.tick(1.5)
+        self.assertTrue(self.state.paused)
+        self.assertFalse(self.state.input_hold)
+        self.assertIsNone(self.state.resume_after)
+        self.assertEqual(self.requested, self.published)
+        source.clear_hold_reason.assert_not_called()
+        self.ns["arm_ik"].solve_ik.assert_not_called()
 
     def test_pause_freezes_last_published_step_instead_of_far_requested_target(self):
         self.state.pause()
@@ -280,6 +385,16 @@ class R1PauseKeysTest(unittest.TestCase):
             "R1_A7_DEFERRED_REAL_MODE": True, "logger_mp": Mock(),
         }
         execute([on_press], self.ns)
+
+    def test_initial_following_still_requires_r_when_control_is_ready(self):
+        self.ns.update(R1_PAUSE=None, START=False, READY=False, ARM_REQUEST_GENERATION=0)
+        self.ns["on_press"]("r")
+        self.assertFalse(self.ns["START"])
+        self.assertEqual(self.ns["ARM_REQUEST_GENERATION"], 0)
+        self.ns["READY"] = True
+        self.ns["on_press"]("r")
+        self.assertTrue(self.ns["START"])
+        self.assertEqual(self.ns["ARM_REQUEST_GENERATION"], 1)
 
     def test_pause_and_resume_request_do_not_depend_on_recording_readiness(self):
         self.ns["on_press"]("p")

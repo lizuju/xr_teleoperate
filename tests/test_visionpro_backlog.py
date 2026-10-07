@@ -2,6 +2,7 @@ from pathlib import Path
 import importlib.util
 import sys
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 HAS_GRPC = importlib.util.find_spec("grpc") is not None
@@ -66,6 +67,24 @@ class LatestTrackingTest(unittest.TestCase):
         _, packet = self.pending.take()
         self.assertEqual(packet["clock_offset"], 50.)
         self.assertEqual(packet["received_monotonic"], 100.2)
+
+    def test_network_age_and_bridge_wait_are_distinct_and_peaks_survive_coalescing(self):
+        self.pending.offer(message(50.), 100.)
+        self.pending.offer(message(50.01), 100.71)
+        self.pending.offer(message(50.72), 100.72)
+        with patch("visionpro_bridge.time.monotonic", return_value=100.92):
+            _, packet = self.pending.take()
+        transport = packet["transport"]
+        self.assertAlmostEqual(transport["upstream_age_ms"], 0.)
+        self.assertAlmostEqual(transport["upstream_age_max_ms"], 700.)
+        self.assertAlmostEqual(transport["receive_gap_max_ms"], 710.)
+        self.assertAlmostEqual(transport["bridge_pending_ms"], 200.)
+        self.assertEqual(transport["upstream_over_100ms"], 1)
+        self.assertEqual(transport["packets_received"], 3)
+        self.assertGreater(transport["bytes_received"], 0)
+        self.pending.begin_stream(2)
+        self.assertEqual(self.pending.transport["upstream_age_max_ms"], 0.)
+        self.assertAlmostEqual(transport["upstream_age_max_ms"], 700.)
 
     def test_protocol_and_clock_errors_are_checked_before_coalescing(self):
         self.pending.offer(message(), 100.)
@@ -146,7 +165,10 @@ class LatestTrackingTest(unittest.TestCase):
         data = self.pending.take()[1]
         self.assertEqual(data["tracking_loss_reason"], "video_clock_expired")
         self.pending.offer(message(50.03), 100.03)
-        self.assertNotIn("tracking_loss_reason", self.pending.take()[1])
+        latest = self.pending.take()[1]
+        self.assertEqual(latest["tracking_loss_reason"], "video_clock_expired")
+        self.assertEqual(latest["tracking_loss_seq"], data["tracking_loss_seq"])
+        self.assertFalse(latest["tracking_lost"])
 
     def test_timeout_and_source_age_take_priority_over_video_or_head_diagnostics(self):
         for mode, expected in (("gap", "receive_timeout"), ("old_anchor", "input_stale"),

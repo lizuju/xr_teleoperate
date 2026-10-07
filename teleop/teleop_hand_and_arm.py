@@ -1597,9 +1597,12 @@ if __name__ == '__main__':
             # get xr's tele data
             tele_data = tv_wrapper.get_tele_data()
             if visionpro_source is not None and visionpro_source.needs_realign:
-                R1_PAUSE.pause()
+                R1_PAUSE.pause(input_lost=True, now=time.monotonic())
                 visionpro_source.consume_realign_required()
-                logger_mp.warning('[VISIONPRO] Input interrupted (%s); holding posture. Keep both hands stable and press r/s to realign.', visionpro_source.get_hold_reason())
+                logger_mp.warning('[VISIONPRO] Input interrupted (%s); holding posture. %s',
+                                  visionpro_source.get_hold_reason(),
+                                  'Stable valid input will realign and resume automatically.' if R1_PAUSE.input_hold
+                                  else 'Manual pause remains active; press r/s to resume.')
             capture_mode = "following"
             run_motion = True
             if R1_PAUSE is not None and R1_PAUSE.paused:
@@ -1904,9 +1907,12 @@ if __name__ == '__main__':
             if STOP:
                 break
             if visionpro_source is not None and visionpro_source.needs_realign:
-                R1_PAUSE.pause()
+                R1_PAUSE.pause(input_lost=True, now=time.monotonic())
                 visionpro_source.consume_realign_required()
-                logger_mp.warning('[VISIONPRO] Input interrupted during IK (%s); holding posture until r/s realignment.', visionpro_source.get_hold_reason())
+                logger_mp.warning('[VISIONPRO] Input interrupted during IK (%s); holding posture. %s',
+                                  visionpro_source.get_hold_reason(),
+                                  'Stable valid input will realign and resume automatically.' if R1_PAUSE.input_hold
+                                  else 'Manual pause remains active; press r/s to resume.')
             if R1_PAUSE is not None and R1_PAUSE.paused:
                 capture_mode = "paused"
                 run_motion = False
@@ -2253,8 +2259,9 @@ if __name__ == '__main__':
                 motion_status = "stopped" if STOP else capture_mode
                 hold_reason = None
                 if R1_PAUSE is not None and R1_PAUSE.paused and not STOP:
-                    hold_reason = visionpro_source.get_hold_reason(latched_only=True)
-                    motion_status = "tracking_hold" if hold_reason else "paused"
+                    motion_status = "tracking_hold" if R1_PAUSE.input_hold else "paused"
+                    if R1_PAUSE.input_hold:
+                        hold_reason = visionpro_source.get_hold_reason(latched_only=True)
                 elif motion_status == "following" and not run_motion:
                     motion_status = "tracking_hold"
                 if motion_status == "tracking_hold" and hold_reason is None:
@@ -2288,8 +2295,8 @@ if __name__ == '__main__':
             if r1_a7_anchored and arm_ik is not None:
                 logger_mp.info(
                     "[R1 SESSION SUMMARY] tracking_holding_events=%d workspace_saturation_events=%d "
-                    "diagnostic_samples=%d. A hold event means Vision Pro zeroed a hand "
-                    "(lost/missing), not a Wi-Fi gap; the arm kept its last pose until tracking returned.",
+                    "diagnostic_samples=%d. Input may be missing, invalid or stale; "
+                    "see XR TRACKING diagnostics for the cause. The robot held its last commanded pose.",
                     tracking_hold_events, workspace_saturation_events, arm_diagnostic_sequence,
                 )
                 # A stop-and-go arm shows up here as iterations that missed the loop

@@ -1,4 +1,4 @@
-> **R1 部署版本：** [production-20260928-visionpro 发布与安装说明](docs/releases/production-20260928-visionpro.md)。
+> **R1 部署版本：** [production-20261007 发布与安装说明](docs/releases/production-20261007.md)。
 
 <div align="center">
   <h1 align="center">xr_teleoperate</h1>

@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
+from teleop.robot_control.r1_pause import R1PauseState
 from teleop.utils import teleop_status
 from teleop.utils.teleop_status import TeleopStatusPublisher
 
@@ -131,7 +132,7 @@ class TeleopStatusTest(unittest.TestCase):
         publisher = Mock()
         state = {"native_status": publisher, "STOP": False, "START": True,
                  "capture_mode": "following", "run_motion": False,
-                 "R1_PAUSE": SimpleNamespace(paused=False), "recorder": None,
+                 "R1_PAUSE": SimpleNamespace(paused=False, input_hold=False), "recorder": None,
                  "visionpro_source": SimpleNamespace(get_hold_reason=lambda **_: None),
                  "args": SimpleNamespace(record=False)}
         exec(code, state)
@@ -165,14 +166,16 @@ class TeleopStatusTest(unittest.TestCase):
         publisher = Mock()
         source = Mock()
         source.get_hold_reason.return_value = "video_clock_expired"
+        pause = R1PauseState()
+        pause.pause(input_lost=True)
         state = {"native_status": publisher, "STOP": False, "capture_mode": "paused",
-                 "run_motion": False, "R1_PAUSE": SimpleNamespace(paused=True),
+                 "run_motion": False, "R1_PAUSE": pause,
                  "recorder": None, "args": SimpleNamespace(record=False), "visionpro_source": source}
         exec(code, state)
         self.assertEqual(publisher.submit.call_args.args[0], "tracking_hold")
         self.assertEqual(publisher.submit.call_args.kwargs["hold_reason"], "video_clock_expired")
         source.get_hold_reason.assert_called_with(latched_only=True)
-        source.get_hold_reason.return_value = None
+        pause.pause()
         exec(code, state)
         self.assertEqual(publisher.submit.call_args.args[0], "paused")
         self.assertIsNone(publisher.submit.call_args.kwargs["hold_reason"])

@@ -30,9 +30,9 @@ def stream(request, context):
     initial = time.monotonic()
     while context.is_active():
         now = time.monotonic()
-        if (mode == 'disconnect' or (mode == 'reconnect' and connection == 1)) and now - initial > .25:
+        if (mode == 'disconnect' or (mode in ('reconnect', 'clock_reset') and connection == 1)) and now - initial > .25:
             return
-        if mode == 'reconnect' and connection > 1:
+        if mode == 'clock_reset' and connection > 1:
             now -= 20.
         anchor = initial if mode == 'frozen' else now
         message = pb.HandUpdate(
@@ -56,6 +56,8 @@ def stream(request, context):
             identity(hand.wristMatrix, x, 1.25, -.6)
             for i in range(27):
                 identity(hand.skeleton.jointMatrices.add(), x=i * .005)
+        if mode == 'delayed' and now - initial > .15:
+            time.sleep(.15)
         yield message
         time.sleep(.01)
 
@@ -104,6 +106,20 @@ class VisionProBridgeTest(unittest.TestCase):
         self.assertEqual(snapshot["right_arm_pose"][0, 2], 1.)
         self.assertTrue(source.get_tracking_diagnostics()["head_tracking"])
 
+    def test_delayed_rpc_is_attributed_upstream_without_changing_hold_threshold(self):
+        source = self.connect("delayed")
+        deadline = time.monotonic() + 2.
+        while time.monotonic() < deadline:
+            transport = source.get_tracking_diagnostics()["transport"]
+            if transport.get("upstream_age_ms", 0.) > 100.:
+                break
+            time.sleep(.01)
+        self.assertGreater(transport["upstream_age_ms"], 100.)
+        self.assertLess(transport["bridge_pending_ms"], 100.)
+        self.assertLess(transport["bridge_to_receiver_ms"], 100.)
+        self.assertLess(transport["receiver_processing_ms"], 100.)
+        self.assertTrue(source.get_tracking_diagnostics()["head_tracking"])
+
     def test_unpatched_app_is_rejected_before_input_is_available(self):
         with self.assertRaisesRegex(RuntimeError, "validity/timestamps"):
             self.connect("stock")
@@ -138,6 +154,18 @@ class VisionProBridgeTest(unittest.TestCase):
         self.assertTrue(source.needs_realign)
         self.assertTrue(source.consume_realign_required())
         self.assertFalse(source.needs_realign)
+
+    def test_peer_clock_reset_is_rejected_after_reconnect(self):
+        source = self.connect("clock_reset")
+        deadline = time.monotonic() + 4.
+        while time.monotonic() < deadline:
+            diagnostics = source.get_tracking_diagnostics()
+            if "clock" in str(diagnostics["error"]).lower():
+                break
+            time.sleep(.02)
+        self.assertIn("clock", str(diagnostics["error"]).lower())
+        self.assertFalse(source.get_hand_motion_snapshot()["motion_data_ready"])
+        self.assertTrue(source.needs_realign)
 
     def test_versioned_diagnostics_and_hidden_loss_survive_full_bridge(self):
         source = self.connect("source_loss")

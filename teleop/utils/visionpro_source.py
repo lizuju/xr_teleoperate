@@ -2,6 +2,7 @@ import json
 import math
 from pathlib import Path
 import subprocess
+import tempfile
 import threading
 import time
 
@@ -57,22 +58,35 @@ class VisionProMotionSource:
         self._realign_required = False
         self._hold_reason = None
         self._source_diagnostics = {}
+        self._transport = {}
+        self._receiver_max_ms = {}
         self._error = None
         self._prediction = 0.
         self._stream_id = 0
         self._frames_coalesced = 0
         self._hand_loss_seq = {side: 0 for side in ("left", "right")}
+        self._bridge_loss_seq = {key: 0 for key in ("head", "left", "right")}
+        self._bridge_publish_seq = 0
+        self._snapshots_skipped = 0
         self._observed_hand_loss = threading.local()
         self._hello = threading.Event()
         self._process = None
         self._reader = None
+        self._reader_stop = threading.Event()
+        self._snapshot_dir = None
         if host is not None:
             bridge = Path(__file__).resolve().parents[2] / "tools/visionpro_bridge.py"
-            self._process = subprocess.Popen(
-                [str(python), "-u", str(bridge), "--host", host, "--port", str(port),
-                 "--timeout", str(timeout)],
-                stdout=subprocess.PIPE, text=True,
-            )
+            self._snapshot_dir = tempfile.TemporaryDirectory(prefix="r1-visionpro-", dir="/dev/shm")
+            self._snapshot_path = Path(self._snapshot_dir.name) / "snapshot.json"
+            try:
+                self._process = subprocess.Popen(
+                    [str(python), "-u", str(bridge), "--host", host, "--port", str(port),
+                     "--timeout", str(timeout), "--snapshot-dir", self._snapshot_dir.name],
+                    stdout=subprocess.DEVNULL,
+                )
+            except OSError:
+                self._snapshot_dir.cleanup()
+                raise
             self._reader = threading.Thread(target=self._read, daemon=True)
             self._reader.start()
             if not self._hello.wait(10.) or self._error:
@@ -82,21 +96,42 @@ class VisionProMotionSource:
 
     def _read(self):
         try:
-            for line in self._process.stdout:
-                packet = json.loads(line)
+            previous = None
+            while not self._reader_stop.is_set():
+                exited = self._process.poll() is not None
+                try:
+                    encoded = self._snapshot_path.read_bytes()
+                except FileNotFoundError:
+                    if exited:
+                        break
+                    self._reader_stop.wait(.005)
+                    continue
+                if encoded == previous:
+                    if exited:
+                        break
+                    self._reader_stop.wait(.005)
+                    continue
+                previous = encoded
+                decode_started = time.monotonic()
+                packet = json.loads(encoded)
+                packet["receiver_json_ms"] = (time.monotonic()-decode_started)*1000.
                 if "error" in packet:
                     raise ValueError(packet["error"])
                 if "disconnected" in packet:
                     with self._lock:
                         self._connected = False
                         self._realign_required |= self._ever_head
-                        self._latch_hold("connection_lost")
+                        self._latch_hold(packet.get("tracking_loss_reason") or "connection_lost")
+                        self._transport.update(packet.get("transport") or {})
                         self._error = packet["disconnected"]
                         self._refresh(time.monotonic())
                     continue
+                if exited or self._reader_stop.is_set():
+                    break
                 self.accept_packet(packet)
                 self._hello.set()
-        except (ValueError, KeyError, TypeError) as exc:
+                self._reader_stop.wait(.005)
+        except (ValueError, KeyError, TypeError, OSError) as exc:
             self._error = f"Vision Pro input rejected: {exc}"
         finally:
             with self._lock:
@@ -124,14 +159,13 @@ class VisionProMotionSource:
                 self._latch_hold("connection_restarted")
                 self._connected = False
                 self._head_live = False
-                self._packet_time = 0.
-                self._clock_offset = None
+                # The peer clock does not reset when its transport is rebuilt.
                 self._anchor_times = {key: 0. for key in self._anchor_times}
                 self._timestamps = dict(self._anchor_times)
                 self._valid = {key: False for key in self._valid}
                 self._stream_id = stream_id
             if sample < self._packet_time:
-                raise ValueError("Vision Pro tracking clock restarted; realignment is required")
+                raise ValueError("Vision Pro tracking clock moved backwards; restart the receiver to establish a new clock epoch")
             self._refresh(now)
             offset = received - sample
             if "clock_offset" in packet:
@@ -189,7 +223,12 @@ class VisionProMotionSource:
                     f"{side}_hand_pinchValue": pinch,
                 })
             self._prediction = prediction
-            lost = packet.get("tracking_lost", ())
+            lost = set(packet.get("tracking_lost", ()))
+            if "tracking_loss_seq" in packet:
+                sequences = packet["tracking_loss_seq"]
+                lost = {key for key in self._bridge_loss_seq
+                        if sequences[key] > self._bridge_loss_seq[key]}
+                self._bridge_loss_seq = dict(sequences)
             if "head" in lost:
                 self._realign_required |= self._ever_head
                 self._latch_hold(packet.get("tracking_loss_reason") or "tracking_interrupted")
@@ -203,6 +242,23 @@ class VisionProMotionSource:
             if updates:
                 self._snapshot["motion_sample_seq"] += 1
             self._refresh(now)
+            publish_seq = packet.get("bridge_publish_seq", self._bridge_publish_seq)
+            if self._bridge_publish_seq:
+                self._snapshots_skipped += max(0, publish_seq - self._bridge_publish_seq - 1)
+            self._bridge_publish_seq = publish_seq
+            self._transport = dict(packet.get("transport") or {})
+            self._transport.update(bridge_publish_seq=publish_seq,
+                                   snapshots_skipped=self._snapshots_skipped)
+            self._transport.update(
+                bridge_received_monotonic=received,
+                receiver_json_ms=packet.get("receiver_json_ms", 0.),
+                receiver_processing_ms=(time.monotonic()-now)*1000.)
+            if "bridge_emit_monotonic" in packet:
+                self._transport["bridge_to_receiver_ms"] = max(0., (now-packet["bridge_emit_monotonic"])*1000.)
+            for key in ("bridge_pending_ms", "bridge_prepare_ms", "bridge_to_receiver_ms",
+                        "receiver_json_ms", "receiver_processing_ms"):
+                if key in self._transport:
+                    self._receiver_max_ms[key] = max(self._receiver_max_ms.get(key, 0.), self._transport[key])
 
     def _refresh(self, now):
         connected = self._connected and 0. <= now - self._received <= self.timeout
@@ -306,6 +362,7 @@ class VisionProMotionSource:
                       "stream_id": self._stream_id, "frames_coalesced": self._frames_coalesced,
                       "motion_sample_seq": self._snapshot["motion_sample_seq"]}
             result.update(self._source_diagnostics)
+            result["transport"] = dict(self._transport, receiver_max_ms=dict(self._receiver_max_ms))
             result["hold_reason"] = self._hold_reason
             result["receive_age_ms"] = (now - self._received) * 1000. if self._received else None
             result["source_age_ms"] = ((now - self._packet_time - self._clock_offset) * 1000.
@@ -320,6 +377,7 @@ class VisionProMotionSource:
             return result
 
     def close(self):
+        self._reader_stop.set()
         if self._process is not None:
             self._process.terminate()
             try:
@@ -329,7 +387,8 @@ class VisionProMotionSource:
                 self._process.wait()
             if self._reader is not None:
                 self._reader.join(timeout=1.)
-            self._process.stdout.close()
+        if self._snapshot_dir is not None:
+            self._snapshot_dir.cleanup()
         with self._lock:
             self._connected = False
             self._refresh(time.monotonic())

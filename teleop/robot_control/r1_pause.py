@@ -8,6 +8,7 @@ class R1PauseState:
     def __init__(self):
         self.lock = threading.Lock()
         self._paused = False
+        self._input_hold = False
         self.generation = 0
         self.resume_after = None
         self.stable_since = None
@@ -19,11 +20,18 @@ class R1PauseState:
         with self.lock:
             return self._paused
 
-    def pause(self):
+    @property
+    def input_hold(self):
         with self.lock:
+            return self._input_hold
+
+    def pause(self, *, input_lost=False, now=None):
+        with self.lock:
+            auto_resume = input_lost and (not self._paused or self.resume_after is not None)
             self._paused = True
+            self._input_hold = auto_resume
             self.generation += 1
-            self.resume_after = None
+            self.resume_after = (time.monotonic() if now is None else now) if auto_resume else None
             self.stable_since = None
             self.last_timestamps = None
             self.samples = 0
@@ -66,5 +74,6 @@ class R1PauseState:
             if self.generation != generation or self.resume_after is None:
                 return False
             self._paused = False
+            self._input_hold = False
             self.resume_after = None
             return True

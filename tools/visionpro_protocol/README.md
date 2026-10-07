@@ -10,4 +10,4 @@ Regenerate handtracking_pb2.py using grpcio-tools==1.78.0:
 python -m grpc_tools.protoc -I tools/visionpro_protocol --python_out=tools/visionpro_protocol tools/visionpro_protocol/handtracking.proto
 ```
 
-The matching native source and Swift bindings are in `lizuju/VisionProTeleop`, tag `production-20260928-visionpro`.
+The matching native source and Swift bindings are in `lizuju/VisionProTeleop`, tag `production-20261007`.
