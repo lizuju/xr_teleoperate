@@ -1,12 +1,85 @@
 #!/usr/bin/env python3
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
 import math
 from pathlib import Path
 import socket
 import ssl
+import subprocess
 import sys
 import threading
 import time
 import urllib.request
+
+
+def check_runtime_version(root=None):
+    root = Path(root or Path(__file__).resolve().parents[1]).resolve()
+    print(f"[VERSION] Python: {sys.executable}", flush=True)
+    try:
+        head = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"],
+                              check=True, capture_output=True, text=True, timeout=2).stdout.strip()
+        tag_result = subprocess.run(["git", "-C", str(root), "describe", "--tags", "--abbrev=0", "--match", "production-*"],
+                                    capture_output=True, text=True, timeout=2)
+        tag = tag_result.stdout.strip() if tag_result.returncode == 0 else "none"
+        dirty = subprocess.run(["git", "-C", str(root), "status", "--porcelain"],
+                               check=True, capture_output=True, text=True, timeout=2).stdout.strip()
+        print(f"[VERSION] Checkout: HEAD={head} tag={tag} dirty={'yes' if dirty else 'no'}; "
+              "checkout identity only, not the deployed source version", flush=True)
+    except (OSError, subprocess.SubprocessError) as error:
+        print(f"[WARN] Checkout version unavailable: {error}", flush=True)
+
+    files = None
+    manifest_path = root / ".runtime-release.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if (not isinstance(manifest, dict) or not isinstance(manifest.get("release"), str)
+                or not isinstance(manifest.get("base_commit"), str)
+                or not isinstance(manifest.get("files"), dict) or not manifest["files"]):
+            raise ValueError("invalid release snapshot fields")
+        for name, digest in manifest["files"].items():
+            if (not isinstance(name, str) or Path(name).is_absolute() or ".." in Path(name).parts
+                    or not isinstance(digest, str) or len(digest) != 64
+                    or any(character not in "0123456789abcdef" for character in digest)):
+                raise ValueError("invalid release snapshot file or hash")
+        files = manifest["files"]
+        mismatches = []
+        for name, expected in files.items():
+            path = root / name
+            try:
+                actual = hashlib.sha256(path.read_bytes()).hexdigest()
+            except OSError:
+                actual = None
+            if actual != expected:
+                mismatches.append(name)
+        print(f"[VERSION] Deployed source snapshot: {manifest['release']} base={manifest['base_commit']}; "
+              f"hashes matched {len(files) - len(mismatches)}/{len(files)} files", flush=True)
+        if mismatches:
+            print("[WARN] Deployed source differs from snapshot: " + ", ".join(mismatches), flush=True)
+    except (OSError, ValueError) as error:
+        print(f"[WARN] Deployed source snapshot unavailable at {manifest_path}: {error}; "
+              "checkout HEAD alone cannot identify deployed source", flush=True)
+
+    for package, module in (("teleimager", "client"), ("televuer", "tv_wrapper")):
+        try:
+            package_spec = importlib.util.find_spec(package)
+            if package_spec is None or package_spec.submodule_search_locations is None:
+                raise ImportError(f"{package} package was not found")
+            # Resolve the child source without executing the package initializer.
+            spec = importlib.machinery.PathFinder.find_spec(
+                f"{package}.{module}", package_spec.submodule_search_locations)
+            if spec is None or spec.origin is None:
+                raise ImportError(f"{package}.{module} source was not found")
+            path = Path(spec.origin).resolve()
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            print(f"[VERSION] Import {package}.{module}: {path} sha256={digest}", flush=True)
+            if not path.is_relative_to(root):
+                print(f"[WARN] Import {package}.{module} is outside the deployed source directory", flush=True)
+            elif files is not None and files.get(str(path.relative_to(root))) != digest:
+                print(f"[WARN] Import {package}.{module} is not verified by the deployed source snapshot", flush=True)
+        except (ImportError, OSError, ValueError) as error:
+            print(f"[WARN] Import {package}.{module} version unavailable: {error}", flush=True)
 
 
 class StreamWindow:
@@ -327,6 +400,7 @@ def check_streams():
 def main():
     print("[PREFLIGHT] read-only checks; DDS state subscriptions only", flush=True)
     try:
+        check_runtime_version()
         context = check_local_and_https()
         # The teleop reads the head image over ZMQ and paints it into the XR scene from
         # shared memory; the WebRTC plane is only negotiated on headsets that support a

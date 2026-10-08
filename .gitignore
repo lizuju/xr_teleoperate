@@ -26,3 +26,5 @@ episode_0*
 *.pkl
 # deployment backups (must never be published)
 *.pre-*
+# local deployment source snapshot
+.runtime-release.json
