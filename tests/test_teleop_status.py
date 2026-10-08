@@ -106,6 +106,21 @@ class TeleopStatusTest(unittest.TestCase):
         snapshot = self.wait_for(lambda value: value["motion"] == "paused")
         self.assertEqual(snapshot["recording"], recording)
 
+    def test_quality_result_updates_publish_immediately_without_recording_transition(self):
+        recording = {"state": "idle", "episode": None, "frames_accepted": 0,
+                     "last_saved": {"name": "episode_0001_saved"}, "error": None,
+                     "quality": {"episode": "episode_0001_saved", "state": "pending"}}
+        recorder = Mock(status_snapshot=Mock(side_effect=lambda: dict(recording)))
+        with patch.object(teleop_status.time, "monotonic_ns", return_value=1_000_000_000):
+            self.publisher.submit("following", recorder, True)
+            self.wait_for(lambda value: value["recording"]["quality"]["state"] == "pending")
+            recording["quality"] = {"episode": "episode_0001_saved", "state": "complete",
+                                    "exportable_frames": 120}
+            self.publisher.submit("following", recorder, True)
+            result = self.wait_for(lambda value: value["recording"]["quality"]["state"] == "complete")
+        self.assertEqual(result["sequence"], 2)
+        self.assertEqual(result["recording"]["quality"]["exportable_frames"], 120)
+
     def test_write_failure_leaves_old_timestamp_then_recovers(self):
         self.publisher.submit("waiting")
         original = self.wait_for(lambda value: value["motion"] == "waiting")

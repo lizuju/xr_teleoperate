@@ -136,6 +136,121 @@ class R1RecordingSnapshotTests(unittest.TestCase):
         self.assertIsNone(snapshot["requested"]["monotonic_ns"])
         self.arm.lowcmd_publisher.Write.assert_not_called()
 
+    def test_arm_command_history_queries_accepted_requests_without_future_or_boundary_crossing(self):
+        self.assertIsNone(self.arm.get_recording_command_at(50_000_000_000, 0))
+        self.arm.ctrl_dual_arm(np.full(14, 0.4), np.full(14, 0.2))
+        self.now += 0.025
+        self.arm.ctrl_dual_arm_and_head(np.full(14, 0.6), np.full(14, 0.3), [0.1, -0.2], 0.7)
+        old = self.arm.get_recording_command_at(50_010_000_000, 0)
+        latest = self.arm.get_recording_command_at(50_025_000_000, 50_010_000_000)
+        self.assertEqual(old["requested"]["sequence"], 1)
+        self.assertEqual(old["requested"]["arm_q"], [0.4] * 14)
+        self.assertEqual(old["requested"]["monotonic_ns"], 50_000_000_000)
+        self.assertIsNone(old["published"])
+        self.assertEqual(latest["requested"]["sequence"], 2)
+        self.assertEqual(latest["requested"]["head_q"], [0.1, -0.2])
+        self.assertEqual(latest["requested"]["waist_q"], 0.7)
+        self.assertIsNone(self.arm.get_recording_command_at(49_999_999_999, 0))
+        self.assertIsNone(self.arm.get_recording_command_at(50_025_000_000, 50_025_000_001))
+        self.arm.lowcmd_publisher.Write.assert_not_called()
+
+    def test_arm_command_history_is_bounded_and_copies_request_and_publication(self):
+        self.publish_arm()
+        before = self.arm.get_recording_command_at(50_000_000_000, 0)
+        changed = self.arm.get_recording_command_at(50_000_000_000, 0)
+        changed["requested"]["arm_q"][0] = -900
+        changed["published"]["arm_q"][0] = -900
+        self.arm.q_target[0] = 0.7
+        self.arm.published_command["arm_q"][0] = 0.6
+        self.assertEqual(self.arm.get_recording_command_at(50_000_000_000, 0), before)
+        for _ in range(64):
+            self.arm.ctrl_dual_arm(np.full(14, 0.5), np.zeros(14))
+        self.assertEqual(len(self.arm.command_history), 64)
+        self.assertEqual(self.arm.command_history[0]["sequence"], 2)
+        self.assertEqual(self.arm.command_history[-1]["sequence"], 65)
+        self.assertEqual(self.arm.command_publications, {})
+
+    def test_arm_publication_keeps_request_sequence_captured_before_concurrent_update(self):
+        self.arm.ctrl_dual_arm_and_head(np.full(14, 0.8), np.zeros(14), [0.2, -0.3])
+
+        def update_during_write(message):
+            self.arm_writes.append(copy.deepcopy(message))
+            self.now += 0.01
+            self.arm.ctrl_dual_arm_and_head(np.full(14, 0.9), np.zeros(14), [0.1, 0.2])
+            self.arm.publish_running = False
+            return True
+
+        self.arm.lowcmd_publisher.Write = Mock(side_effect=update_during_write)
+        self.arm.publish_running = True
+        self.arm._ctrl_motor_state()
+        self.arm.raise_if_failed()
+        old = self.arm.get_recording_command_at(50_000_000_000, 0)
+        latest = self.arm.get_recording_command_at(50_010_000_000, 0)
+        self.assertEqual(old["requested"]["sequence"], 1)
+        self.assertEqual(old["published"]["request_sequence"], 1)
+        self.assertEqual(old["published"]["head_q"], [0.2, -0.3])
+        self.assertEqual(latest["requested"]["sequence"], 2)
+        self.assertIsNone(latest["published"])
+        self.assertEqual(self.arm.get_recording_snapshot()["published"]["request_sequence"], 1)
+
+    def test_failed_arm_publication_preserves_per_request_last_success(self):
+        self.publish_arm()
+        before = self.arm.get_recording_command_at(50_000_000_000, 0)
+        self.arm.lowcmd_publisher.Write = Mock(return_value=False)
+        with self.assertRaisesRegex(RuntimeError, "Write failed"):
+            self.arm._write_command(target_updated_at=self.arm.target_updated_at, request_sequence=1)
+        self.assertEqual(self.arm.get_recording_command_at(50_000_000_000, 0), before)
+        self.now += 0.025
+        self.arm.ctrl_dual_arm(np.full(14, 0.9), np.zeros(14))
+        with self.assertRaisesRegex(RuntimeError, "Write failed"):
+            self.arm._write_command(target_updated_at=self.arm.target_updated_at, request_sequence=2)
+        self.assertIsNone(self.arm.get_recording_command_at(50_025_000_000, 0)["published"])
+        self.assertEqual(self.arm.get_recording_command_at(50_000_000_000, 0), before)
+
+    def test_hold_clears_history_without_fabricating_an_accepted_request(self):
+        self.publish_arm()
+        self.now += 0.025
+        self.arm.hold_targets()
+        self.assertEqual(self.arm.requested_sequence, 1)
+        self.assertEqual(self.arm.target_updated_at, self.now)
+        self.assertIsNone(self.arm.get_recording_command_at(50_025_000_000, 0))
+        self.assertEqual(self.arm.command_publications, {})
+        self.arm.ctrl_dual_arm(np.full(14, 0.5), np.zeros(14))
+        resumed = self.arm.get_recording_command_at(50_025_000_000, 50_025_000_000)
+        self.assertEqual(resumed["requested"]["sequence"], 2)
+        self.assertIsNone(resumed["published"])
+        self.assertIsNone(self.arm.get_recording_command_at(50_000_000_000, 0))
+
+    def test_hold_during_inflight_publication_cannot_repopulate_history(self):
+        self.arm.ctrl_dual_arm(np.full(14, 0.8), np.zeros(14))
+
+        def hold_during_write(message):
+            self.now += 0.01
+            self.arm.hold_targets()
+            self.arm.ctrl_dual_arm(np.full(14, 0.5), np.zeros(14))
+            self.arm.publish_running = False
+            return True
+
+        self.arm.lowcmd_publisher.Write = Mock(side_effect=hold_during_write)
+        self.arm.publish_running = True
+        self.arm._ctrl_motor_state()
+        self.arm.raise_if_failed()
+        self.assertIsNone(self.arm.get_recording_command_at(50_000_000_000, 0))
+        self.assertEqual(self.arm.get_recording_command_at(50_010_000_000, 0)["requested"]["sequence"], 2)
+        self.assertIsNone(self.arm.get_recording_command_at(50_010_000_000, 0)["published"])
+        self.assertEqual(self.arm.command_publications, {})
+
+    def test_arm_history_keeps_last_successful_publication_of_the_same_request(self):
+        self.publish_arm()
+        self.now += 0.01
+        self.arm.publish_running = True
+        self.arm._ctrl_motor_state()
+        result = self.arm.get_recording_command_at(50_000_000_000, 0)
+        self.assertEqual(result["requested"]["sequence"], 1)
+        self.assertEqual(result["published"]["request_sequence"], 1)
+        self.assertEqual(result["published"]["sequence"], 2)
+        self.assertEqual(result["published"]["monotonic_ns"], 50_010_000_000)
+
     def test_hand_snapshot_distinguishes_requested_smoothed_published_and_actual(self):
         self.hand.update([0.9] * 6, [0.8] * 6)
         snapshot = self.hand.get_recording_snapshot()
@@ -217,6 +332,7 @@ class R1RecordingSnapshotTests(unittest.TestCase):
     def test_current_r1_capture_output_is_accepted_by_offline_checker(self):
         hand_loop = SimpleNamespace(get_recording_sample=lambda: {
             "hand": self.hand.get_recording_snapshot(), "target_inputs": None,
+            "paused": False, "tracking_fresh": {"left": True, "right": True},
         })
         capture = r1_capture.R1Capture(self.arm, self.hand, hand_loop,
                                        tracking_timeout=0.25, image_shape=(48, 128))

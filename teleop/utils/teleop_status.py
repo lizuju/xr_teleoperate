@@ -28,12 +28,12 @@ class TeleopStatusPublisher:
                hold_reason=None):
         recording = recorder.status_snapshot() if recorder is not None else {
             "state": "idle" if record_enabled else "disabled", "episode": None,
-            "frames_accepted": 0, "last_saved": None, "error": None,
+            "frames_accepted": 0, "last_saved": None, "quality": None, "error": None,
         }
         if motion != "tracking_hold":
             hold_reason = None
         state_key = (motion, recording["state"], recording["episode"], recording["last_saved"],
-                     recording["error"], error, hold_reason)
+                     recording.get("quality"), recording["error"], error, hold_reason)
         sample_ns = time.monotonic_ns()
         with self._condition:
             if self._closed:

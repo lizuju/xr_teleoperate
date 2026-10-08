@@ -11,6 +11,8 @@ import cv2
 import numpy as np
 
 
+DEFAULT_MIN_SEGMENT_FRAMES = 40
+
 SOURCE_NAMES = ("image", "xr", "left_hand_tracking", "right_hand_tracking", "robot",
                 "left_hand_feedback", "right_hand_feedback")
 
@@ -58,7 +60,8 @@ TRAINING_GROUPS = {"left_arm": 7, "right_arm": 7, "left_ee": 6, "right_ee": 6, "
 TRAINING_CAMERAS = {"color_0": "head_left", "color_1": "head_right",
                     "color_2": "left_wrist", "color_3": "right_wrist"}
 TRAINING_TIME_LIMITS = {"observation_skew_ms": 25.0, "observation_age_ms": 150.0,
-                        "request_age_ms": 100.0, "request_skew_ms": 25.0}
+                        "request_age_ms": 100.0, "request_skew_ms": 25.0,
+                        "hand_input_age_ms": 100.0}
 
 
 def training_observation(frame):
@@ -71,6 +74,38 @@ def training_observation(frame):
             "body": [robot.get("waist_q"), *(robot.get("head_q") or [])]}
 
 
+def training_commands(sample):
+    if "action_alignment" in sample:
+        aligned = sample["action_alignment"]
+        return {key: aligned.get(key) for key in ("arm", "hands")} if isinstance(aligned, dict) else {}
+    return sample.get("commands") or {}
+
+
+def training_hand_inputs(sample):
+    if "action_alignment" in sample:
+        alignment = sample["action_alignment"]
+        return (alignment.get("hand_target_inputs") or {}) if isinstance(alignment, dict) else {}
+    return sample.get("hand_target_inputs") or {}
+
+
+def training_action(frame):
+    sample = frame.get("sample") or {}
+    if "action_alignment" not in sample:
+        return {group: ((frame.get("actions") or {}).get(group) or {}).get("qpos")
+                for group in TRAINING_GROUPS}
+    commands = training_commands(sample)
+    arm = (commands.get("arm") or {}).get("requested") or {}
+    hands = (commands.get("hands") or {}).get("requested") or {}
+    q = arm.get("arm_q") or []
+    waist = arm.get("waist_q")
+    if waist is None:
+        body = (((frame.get("states") or {}).get("body") or {}).get("qpos") or [])
+        waist = body[0] if body else None
+    return {"left_arm": q[:7], "right_arm": q[7:],
+            "left_ee": hands.get("left_q"), "right_ee": hands.get("right_q"),
+            "body": [waist, *(arm.get("head_q") or [])]}
+
+
 def training_timing(sample):
     sources = sample.get("sources") or {}
     cameras = {name: ((sources.get(name) or {}).get("timing") or {}).get("mapped_monotonic_ns")
@@ -79,14 +114,20 @@ def training_timing(sample):
     feedback = {"robot": (aligned.get("robot") or {}).get("monotonic_ns"),
                 **{side: ((aligned.get("hands") or {}).get(side) or {}).get("monotonic_ns")
                    for side in ("left", "right")}}
-    commands = sample.get("commands") or {}
+    commands = training_commands(sample)
     requests = {name: ((commands.get(name) or {}).get("requested") or {}).get("monotonic_ns")
                 for name in ("arm", "hands")}
     now = sample.get("monotonic_ns")
     anchor = (sample.get("camera_alignment") or {}).get("anchor_monotonic_ns")
     result = {"camera_ns": cameras, "feedback_ns": feedback, "request_ns": requests,
               "observation_ns": anchor, "observation_skew_ms": None, "observation_age_ms": None,
-              "request_skew_ms": None, "arm_observation_delay_ms": None, "hands_observation_delay_ms": None}
+              "request_skew_ms": None, "arm_observation_delay_ms": None, "hands_observation_delay_ms": None,
+              "left_hand_input_age_ms": None, "right_hand_input_age_ms": None}
+    inputs = training_hand_inputs(sample)
+    for side in ("left", "right"):
+        stamp = (inputs.get(side) or {}).get("received_monotonic_ns")
+        if type(now) is int and type(stamp) is int and 0 < stamp <= now:
+            result[side + "_hand_input_age_ms"] = (now - stamp) / 1e6
     stamps = [*cameras.values(), *feedback.values()]
     # The head stamp is the earlier eye. Both eyes must have valid history times.
     stereo_skew = ((sources.get("image") or {}).get("timing") or {}).get("stereo_skew_ns")
@@ -116,6 +157,16 @@ def training_frame_rejections(frame, info):
     now = sample.get("monotonic_ns")
     if type(now) is not int or now <= 0:
         return reasons + ["invalid_time"]
+    action_alignment = sample.get("action_alignment")
+    if "action_alignment" in sample:
+        if (not isinstance(action_alignment, dict) or action_alignment.get("schema") != "r1_action_alignment_v1"
+                or action_alignment.get("aligned") is not True):
+            reasons.append("actions_unaligned")
+        elif (type(action_alignment.get("anchor_monotonic_ns")) is not int
+              or not 0 < action_alignment["anchor_monotonic_ns"] <= now
+              or any((action_alignment.get("tracking_fresh") or {}).get(side) is not True
+                     for side in ("left", "right"))):
+            reasons.append("actions_unaligned")
     sources = sample.get("sources") or {}
     for names, limit_ms, reason in (
         (("xr", "left_hand_tracking", "right_hand_tracking"), 100, "tracking_stale"),
@@ -162,7 +213,7 @@ def training_frame_rejections(frame, info):
     elif any(value is None or value < -TRAINING_TIME_LIMITS["observation_skew_ms"]
              for value in (timing["arm_observation_delay_ms"], timing["hands_observation_delay_ms"])):
         reasons.append("request_before_observation")
-    commands = sample.get("commands") or {}
+    commands = training_commands(sample)
     arm = commands.get("arm") or {}
     hands = (commands.get("hands") or {}).get("published") or {}
     for command in [arm.get("published"), hands.get("left"), hands.get("right")]:
@@ -180,12 +231,38 @@ def training_frame_rejections(frame, info):
     hand_request = (commands.get("hands") or {}).get("requested") or {}
     sequence = hand_request.get("sequence")
     if (type(sequence) is not int or sequence <= 0
-            or any((hands.get(side) or {}).get("request_sequence") != sequence
+            or any(type((hands.get(side) or {}).get("request_sequence")) is not int
+                   or (hands.get(side) or {}).get("request_sequence") != sequence
                    or type((hands.get(side) or {}).get("monotonic_ns")) is not int
                    or type(hand_request.get("monotonic_ns")) is not int
                    or hands[side]["monotonic_ns"] < hand_request["monotonic_ns"]
                    for side in ("left", "right"))):
         reasons.append("hand_request_unmatched")
+    if "action_alignment" in sample:
+        arm_request = arm.get("requested") or {}
+        arm_published = arm.get("published") or {}
+        stamp = arm_request.get("monotonic_ns")
+        publication = arm_published.get("monotonic_ns")
+        if (type(arm_request.get("sequence")) is not int or arm_request["sequence"] <= 0
+                or type(arm_published.get("request_sequence")) is not int
+                or arm_published.get("request_sequence") != arm_request.get("sequence")
+                or type(stamp) is not int or type(publication) is not int or publication < stamp):
+            reasons.append("arm_request_unmatched")
+        if (not isinstance(action_alignment, dict)
+                or action_alignment.get("anchor_monotonic_ns") != hand_request.get("monotonic_ns")
+                or type(stamp) is not int or type(hand_request.get("monotonic_ns")) is not int
+                or stamp > hand_request["monotonic_ns"]):
+            if "actions_unaligned" not in reasons:
+                reasons.append("actions_unaligned")
+    if "action_alignment" in sample or "hand_target_inputs" in sample:
+        inputs = training_hand_inputs(sample)
+        request = hand_request.get("monotonic_ns")
+        if any(timing[side + "_hand_input_age_ms"] is None
+               or timing[side + "_hand_input_age_ms"] > TRAINING_TIME_LIMITS["hand_input_age_ms"]
+               or type(request) is not int
+               or type((inputs.get(side) or {}).get("received_monotonic_ns")) is not int
+               or inputs[side]["received_monotonic_ns"] > request for side in ("left", "right")):
+            reasons.append("hand_input_stale")
     observation = training_observation(frame)
     for group, size in TRAINING_GROUPS.items():
         values = observation[group]
@@ -200,10 +277,18 @@ def training_frame_rejections(frame, info):
                     or any(type(v) not in (int, float) or not math.isfinite(v) for v in values)):
                 reasons.append("invalid_" + field)
                 break
+    if "action_alignment" in sample:
+        for group, values in training_action(frame).items():
+            if (not isinstance(values, list) or len(values) != TRAINING_GROUPS[group]
+                    or any(type(v) not in (int, float) or not math.isfinite(v) for v in values)):
+                reasons.append("invalid_aligned_actions")
+                break
     return reasons
 
 
-def validate_episode(path):
+def validate_episode(path, min_segment_frames=DEFAULT_MIN_SEGMENT_FRAMES):
+    if type(min_segment_frames) is not int or min_segment_frames < 2:
+        raise ValueError("min_segment_frames must be at least 2")
     directory = episode_directory(path)
     report = {"episode": str(directory), "valid": False, "trainable": False, "errors": [],
               "error_count": 0, "warnings": [], "excluded_reasons": [], "frames_checked": 0,
@@ -222,6 +307,9 @@ def validate_episode(path):
               "training_no_imu": {"policy": "r1_vision_joint_bc_v2", "imu_used": False,
                                   "time_limits_ms": TRAINING_TIME_LIMITS.copy(),
                                   "eligible_frames": 0, "excluded_counts": {}, "segments": [],
+                                  "min_segment_frames": min_segment_frames,
+                                  "longest_segment_frames": 0, "exportable_segments": 0,
+                                  "exportable_frames": 0, "short_segment_frames": 0,
                                   "sampling_gap_boundaries": 0}}
 
     def error(message):
@@ -398,7 +486,8 @@ def validate_episode(path):
     decoded_sizes = {}
     training_exclusions = Counter()
     timing_samples = {key: [] for key in ("observation_skew_ms", "observation_age_ms", "request_skew_ms",
-                                          "arm_observation_delay_ms", "hands_observation_delay_ms")}
+                                          "arm_observation_delay_ms", "hands_observation_delay_ms",
+                                          "left_hand_input_age_ms", "right_hand_input_age_ms")}
     timing_bases = Counter()
     training_previous_ns = None
     training_previous_idx = None
@@ -520,6 +609,56 @@ def validate_episode(path):
                 if not isinstance(sample.get(name), dict):
                     error(f"{label}.sample.{name}: expected an object")
             commands = sample.get("commands", {})
+            if "action_alignment" in sample:
+                action_alignment = sample["action_alignment"]
+                location = f"{label}.sample.action_alignment"
+                if not isinstance(action_alignment, dict) or action_alignment.get("schema") != "r1_action_alignment_v1":
+                    error(f"{location}: missing or unknown schema")
+                else:
+                    if type(action_alignment.get("aligned")) is not bool:
+                        error(f"{location}.aligned: expected a boolean")
+                    timestamp(action_alignment.get("anchor_monotonic_ns"), f"{location}.anchor_monotonic_ns")
+                    freshness = action_alignment.get("tracking_fresh")
+                    if not isinstance(freshness, dict) or any(type(freshness.get(side)) is not bool for side in ("left", "right")):
+                        error(f"{location}.tracking_fresh: expected per-side booleans")
+                    arm_aligned = action_alignment.get("arm")
+                    if arm_aligned is not None:
+                        if not isinstance(arm_aligned, dict):
+                            error(f"{location}.arm: expected command snapshots or null")
+                        else:
+                            for stage in ("requested", "published"):
+                                command = arm_aligned.get(stage)
+                                if command is None:
+                                    continue
+                                if not isinstance(command, dict):
+                                    error(f"{location}.arm.{stage}: expected an object or null")
+                                    continue
+                                for name, length in (("arm_q", 14), ("arm_tau", 14), ("head_q", 2)):
+                                    command_vector(command.get(name), length, f"{location}.arm.{stage}.{name}")
+                                waist = command.get("waist_q")
+                                if waist is not None and type(waist) not in (int, float):
+                                    error(f"{location}.arm.{stage}.waist_q: expected a number or null")
+                    hands_aligned = action_alignment.get("hands")
+                    if not isinstance(hands_aligned, dict):
+                        error(f"{location}.hands: expected command snapshots")
+                    else:
+                        requested = hands_aligned.get("requested")
+                        if requested is not None:
+                            if not isinstance(requested, dict):
+                                error(f"{location}.hands.requested: expected an object or null")
+                            else:
+                                for side in ("left", "right"):
+                                    command_vector(requested.get(side + "_q"), 6, f"{location}.hands.requested.{side}_q")
+                        published = hands_aligned.get("published")
+                        if not isinstance(published, dict):
+                            error(f"{location}.hands.published: expected per-side snapshots")
+                        else:
+                            for side, command in published.items():
+                                if command is not None:
+                                    if not isinstance(command, dict):
+                                        error(f"{location}.hands.published.{side}: expected an object or null")
+                                    else:
+                                        command_vector(command.get("q"), 6, f"{location}.hands.published.{side}.q")
             if isinstance(commands, dict):
                 for controller, stages in commands.items():
                     if not isinstance(stages, dict):
@@ -1065,9 +1204,14 @@ def validate_episode(path):
     report["trainable"] = report["valid"] and not report["excluded_reasons"]
     training = report["training_no_imu"]
     training["excluded_counts"] = dict(training_exclusions)
+    lengths = [segment["stop_idx"] - segment["start_idx"] for segment in training["segments"]]
+    training["longest_segment_frames"] = max(lengths, default=0)
+    training["exportable_segments"] = sum(length >= min_segment_frames for length in lengths)
+    training["exportable_frames"] = sum(length for length in lengths if length >= min_segment_frames)
+    training["short_segment_frames"] = sum(length for length in lengths if length < min_segment_frames)
     training["demonstration_eligible"] = (report["valid"] and report["status"] == "complete"
                                           and report["outcome"] == "success"
-                                          and training["eligible_frames"] > 0)
+                                          and training["exportable_frames"] > 0)
     training["timing_basis_counts"] = dict(timing_bases)
     training["timing_basis"] = (next(iter(timing_bases)) if len(timing_bases) == 1 else "mixed_or_missing")
     training["timing"] = {key: {"samples": len(values), "p50": percentile(values, .50),
@@ -1084,7 +1228,14 @@ def quality_summary(report):
     percent = 100 * usable / total if total else 0
     outcome = {"success": "成功", "failure": "失败", "discarded": "丢弃", "unspecified": "未标记"}.get(report.get("outcome"), "未知")
     status = "通过" if report["valid"] else "未通过"
-    selected = "可筛选导出" if training.get("demonstration_eligible") else "不进入成功示范训练集"
+    if not report["valid"] or report.get("status") != "complete":
+        selected = "文件不完整或检查未通过，不进入训练集"
+    elif report.get("outcome") != "success":
+        selected = "当前标签不进入成功示范训练集"
+    elif not training["exportable_frames"]:
+        selected = f"没有达到 {training['min_segment_frames']} 帧的连续合格片段，无法导出训练"
+    else:
+        selected = "可导出成功示范"
     fps = ", ".join(f"{TRAINING_CAMERAS.get(k, k)}={v:.1f}" for k, v in report.get("image_fps", {}).items()
                     if isinstance(v, (int, float))) or "无统计"
     name = Path(report["episode"]).name
@@ -1097,10 +1248,16 @@ def quality_summary(report):
             f"[QUALITY] 视觉/关节合格={usable}/{total} ({percent:.1f}%) | "
             f"追踪保持={report['modes'].get('tracking_hold', 0)} | "
             f"相机未对齐={report['unaligned_frames']} | 连续片段={len(training['segments'])}\n"
+            f"[QUALITY] 最低片段长度={training['min_segment_frames']} 帧 | "
+            f"最长={training['longest_segment_frames']} 帧 | "
+            f"可导出={training['exportable_segments']} 段/{training['exportable_frames']} 帧 | "
+            f"过短片段={training['short_segment_frames']} 帧\n"
             f"[QUALITY] 图像实际 FPS: {fps} | IMU 不参与训练\n"
             f"[QUALITY] 时间基准={training.get('timing_basis', 'unknown')} | "
             f"观察跨度 P95={p95('observation_skew_ms')} | 观察年龄 P95={p95('observation_age_ms')} | "
             f"双臂/手指请求时间差 P95={p95('request_skew_ms')}\n"
+            f"[QUALITY] 实际手指目标输入年龄 P95: 左={p95('left_hand_input_age_ms')} | "
+            f"右={p95('right_hand_input_age_ms')}\n"
             f"[QUALITY] 筛除原因（可重叠）: {exclusions}\n"
             f"[QUALITY] 详情: {Path(report['episode']) / 'quality.json'}")
 
@@ -1123,13 +1280,29 @@ def main():
     if args.worker:
         os.nice(5)
         cv2.setNumThreads(1)
+        send_results = True
         for line in sys.stdin:
+            directory = None
             try:
                 directory = Path(json.loads(line))
                 report = save_quality_report(directory, directory / "quality.json")
-                print(quality_summary(report), flush=True)
+                training = report["training_no_imu"]
+                result = {"episode": directory.name, "state": "complete",
+                          "file_valid": report["valid"] and report.get("status") == "complete",
+                          "outcome": report.get("outcome") or "unspecified", "total_frames": report["frames_checked"],
+                          **{key: training[key] for key in ("eligible_frames", "exportable_frames",
+                              "exportable_segments", "longest_segment_frames", "min_segment_frames",
+                              "excluded_counts")}, "error": None}
+                print(quality_summary(report), file=sys.stderr, flush=True)
             except Exception as exc:
                 print(f"[QUALITY] 质检未完成（原始数据保留）: {line.strip()}: {exc}", file=sys.stderr, flush=True)
+                result = {"episode": directory.name if directory is not None else None,
+                          "state": "failed", "error": str(exc)}
+            if send_results:
+                try:
+                    os.write(sys.stdout.fileno(), (json.dumps(result, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8"))
+                except BrokenPipeError:
+                    send_results = False
         return 0
     if args.episode is None:
         parser.error("episode is required")

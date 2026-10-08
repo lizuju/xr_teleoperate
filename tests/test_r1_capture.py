@@ -2,6 +2,7 @@ import copy
 import json
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 import tempfile
 import time
 import unittest
@@ -43,6 +44,13 @@ class Snapshot:
     def get_recording_snapshot(self):
         return copy.deepcopy(self.data)
 
+    def get_recording_command_at(self, anchor_ns, not_before_ns):
+        commands = getattr(self, "command_history", [self.data])
+        for command in reversed(commands):
+            if not_before_ns <= command["requested"]["monotonic_ns"] <= anchor_ns:
+                return copy.deepcopy({key: command[key] for key in ("requested", "published")})
+        return None
+
 
 def build(now, image_shape=(16, 32)):
     """Fixtures shared by the head-only and the palm-camera capture tests."""
@@ -53,10 +61,10 @@ def build(now, image_shape=(16, 32)):
                   "imu": {"quaternion": [1.0, 0.0, 0.0, 0.0], "rpy": [0.0]*3,
                           "gyroscope": [0.1]*3, "accelerometer": [0.0, 0.0, 9.81], "temperature": 30, "valid": True}},
         "requested": {"arm_q": [0.6] * 14, "arm_tau": [0.7] * 14,
-                      "head_q": [0.8, 0.9], "waist_q": None, "monotonic_ns": now},
+                      "head_q": [0.8, 0.9], "waist_q": None, "monotonic_ns": now, "sequence": 7},
         "published": {"arm_q": [0.55] * 14, "arm_tau": [0.7] * 14,
                       "head_q": [0.75, 0.85], "waist_q": 0.5,
-                      "monotonic_ns": now, "sequence": 9},
+                      "monotonic_ns": now, "sequence": 9, "request_sequence": 7},
     })
     hand = Snapshot({
         "state": {side: {"q": [0.1] * 6, "monotonic_ns": now,
@@ -69,7 +77,8 @@ def build(now, image_shape=(16, 32)):
     inputs = {side: {"received_monotonic_ns": now - 10_000_000,
                      "points": np.ones((25, 3)).tolist()} for side in ("left", "right")}
     loop = SimpleNamespace(get_recording_sample=lambda: {
-        "hand": hand.get_recording_snapshot(), "target_inputs": copy.deepcopy(inputs)})
+        "hand": hand.get_recording_snapshot(), "target_inputs": copy.deepcopy(inputs),
+        "tracking_fresh": {"left": True, "right": True}, "paused": False})
     xr = SimpleNamespace(
         motion_data_ready=True, motion_data_timestamp=now / 1e9,
         left_hand_timestamp=now / 1e9, right_hand_timestamp=now / 1e9,
@@ -151,6 +160,59 @@ class CaptureTests(unittest.TestCase):
         self.assertEqual(frame["sample"]["hand_target_inputs"], self.inputs)
         self.assertLess(frame["sample"]["hand_target_inputs"]["left"]["received_monotonic_ns"],
                         frame["sample"]["sources"]["left_hand_tracking"]["received_monotonic_ns"])
+
+    def test_training_alignment_selects_causal_history_and_preserves_raw_actions(self):
+        previous = copy.deepcopy(self.arm.data)
+        previous["requested"]["monotonic_ns"] -= 5_000_000
+        previous["requested"]["arm_q"] = [0.4] * 14
+        previous["published"]["monotonic_ns"] -= 4_000_000
+        self.arm.command_history = [previous, copy.deepcopy(self.arm.data)]
+        self.hand.data["requested"]["monotonic_ns"] -= 2_000_000
+        frame = self.capture.frame(self.xr, self.image, "following")
+        aligned = frame["sample"]["action_alignment"]
+        self.assertTrue(aligned["aligned"])
+        self.assertEqual(aligned["arm"]["requested"]["arm_q"], [0.4] * 14)
+        self.assertEqual(frame["actions"]["left_arm"]["qpos"], [0.6] * 7)
+        self.assertEqual(frame["sample"]["commands"]["arm"]["requested"], self.arm.data["requested"])
+        self.assertEqual(aligned["hand_target_inputs"], self.inputs)
+        self.assertLessEqual(aligned["arm"]["requested"]["monotonic_ns"], aligned["anchor_monotonic_ns"])
+
+    def test_unavailable_or_future_history_does_not_fall_back_to_raw_actions(self):
+        self.hand.data["requested"]["monotonic_ns"] -= 2_000_000
+        frame = self.capture.frame(self.xr, self.image, "following")
+        self.assertFalse(frame["sample"]["action_alignment"]["aligned"])
+        self.assertIsNone(frame["sample"]["action_alignment"]["arm"])
+        self.assertEqual(frame["actions"]["left_arm"]["qpos"], [0.6] * 7)
+
+    def test_capture_time_is_after_the_selected_publication_snapshot(self):
+        clock = [self.now]
+        original = self.arm.get_recording_command_at
+
+        def concurrent_publication(*args):
+            command = original(*args)
+            clock[0] += 1_000_000
+            command["published"]["monotonic_ns"] = clock[0]
+            return command
+
+        self.arm.get_recording_command_at = concurrent_publication
+        with patch("teleop.utils.r1_capture.time.monotonic_ns", side_effect=lambda: clock[0]):
+            sample = self.capture.frame(self.xr, self.image, "following")["sample"]
+        self.assertGreaterEqual(sample["monotonic_ns"], sample["action_alignment"]["arm"]["published"]["monotonic_ns"])
+
+    def test_episode_start_and_pause_exclude_previous_actions(self):
+        self.assertTrue(self.capture.frame(self.xr, self.image, "following")["sample"]["action_alignment"]["aligned"])
+        with patch("teleop.utils.r1_capture.time.monotonic_ns", return_value=self.now + 1):
+            self.capture.reset_episode()
+        self.assertFalse(self.capture.frame(self.xr, self.image, "following")["sample"]["action_alignment"]["aligned"])
+        self.assertFalse(self.capture.frame(self.xr, self.image, "paused")["sample"]["action_alignment"]["aligned"])
+
+    def test_cached_hand_loss_or_pause_is_not_hidden_by_fresh_current_xr(self):
+        original = self.capture.hand_loop.get_recording_sample()
+        for paused, fresh in ((True, {"left": True, "right": True}),
+                              (False, {"left": False, "right": True})):
+            self.capture.hand_loop.get_recording_sample = lambda: {
+                **original, "paused": paused, "tracking_fresh": fresh}
+            self.assertFalse(self.capture.frame(self.xr, self.image, "following")["sample"]["action_alignment"]["aligned"])
 
     def test_lost_or_stale_image_is_not_silently_recorded(self):
         with self.assertRaisesRegex(RuntimeError, "lost"):
@@ -353,18 +415,16 @@ class PalmCaptureTests(unittest.TestCase):
         self.assertTrue(self.sources(frame)["left_wrist_image"]["repeated"])
         self.assertTrue(self.sources(frame)["right_wrist_image"]["repeated"])
 
-    def test_the_frame_nearest_the_head_wins_over_the_newest(self):
-        # The palm delivered one frame 8 ms before the head frame and another
-        # 10 ms after it. Pairing must take the nearer one, not the newest.
+    def test_the_newest_aligned_palm_wins_over_an_older_tighter_match(self):
         older = palm_at(77, 11, 20)
         newer = palm_at(88, 12, 2)
         self.capture.observe(None, {"left": older, "right": older})
         frame = self.sample(left=newer, right=newer, head_offset_ms=12)
-        self.assertTrue(np.all(frame["colors"]["color_2"] == 77))
-        self.assertTrue(np.all(frame["colors"]["color_3"] == 77))
+        self.assertTrue(np.all(frame["colors"]["color_2"] == 88))
+        self.assertTrue(np.all(frame["colors"]["color_3"] == 88))
         source = self.sources(frame)["left_wrist_image"]
-        self.assertEqual(source["sequence"], 11)
-        self.assertAlmostEqual(source["offset_ms"], -8.0, delta=1.0)
+        self.assertEqual(source["sequence"], 12)
+        self.assertAlmostEqual(source["offset_ms"], 10.0, delta=1.0)
 
     def test_alignment_block_reports_the_actual_spread(self):
         # Head lands 6 ms ago; the left palm 8 ms before it, the right palm 6 ms

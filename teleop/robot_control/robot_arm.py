@@ -2101,6 +2101,9 @@ class R1_A7_ArmController:
         self.publish_error = None
         self.published_sequence = 0
         self.published_command = None
+        self.requested_sequence = 0
+        self.command_history = deque(maxlen=64)
+        self.command_publications = {}
         self.simulation_mode = simulation_mode
         self.deferred_activation = deferred_activation
         self.defer_publisher_start = False
@@ -2412,6 +2415,7 @@ class R1_A7_ArmController:
                 waist_target_sequence = self.waist_target_sequence
                 waist_hold_requested = self.waist_hold_requested
                 target_updated_at = self.target_updated_at
+                request_sequence = self.requested_sequence if self.command_history else None
                 dq_feedforward = self._dq_feedforward.copy()
                 dq_feedforward_updated_at = self._dq_feedforward_updated_at
 
@@ -2488,7 +2492,7 @@ class R1_A7_ArmController:
                 self.msg.motor_cmd[R1_A7_JointIndex.kWaistYaw].dq = 0.0
                 self.msg.motor_cmd[R1_A7_JointIndex.kWaistYaw].tau = 0.0
 
-            self._write_command(target_updated_at=target_updated_at)
+            self._write_command(target_updated_at=target_updated_at, request_sequence=request_sequence)
 
             current_time = time.monotonic()
             all_t_elapsed = current_time - start_time
@@ -2562,6 +2566,7 @@ class R1_A7_ArmController:
             self.q_target = shaped
             self.tauff_target = tauff_target
             self.target_updated_at = now
+            self._record_accepted_request(now)
 
     def ctrl_dual_arm_and_head(self, q_target, tauff_target, head_q_target, waist_yaw_target=None):
         '''Set arm, head, and optional waist targets from one tracking sample.'''
@@ -2595,6 +2600,20 @@ class R1_A7_ArmController:
                 self.waist_target_updated_at = now
                 self.waist_target_sequence += 1
                 self.waist_hold_requested = False
+            self._record_accepted_request(now)
+
+    def _record_accepted_request(self, now):
+        self.requested_sequence += 1
+        if len(self.command_history) == self.command_history.maxlen:
+            self.command_publications.pop(self.command_history[0]["sequence"], None)
+        self.command_history.append({
+            "sequence": self.requested_sequence,
+            "monotonic_ns": int(now * 1e9),
+            "arm_q": self.q_target.tolist(),
+            "arm_tau": self.tauff_target.tolist(),
+            "head_q": self.head_q_target.tolist(),
+            "waist_q": self.waist_yaw_target,
+        })
 
     def hold_waist(self):
         with self.ctrl_lock:
@@ -2607,6 +2626,8 @@ class R1_A7_ArmController:
             self._check_target_freshness(self.target_updated_at)
             if self.target_updated_at is not None:
                 self.target_updated_at = time.monotonic()
+            self.command_history.clear()
+            self.command_publications.clear()
             self._dq_feedforward = np.zeros(14)
             self._dq_feedforward_previous = None
             self._dq_feedforward_previous_at = None
@@ -2639,7 +2660,7 @@ class R1_A7_ArmController:
             raise RuntimeError("R1-A7 motor feedback is stale; command output stopped.")
         return lowstate
 
-    def _write_command(self, target_updated_at=None, cancel_requested=None):
+    def _write_command(self, target_updated_at=None, cancel_requested=None, request_sequence=None):
         self.msg.crc = self.crc.Crc(self.msg)
         self._check_activation_cancelled(cancel_requested)
         self._get_fresh_lowstate()
@@ -2652,12 +2673,18 @@ class R1_A7_ArmController:
             self.published_sequence += 1
             self.published_command = {
                 "sequence": self.published_sequence,
+                "request_sequence": request_sequence,
                 "monotonic_ns": int(time.monotonic() * 1e9),
                 "arm_q": [float(self.msg.motor_cmd[i].q) for i in R1_A7_JointArmIndex],
                 "arm_tau": [float(self.msg.motor_cmd[i].tau) for i in R1_A7_JointArmIndex],
                 "head_q": [float(self.msg.motor_cmd[i].q) for i in R1_A7_JointHeadIndex],
                 "waist_q": float(self.msg.motor_cmd[R1_A7_JointIndex.kWaistYaw].q),
             }
+            if any(request["sequence"] == request_sequence for request in self.command_history):
+                self.command_publications[request_sequence] = {
+                    key: value[:] if isinstance(value, list) else value
+                    for key, value in self.published_command.items()
+                }
 
     @staticmethod
     def _recording_state(lowstate):
@@ -2700,6 +2727,7 @@ class R1_A7_ArmController:
                 "arm_tau": self.tauff_target.tolist(),
                 "head_q": self.head_q_target.tolist(),
                 "waist_q": self.waist_yaw_target,
+                "sequence": self.requested_sequence,
                 "monotonic_ns": None if self.target_updated_at is None else int(self.target_updated_at * 1e9),
             }
             published = None if self.published_command is None else {
@@ -2711,6 +2739,22 @@ class R1_A7_ArmController:
             "requested": requested,
             "published": published,
         }
+
+    def get_recording_command_at(self, anchor_ns, not_before_ns):
+        with self.ctrl_lock:
+            requested = next((entry for entry in reversed(self.command_history)
+                              if not_before_ns <= entry["monotonic_ns"] <= anchor_ns), None)
+            if requested is None:
+                return None
+            published = self.command_publications.get(requested["sequence"])
+            return {
+                "requested": {key: value[:] if isinstance(value, list) else value
+                              for key, value in requested.items()},
+                "published": None if published is None else {
+                    key: value[:] if isinstance(value, list) else value
+                    for key, value in published.items()
+                },
+            }
 
     def get_mode_machine(self):
         '''Return current dds mode machine.'''

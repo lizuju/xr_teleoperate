@@ -1,4 +1,5 @@
 import threading
+from collections import deque
 import types
 import unittest
 import xml.etree.ElementTree as ET
@@ -39,6 +40,9 @@ class R1A7WaistControllerTest(unittest.TestCase):
         controller.publish_error = None
         controller.published_sequence = 0
         controller.published_command = None
+        controller.requested_sequence = 0
+        controller.command_history = deque(maxlen=64)
+        controller.command_publications = {}
         controller.control_dt = 0.004
         # velocity feed-forward state that __init__ would normally create
         controller.dq_feedforward_enabled = False

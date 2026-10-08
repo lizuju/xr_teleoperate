@@ -57,6 +57,9 @@ class EpisodeWriter:
         self._error = None
         self.quality_report = quality_report
         self._quality_process = None
+        self._quality_thread = None
+        self._quality_pending_process = None
+        self._quality = None
         self._outcome = "unspecified"
         self._started_at = None
         self._saved_at = None
@@ -96,6 +99,7 @@ class EpisodeWriter:
                 "episode": deepcopy(self._current_episode) if state != "idle" else None,
                 "frames_accepted": self.item_id + 1 if state != "idle" else 0,
                 "last_saved": deepcopy(self._last_saved),
+                "quality": deepcopy(self._quality),
                 "error": str(self._error) if self._error is not None else None,
             }
 
@@ -330,16 +334,31 @@ class EpisodeWriter:
         self.episode_dir = saved_dir
         self._write_manifest("complete")
         if self.quality_report:
+            with self._lock:
+                self._quality = {"episode": saved_dir.name, "state": "pending", "error": None}
+                self._quality_pending_process = None
             try:
+                new_process = False
                 if self._quality_process is None or self._quality_process.poll() is not None:
+                    if self._quality_process is not None:
+                        self._quality_process.stdin.close()
                     checker = Path(__file__).resolve().parents[2] / "tools/check_teleop_episode.py"
                     self._quality_process = subprocess.Popen(
                         [sys.executable, "-u", str(checker), "--worker"],
-                        stdin=subprocess.PIPE, text=True, encoding="utf-8",
+                        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, encoding="utf-8",
                         start_new_session=True)
+                    new_process = True
+                with self._lock:
+                    self._quality_pending_process = self._quality_process
+                if new_process:
+                    self._quality_thread = Thread(target=self._read_quality_results,
+                                                  args=(self._quality_process,), name="episode-quality", daemon=True)
+                    self._quality_thread.start()
                 self._quality_process.stdin.write(json.dumps(str(saved_dir.resolve())) + "\n")
                 self._quality_process.stdin.flush()
             except (OSError, ValueError) as error:
+                with self._lock:
+                    self._quality.update(state="failed", error=str(error))
                 logger.warning("[QUALITY] 无法启动质检；数据已保存：%s (%s)", saved_dir, error)
         with self._lock:
             if self._error is not None:
@@ -351,6 +370,49 @@ class EpisodeWriter:
             }
             self._state = "idle"
         logger.info("Saved episode: %s (%d frames)", self.episode_dir, self._frame_count)
+
+    def _read_quality_results(self, process):
+        error = "质检进程退出，没有返回结果"
+        try:
+            for line in process.stdout:
+                try:
+                    result = json.loads(line)
+                    if isinstance(result, dict) and isinstance(result.get("episode"), str):
+                        with self._lock:
+                            if (self._quality_pending_process is not process or self._quality is None
+                                    or self._quality["episode"] != result["episode"]):
+                                continue
+                    if (not isinstance(result, dict) or not isinstance(result.get("episode"), str)
+                            or result.get("state") not in ("complete", "failed")):
+                        raise ValueError("invalid quality worker result")
+                    if result["state"] == "complete":
+                        counts = ("total_frames", "eligible_frames", "exportable_frames", "exportable_segments",
+                                  "longest_segment_frames", "min_segment_frames")
+                        if (type(result.get("file_valid")) is not bool or result.get("outcome") not in OUTCOMES
+                                or any(type(result.get(key)) is not int or result[key] < 0 for key in counts)
+                                or not isinstance(result.get("excluded_counts"), dict)
+                                or any(not isinstance(key, str) or type(value) is not int or value < 0
+                                       for key, value in result["excluded_counts"].items())):
+                            raise ValueError("invalid quality worker statistics")
+                except ValueError as exc:
+                    with self._lock:
+                        if (self._quality_pending_process is process and self._quality is not None
+                                and self._quality["state"] == "pending"):
+                            self._quality.update(state="failed", error=str(exc))
+                    continue
+                with self._lock:
+                    if (self._quality_pending_process is process and self._quality is not None
+                            and self._quality["episode"] == result["episode"]
+                            and self._quality["state"] == "pending"):
+                        self._quality = result
+        except OSError as exc:
+            error = str(exc)
+        finally:
+            process.stdout.close()
+            with self._lock:
+                if (self._quality_pending_process is process and self._quality is not None
+                        and self._quality["state"] == "pending"):
+                    self._quality.update(state="failed", error=error)
 
     def process_queue(self):
         try:
@@ -404,6 +466,12 @@ class EpisodeWriter:
                 except Empty:
                     break
             logger.error("Episode recording failed: %s", self._error)
+        finally:
+            if self._quality_process is not None:
+                try:
+                    self._quality_process.stdin.close()
+                except OSError:
+                    pass
 
     def close(self):
         with self._lock:
@@ -411,11 +479,6 @@ class EpisodeWriter:
             if self._state == "recording":
                 self._state = "saving"
         self.worker_thread.join(timeout=CLOSE_TIMEOUT)
-        if not self.worker_thread.is_alive() and self._quality_process is not None:
-            try:
-                self._quality_process.stdin.close()
-            except OSError:
-                pass
         if self.worker_thread.is_alive():
             with self._lock:
                 if self._error is None:

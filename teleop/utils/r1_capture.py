@@ -91,7 +91,7 @@ def capture_metadata(args, camera_config, retargeter, calibration=None, recordin
         # per colour key actually written to the episode.
         "images": images,
         "camera_sync": {
-            "method": "minimax nearest frame across newest stream anchors; no sequence rewind",
+            "method": "newest complete frame set within actual source-time spread tolerance; no sequence rewind",
             "anchor": "selected per sample",
             "tolerance_ms": float(getattr(args, "camera_sync_tolerance_ms",
                                           CameraSynchronizer.DEFAULT_TOLERANCE_MS)),
@@ -157,6 +157,10 @@ def capture_metadata(args, camera_config, retargeter, calibration=None, recordin
             "states": "latest received motor feedback; each source retains its own receive time",
             "sample.aligned_states": "separate nearest-feedback observations at camera anchor; raw actions unchanged",
             "hand_request_time": "Ubuntu monotonic time of accepted paired hand targets; sequence links successful publications",
+            "sample.action_alignment": ("Training selects the latest accepted arm request at or before the completed "
+                                        "hand request, with corresponding successful publications and actual hand inputs. "
+                                        "No interpolation, future request, or crossing an episode start or arm hold. "
+                                        "Raw actions, commands and XR retain their original capture times."),
             "sample.imu": "latest SDK IMU with the same receive sequence and tick as robot state",
             "sample.imu_packets": "unresampled IMU packet batch since previous recording sample",
             "states.*.torque": ("measured joint torque; an empty list means the source exposes no "
@@ -225,12 +229,14 @@ class R1Capture:
         self.last_wrist_sequences = {}
         self.wrist_seen = {}
         self.last_imu_sequence = None
+        self.action_not_before_ns = 0
 
     def reset_episode(self):
         self.last_image_sequence = None
         self.last_wrist_sequences = {}
         self.wrist_seen = {}
         self.last_imu_sequence = None
+        self.action_not_before_ns = time.monotonic_ns()
         self.sync.clear()
 
     def observe(self, image, wrist_images=None):
@@ -249,8 +255,24 @@ class R1Capture:
         hand_sample = self.hand_loop.get_recording_sample()
         hand = hand_sample["hand"]
         hand_inputs = hand_sample["target_inputs"]
+        hand_anchor_ns = int(hand["requested"]["monotonic_ns"] or 0)
+        aligned_arm = self.arm.get_recording_command_at(hand_anchor_ns, self.action_not_before_ns)
         now = time.monotonic_ns()
         wall = time.time_ns()
+        action_alignment = {
+            "schema": "r1_action_alignment_v1",
+            "method": "latest accepted arm request at or before completed hand request",
+            "anchor_monotonic_ns": hand_anchor_ns,
+            "aligned": bool(mode == "following" and not hand_sample["paused"]
+                            and all(hand_sample["tracking_fresh"].values())
+                            and aligned_arm is not None
+                            and self.action_not_before_ns <= hand_anchor_ns <= now
+                            and hand_anchor_ns > 0),
+            "arm": aligned_arm,
+            "hands": {"requested": hand["requested"], "published": hand["published"]},
+            "hand_target_inputs": hand_inputs,
+            "tracking_fresh": hand_sample["tracking_fresh"],
+        }
 
         def source(timestamp, timeout, valid=True, sequence=None):
             received = int(timestamp or 0)
@@ -419,6 +441,7 @@ class R1Capture:
                     "head_pose": np.asarray(tele_data.head_pose).tolist(),
                 },
                 "hand_target_inputs": hand_inputs,
+                "action_alignment": action_alignment,
                 "commands": {"arm": {"requested": requested, "published": arm["published"]},
                              "hands": {"requested": hand["requested"], "published": hand["published"]}},
             },

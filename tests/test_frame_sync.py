@@ -9,10 +9,11 @@ MS = 1_000_000
 class Frame:
     """Minimal stand-in for a teleimager TeleImage."""
 
-    def __init__(self, sequence, received_monotonic_ns, tag=None):
+    def __init__(self, sequence, received_monotonic_ns, tag=None, timing=None):
         self.sequence = sequence
         self.received_monotonic_ns = received_monotonic_ns
         self.tag = tag
+        self.timing = timing
 
 
 class StreamHistoryTest(unittest.TestCase):
@@ -90,22 +91,23 @@ class CameraSynchronizerTest(unittest.TestCase):
         self.assertEqual(pairing.anchor, "left_wrist")
         self.assertIsNone(pairing.frames["head"])
         self.assertEqual(pairing.skew_ms, 0.0)
+        self.assertFalse(self.sync.alignment(pairing)["aligned"])
 
-    def test_the_instant_is_chosen_to_minimise_the_worst_distance(self):
-        # Anchored on the head the worst distance is 60 ms (the left palm); on
-        # the left palm it is 60 ms (the head); on the right palm it is only
-        # 40 ms. The fixed-head anchor this used to have cannot see that.
+    def test_no_qualifying_pair_records_the_latest_complete_set(self):
         self.sync.offer("head", Frame(1, 200 * MS))
         self.sync.offer("left_wrist", Frame(1, 260 * MS))
         self.sync.offer("right_wrist", Frame(1, 220 * MS))
         pairing = self.sync.pair(260 * MS)
-        self.assertEqual(pairing.anchor, "right_wrist")
+        self.assertEqual(pairing.anchor, "head")
         self.assertAlmostEqual(pairing.skew_ms, 60.0)
-        self.assertAlmostEqual(pairing.offsets_ms["head"], -20.0)
-        self.assertAlmostEqual(pairing.offsets_ms["right_wrist"], 0.0)
+        self.assertAlmostEqual(pairing.offsets_ms["head"], 0.0)
+        self.assertAlmostEqual(pairing.offsets_ms["right_wrist"], 20.0)
+        self.assertTrue(self.sync.alignment(pairing)["complete"])
+        self.assertFalse(self.sync.alignment(pairing)["aligned"])
 
-    def test_pair_chooses_the_wrist_frame_nearest_the_head_not_the_newest(self):
+    def test_pair_chooses_a_qualifying_complete_set_from_history(self):
         self.sync.offer("head", Frame(1, 100 * MS))
+        self.sync.offer("right_wrist", Frame(1, 100 * MS))
         for sequence, offset in enumerate((60, 90, 130), start=1):
             self.sync.offer("left_wrist", Frame(sequence, offset * MS))
         # The newest wrist frame is 30 ms late; the one at 90 ms is 10 ms early.
@@ -113,7 +115,7 @@ class CameraSynchronizerTest(unittest.TestCase):
         self.assertEqual(pairing.frames["left_wrist"].received_monotonic_ns, 90 * MS)
         self.assertAlmostEqual(pairing.skew_ms, 10.0)
 
-    def test_nearest_pairing_beats_latest_pairing_on_a_measured_like_schedule(self):
+    def test_qualifying_pairing_beats_latest_pairing_at_different_rates(self):
         """Reproduce the shape of the live rig: 15 Hz head against ~23 Hz palms."""
         # Shifted off zero: a zero receive time is refused as unusable.
         epoch = 1000
@@ -136,7 +138,7 @@ class CameraSynchronizerTest(unittest.TestCase):
             pairing = sync.pair(grid * MS)
             chosen = pairing.frames["left_wrist"].received_monotonic_ns / MS
             self.assertIn(chosen, wrists)
-            nearest_skews.append(abs(chosen - anchor))
+            nearest_skews.append(pairing.skew_ms)
         self.assertGreaterEqual(max(latest_skews), 40.0)
         self.assertLessEqual(max(nearest_skews), 24.0)
         self.assertLess(max(nearest_skews), max(latest_skews))
@@ -164,6 +166,7 @@ class CameraSynchronizerTest(unittest.TestCase):
         self.assertTrue(block["aligned"])
         self.assertAlmostEqual(block["skew_ms"], 10.0)
 
+        sync.clear()
         sync.offer("head", Frame(2, 200 * MS))
         sync.offer("left_wrist", Frame(2, 165 * MS))
         block = sync.alignment(sync.pair(200 * MS))
@@ -177,6 +180,145 @@ class CameraSynchronizerTest(unittest.TestCase):
         block = self.sync.alignment(self.sync.pair(120 * MS))
         self.assertAlmostEqual(block["skew_ms"],
                                max(block["offset_ms"].values()) - min(block["offset_ms"].values()))
+        self.assertFalse(block["aligned"])
+
+    def test_new_qualifying_wrist_frames_beat_an_old_perfect_pair(self):
+        self.sync.offer("head", Frame(1, 100 * MS))
+        for name in ("left_wrist", "right_wrist"):
+            self.sync.offer(name, Frame(1, 100 * MS))
+        self.sync.offer("left_wrist", Frame(2, 124 * MS))
+        self.sync.offer("right_wrist", Frame(2, 122 * MS))
+        pairing = self.sync.pair(130 * MS)
+        self.assertEqual({name: frame.sequence for name, frame in pairing.frames.items()},
+                         {"head": 1, "left_wrist": 2, "right_wrist": 2})
+        self.assertEqual(pairing.skew_ms, 24.0)
+        self.assertTrue(self.sync.alignment(pairing)["aligned"])
+
+    def test_freshness_is_the_oldest_camera_time_not_the_tightest_spread(self):
+        for name in self.sync.histories:
+            self.sync.offer(name, Frame(1, 100 * MS))
+        for name, stamp in (("head", 180), ("left_wrist", 190), ("right_wrist", 202)):
+            self.sync.offer(name, Frame(2, stamp * MS))
+        pairing = self.sync.pair(210 * MS)
+        self.assertTrue(all(frame.sequence == 2 for frame in pairing.frames.values()))
+        self.assertEqual(pairing.skew_ms, 22.0)
+
+    def test_opposite_offsets_cannot_mask_a_spread_over_tolerance(self):
+        for name, stamp in (("head", 100), ("left_wrist", 82), ("right_wrist", 118)):
+            self.sync.offer(name, Frame(1, stamp * MS))
+        block = self.sync.alignment(self.sync.pair(120 * MS))
+        self.assertTrue(all(abs(value) < 25 for value in block["offset_ms"].values()))
+        self.assertEqual(block["skew_ms"], 36.0)
+        self.assertFalse(block["aligned"])
+
+    def test_short_head_dropout_reuses_an_aligned_set_then_accepts_new_frames(self):
+        for name in self.sync.histories:
+            self.sync.offer(name, Frame(1, 100 * MS))
+        self.sync.pair(100 * MS)
+        for name in ("left_wrist", "right_wrist"):
+            self.sync.offer(name, Frame(2, 130 * MS))
+        repeated = self.sync.pair(135 * MS)
+        self.assertTrue(all(frame.sequence == 1 for frame in repeated.frames.values()))
+        self.sync.offer("head", Frame(2, 133 * MS))
+        resumed = self.sync.pair(140 * MS)
+        self.assertTrue(all(frame.sequence == 2 for frame in resumed.frames.values()))
+        self.assertEqual(resumed.skew_ms, 3.0)
+
+    def test_10hz_head_and_30hz_wrists_keep_the_latest_qualifying_history(self):
+        streams = {"head": list(range(1000, 2001, 100)),
+                   "left_wrist": list(range(1008, 2001, 33)),
+                   "right_wrist": list(range(1016, 2001, 33))}
+        offered = {name: 0 for name in streams}
+        selected_head_sequences = []
+        for tick in range(1025, 2001, 25):
+            for name, stamps in streams.items():
+                while offered[name] < len(stamps) and stamps[offered[name]] <= tick:
+                    self.sync.offer(name, Frame(offered[name] + 1, stamps[offered[name]] * MS))
+                    offered[name] += 1
+            pairing = self.sync.pair(tick * MS)
+            self.assertTrue(self.sync.alignment(pairing)["aligned"])
+            oldest = min(frame.received_monotonic_ns for frame in pairing.frames.values())
+            self.assertLessEqual(tick * MS - oldest, 125 * MS)
+            selected_head_sequences.append(pairing.frames["head"].sequence)
+        self.assertEqual(selected_head_sequences, sorted(selected_head_sequences))
+        self.assertGreaterEqual(selected_head_sequences[-1], 10)
+        self.assertTrue(all(len(history) <= 8 for history in self.sync.histories.values()))
+
+    def test_unaligned_fallback_advances_sequence_floors(self):
+        for name, stamp in (("head", 100), ("left_wrist", 70), ("right_wrist", 60)):
+            self.sync.offer(name, Frame(1, stamp * MS))
+        self.sync.pair(100 * MS)
+        for name, stamp in (("head", 200), ("left_wrist", 170), ("right_wrist", 160)):
+            self.sync.offer(name, Frame(2, stamp * MS))
+        fallback = self.sync.pair(210 * MS)
+        self.assertFalse(self.sync.alignment(fallback)["aligned"])
+        self.assertEqual(self.sync.last_used, {name: 2 for name in self.sync.histories})
+        self.sync.offer("head", Frame(3, 250 * MS))
+        self.sync.offer("left_wrist", Frame(1, 250 * MS))
+        self.sync.offer("right_wrist", Frame(1, 250 * MS))
+        pairing = self.sync.pair(260 * MS)
+        self.assertEqual(pairing.frames["left_wrist"].sequence, 2)
+        self.assertEqual(pairing.frames["right_wrist"].sequence, 2)
+
+    def test_source_time_is_checked_per_frame_and_not_replaced_by_receive_time(self):
+        for name in self.sync.histories:
+            self.sync.offer(name, Frame(1, 190 * MS,
+                                       timing={"clock_valid": False, "mapped_monotonic_ns": 200 * MS}))
+            self.sync.offer(name, Frame(2, 201 * MS,
+                                       timing={"clock_valid": True, "mapped_monotonic_ns": 180 * MS}))
+        pairing = self.sync.pair(210 * MS)
+        self.assertEqual(pairing.timestamp_basis, "mapped_source")
+        self.assertEqual(pairing.anchor_ns, 180 * MS)
+        self.assertTrue(all(frame.sequence == 2 for frame in pairing.frames.values()))
+
+    def test_future_mapped_frames_do_not_beat_valid_history(self):
+        for name in self.sync.histories:
+            self.sync.offer(name, Frame(1, 180 * MS,
+                                       timing={"clock_valid": True, "mapped_monotonic_ns": 179 * MS}))
+            self.sync.offer(name, Frame(2, 200 * MS,
+                                       timing={"clock_valid": True, "mapped_monotonic_ns": 220 * MS}))
+        pairing = self.sync.pair(210 * MS)
+        self.assertTrue(all(frame.sequence == 1 for frame in pairing.frames.values()))
+        self.assertEqual(pairing.anchor_ns, 179 * MS)
+
+    def test_missing_clock_keeps_original_receive_times_and_invalid_timing(self):
+        for name, stamp in (("head", 100), ("left_wrist", 108), ("right_wrist", 116)):
+            self.sync.offer(name, Frame(1, stamp * MS, timing={"clock_valid": name != "head"}))
+        pairing = self.sync.pair(120 * MS)
+        self.assertEqual(pairing.timestamp_basis, "host_receive")
+        self.assertEqual(pairing.anchor_ns, 100 * MS)
+        self.assertFalse(pairing.frames["head"].payload.timing["clock_valid"])
+
+    def test_camera_epoch_change_clears_only_its_history_and_floor(self):
+        for name in self.sync.histories:
+            self.sync.offer(name, Frame(7, 100 * MS,
+                                       timing={"clock_valid": True, "mapped_monotonic_ns": 100 * MS,
+                                               "clock_id": "pc2", "source_epoch": "capture-1"}))
+        self.sync.pair(100 * MS)
+        self.sync.offer("left_wrist", Frame(1, 110 * MS,
+                                            timing={"clock_valid": True, "mapped_monotonic_ns": 110 * MS,
+                                                    "clock_id": "pc2", "source_epoch": "capture-2"}))
+        self.assertEqual(len(self.sync.histories["left_wrist"]), 1)
+        self.assertNotIn("left_wrist", self.sync.last_used)
+        self.assertEqual(self.sync.last_used["head"], 7)
+        pairing = self.sync.pair(120 * MS)
+        self.assertEqual(pairing.frames["left_wrist"].sequence, 1)
+        self.assertEqual(pairing.frames["head"].sequence, 7)
+
+    def test_clock_id_change_cannot_use_previous_clock_history(self):
+        self.sync.offer("head", Frame(9, 100 * MS,
+                                     timing={"clock_valid": True, "mapped_monotonic_ns": 100 * MS,
+                                             "clock_id": "old-pc2"}))
+        self.sync.offer("head", Frame(1, 200 * MS,
+                                     timing={"clock_valid": True, "mapped_monotonic_ns": 200 * MS,
+                                             "clock_id": "new-pc2"}))
+        for name in ("left_wrist", "right_wrist"):
+            self.sync.offer(name, Frame(1, 100 * MS,
+                                       timing={"clock_valid": True, "mapped_monotonic_ns": 100 * MS,
+                                               "clock_id": "pc2"}))
+        pairing = self.sync.pair(210 * MS)
+        self.assertEqual(pairing.frames["head"].sequence, 1)
+        self.assertFalse(self.sync.alignment(pairing)["aligned"])
 
     def test_single_stream_pairing_has_zero_skew(self):
         sync = CameraSynchronizer(["head"], tolerance_ms=25.0)

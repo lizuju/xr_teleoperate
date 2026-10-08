@@ -191,9 +191,21 @@ class LinkerO6ControlLoopTest(unittest.TestCase):
         self.loop.should_pause = lambda: True
         self.loop._step()
         paused = self.loop.get_recording_sample()
+        self.assertTrue(paused["paused"])
         self.assertEqual(paused["target_inputs"], previous["target_inputs"])
         self.assertEqual(paused["hand"]["sequence"], previous["hand"]["sequence"] + 1)
         self.assertGreater(paused["hand"]["monotonic_ns"], previous["hand"]["monotonic_ns"])
+
+    def test_cached_recording_validity_belongs_to_the_published_request(self):
+        self.loop.get_tele_data = lambda: sample(fresh=(False, True))
+        self.loop._step()
+        cached = self.loop.get_recording_sample()
+        self.assertEqual(cached["tracking_fresh"], {"left": False, "right": True})
+        self.assertFalse(cached["paused"])
+        self.loop.get_tele_data = sample
+        self.assertEqual(self.loop.get_recording_sample(), cached)
+        self.loop._step()
+        self.assertEqual(self.loop.get_recording_sample()["tracking_fresh"], {"left": True, "right": True})
 
     def test_paused_worker_keeps_ticking_and_reports_feedback_failure(self):
         self.loop._step()

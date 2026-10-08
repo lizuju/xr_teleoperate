@@ -10,15 +10,15 @@ import cv2
 import h5py
 import numpy as np
 
-from check_teleop_episode import (TRAINING_CAMERAS, TRAINING_GROUPS,
+from check_teleop_episode import (DEFAULT_MIN_SEGMENT_FRAMES, TRAINING_CAMERAS, TRAINING_GROUPS,
                                  TRAINING_TIME_LIMITS, episode_file, training_observation,
-                                 training_timing, validate_episode)
+                                 training_action, training_commands, training_hand_inputs, training_timing, validate_episode)
 
 
 IMAGE_HW = (240, 320)
 
 
-def export_dataset(source, output, min_frames=40):
+def export_dataset(source, output, min_frames=DEFAULT_MIN_SEGMENT_FRAMES):
     source, output = Path(source).resolve(), Path(output).resolve()
     if min_frames < 2:
         raise ValueError("min_frames must be at least 2")
@@ -38,11 +38,11 @@ def export_dataset(source, output, min_frames=40):
         "joint_groups": TRAINING_GROUPS, "camera_names": list(TRAINING_CAMERAS.values()),
         "image_size_hw": list(IMAGE_HW), "image_color_order": "RGB",
         "training_inputs": ["observations/qpos", "observations/images"], "imu_used": False,
-        "action_semantics": "Same-row requested qpos before publisher limiting and hand smoothing; no time shift.",
+        "action_semantics": "Bounded causal accepted-request alignment from sample.action_alignment: the latest historical arm target accepted at or before the completed hand request. Arm targets already include arm target shaping; hand targets precede hand smoothing. Only older rows without this block use original same-row actions. Actual acceptance timestamps are retained; no interpolation or fabricated times.",
         "observation_semantics": "Camera-source-time paired images and aligned_states feedback. Software timestamps, not exposure synchronization.",
         "timing": "Original samples and measured intervals retained; no interpolation. Split at rejected rows and gaps >1.5 nominal periods.",
-        "deployment_contract": "At each decision tick, pair cameras and historical feedback by the same source-time rules; preserve observation age bounds. Actions remain that tick's requests and enter the recorded target shaping/limiting and hand smoothing path, not direct motor writes.",
-        "hand_request_time": "Recorded paired-target acceptance time and sequence, linked to successful hand publications; not physical execution time.",
+        "deployment_contract": "Reproduce recorded source-time observation pairing and freshness checks. Consume the already accepted targets at the recorded action anchor, preserving publisher limits and hand smoothing safeguards.",
+        "hand_request_time": "Recorded paired-target acceptance time and sequence, linked to successful hand publications; input age is checked against hand_target_inputs when present. Not physical execution time.",
         "time_limits_ms": TRAINING_TIME_LIMITS.copy(),
         "qvel_semantics": "Finite differences of aligned qpos over decision ticks, including repeated observations; not physical joint velocity or a training input.",
         "image_transform": "OpenCV INTER_AREA resize from each original image to 320x240, then BGR to RGB; original calibration needs the recorded x/y pixel scaling.",
@@ -62,7 +62,7 @@ def export_dataset(source, output, min_frames=40):
         for source_id, path in enumerate(manifests):
             directory = path.parent
             manifest = json.loads(path.read_text())
-            report = validate_episode(directory)
+            report = validate_episode(directory, min_segment_frames=min_frames)
             report_path = Path("quality") / f"source_{source_id:04d}.json"
             (output / report_path).write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
             entry = {"source_id": source_id, "episode": str(directory), "outcome": manifest.get("outcome"),
@@ -119,15 +119,16 @@ def export_dataset(source, output, min_frames=40):
                 observations = [training_observation(r) for r in selected]
                 qpos = np.array([sum((o[g] for g in TRAINING_GROUPS), [])
                                  for o in observations], dtype=np.float32)
-                actions = np.array([sum((r["actions"][g]["qpos"] for g in TRAINING_GROUPS), [])
-                                    for r in selected], dtype=np.float32)
+                aligned_actions = [training_action(r) for r in selected]
+                actions = np.array([sum((action[g] for g in TRAINING_GROUPS), [])
+                                    for action in aligned_actions], dtype=np.float32)
                 if not np.isfinite(qpos).all() or not np.isfinite(actions).all():
                     raise ValueError(f"{directory}: joint values cannot be represented as finite float32")
                 stamps = np.array([r["sample"]["monotonic_ns"] for r in selected], dtype=np.int64)
                 seconds = (stamps - stamps[0]).astype(np.float64) / 1e9
                 with h5py.File(temporary, "w") as h:
                     h.attrs.update(sim=False, compress=False, fps=frequency, imu_used=False,
-                                   action_time_shift=0, color_order="RGB", source_episode=str(directory))
+                                   action_semantics=dataset["action_semantics"], color_order="RGB", source_episode=str(directory))
                     h.create_dataset("observations/qpos", data=qpos)
                     h.create_dataset("observations/qvel", data=np.gradient(qpos, seconds, axis=0).astype(np.float32))
                     h["observations/qvel"].attrs["meaning"] = dataset["qvel_semantics"]
@@ -135,10 +136,25 @@ def export_dataset(source, output, min_frames=40):
                     h.create_dataset("timestamp", data=seconds)
                     h.create_dataset("source/frame_index", data=[r["idx"] for r in selected])
                     h.create_dataset("source/monotonic_ns", data=stamps)
-                    h.create_dataset("source/arm_request_ns", data=[r["sample"]["commands"]["arm"]["requested"]["monotonic_ns"] for r in selected])
-                    h.create_dataset("source/hand_request_ns", data=[r["sample"]["commands"]["hands"]["requested"]["monotonic_ns"] for r in selected])
-                    h.create_dataset("source/hand_request_sequence", data=[r["sample"]["commands"]["hands"]["requested"]["sequence"] for r in selected])
+                    commands = [training_commands(r["sample"]) for r in selected]
+                    h.create_dataset("source/arm_request_ns", data=[c["arm"]["requested"]["monotonic_ns"] for c in commands])
+                    h.create_dataset("source/hand_request_ns", data=[c["hands"]["requested"]["monotonic_ns"] for c in commands])
+                    h.create_dataset("source/hand_request_sequence", data=[c["hands"]["requested"]["sequence"] for c in commands])
+                    h.create_dataset("source/arm_request_sequence", data=[c["arm"]["requested"].get("sequence", 0)
+                                                                         for c in commands]).attrs["missing_value"] = 0
+                    h.create_dataset("source/action_alignment_used", data=["action_alignment" in r["sample"] for r in selected])
+                    h.create_dataset("source/action_anchor_ns", data=[r["sample"]["action_alignment"]["anchor_monotonic_ns"]
+                                     if "action_alignment" in r["sample"] else r["sample"]["monotonic_ns"] for r in selected])
                     timings = [training_timing(r["sample"]) for r in selected]
+                    inputs = [training_hand_inputs(r["sample"]) for r in selected]
+                    input_stamps = h.create_dataset("source/hand_input_ns", data=[
+                        [(value.get(side) or {}).get("received_monotonic_ns", 0) for side in ("left", "right")]
+                        for value in inputs])
+                    input_stamps.attrs.update(sides=["left", "right"], missing_value=0)
+                    input_ages = h.create_dataset("source/hand_input_age_ms", data=[
+                        [t[side + "_hand_input_age_ms"] if t[side + "_hand_input_age_ms"] is not None else -1.0
+                         for side in ("left", "right")] for t in timings])
+                    input_ages.attrs.update(sides=["left", "right"], missing_value=-1.0)
                     h.create_dataset("source/observation_ns", data=[t["observation_ns"] for t in timings])
                     for kind in ("camera_ns", "feedback_ns", "request_ns"):
                         for name in timings[0][kind]:
@@ -228,7 +244,8 @@ def main():
     parser = argparse.ArgumentParser(description="Export successful R1/O6 demonstrations to ACT HDF5; no robot connection, no IMU inputs.")
     parser.add_argument("source", type=Path, help="One task directory or one episode directory")
     parser.add_argument("--output", type=Path, required=True, help="A new directory outside the recordings")
-    parser.add_argument("--min-frames", type=int, default=40, help="Minimum consecutive eligible samples per segment (default: 40)")
+    parser.add_argument("--min-frames", type=int, default=DEFAULT_MIN_SEGMENT_FRAMES,
+                        help=f"Minimum consecutive eligible samples per segment (default: {DEFAULT_MIN_SEGMENT_FRAMES})")
     args = parser.parse_args()
     cv2.setNumThreads(1)
     result = export_dataset(args.source, args.output, args.min_frames)

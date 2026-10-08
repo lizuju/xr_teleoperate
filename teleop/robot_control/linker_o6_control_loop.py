@@ -29,6 +29,8 @@ class LinkerO6ControlLoop:
         self.recording_sample = {
             "hand": controller.get_recording_snapshot(),
             "target_inputs": deepcopy(self.target_inputs),
+            "tracking_fresh": {"left": False, "right": False},
+            "paused": False,
         }
         self.thread = threading.Thread(target=self._run, name="linker-o6-control", daemon=True)
 
@@ -96,7 +98,11 @@ class LinkerO6ControlLoop:
     def _cache_recording_sample(self):
         snapshot = self.controller.get_recording_snapshot()
         with self.target_inputs_lock:
-            self.recording_sample = {"hand": snapshot, "target_inputs": deepcopy(self.target_inputs)}
+            self.recording_sample = {
+                "hand": snapshot, "target_inputs": deepcopy(self.target_inputs),
+                "tracking_fresh": dict(zip(("left", "right"), self.command_fresh)),
+                "paused": self.was_paused,
+            }
 
     def get_recording_sample(self):
         with self.target_inputs_lock:

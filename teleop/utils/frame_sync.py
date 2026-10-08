@@ -91,7 +91,7 @@ def frame_time(frame, source_time):
 
 
 class CameraSynchronizer:
-    """Pairs the frames of several streams around a chosen anchor stream."""
+    """Selects the latest complete camera pair within the allowed time spread."""
 
     #: Cross-camera spread above which a sample is reported as not aligned.
     DEFAULT_TOLERANCE_MS = 25.0
@@ -114,6 +114,13 @@ class CameraSynchronizer:
         history = self.histories.get(stream)
         if history is None or frame is None:
             return False
+        previous = history.latest()
+        timing = getattr(frame, "timing", None) or {}
+        previous_timing = (getattr(previous.payload, "timing", None) or {}) if previous else {}
+        if any(previous_timing.get(key) and timing.get(key)
+               and previous_timing[key] != timing[key] for key in ("clock_id", "source_epoch")):
+            history.clear()
+            self.last_used.pop(stream, None)
         return history.offer(getattr(frame, "sequence", 0),
                              getattr(frame, "received_monotonic_ns", 0), frame)
 
@@ -121,46 +128,50 @@ class CameraSynchronizer:
         return self.histories[stream].latest()
 
     def pair(self, now_ns):
-        """Choose one frame per stream, all as close to a common instant as possible.
+        """Prefer the freshest complete set whose actual time spread is allowed.
 
-        The instant is not pinned to a fixed stream. A fixed head anchor only
-        works while the head is the slowest stream: it is then stale enough that
-        a palm frame has already arrived on either side of it. Once the head
-        stereo is made faster than the palms (measured 25 Hz against 20 Hz after
-        the head fps raise of 2026-09-15) the head anchor is too fresh, the
-        nearest palm frame is always the previous one, and the pairing stops
-        helping -- the skew went from 10.1 ms back up to 27.8 ms.
-
-        So the instant is picked by minimax over the newest frame of every
-        stream: try each as the anchor, keep the one whose worst per-stream
-        distance is smallest. Frames already used by an earlier sample are never
-        revisited, so a stream can repeat but cannot be rewound.
+        Freshness is the oldest camera time in the set. With no qualifying set,
+        record the latest available images and their actual spread. Every image
+        recorded advances its sequence floor, including an unaligned sample.
         """
-        candidates = []
+        candidates = {}
         for name, history in self.histories.items():
-            frame = history.latest(self.last_used.get(name))
-            if frame is not None:
-                candidates.append((name, frame))
-        if not candidates:
+            floor = self.last_used.get(name, 0)
+            candidates[name] = [frame for frame in history._frames
+                                if frame.sequence >= floor and frame.received_monotonic_ns <= now_ns]
+        if not any(candidates.values()):
             return None
-        source_time = len(candidates) == len(self.histories) and all(
-            (getattr(frame.payload, "timing", None) or {}).get("clock_valid")
-            for _, frame in candidates)
-        best = None
-        for anchor_name, anchor_frame in candidates:
-            target = frame_time(anchor_frame, source_time)
-            frames, offsets, worst = {}, {}, 0.0
-            for name, history in self.histories.items():
-                frame = history.nearest(target, self.last_used.get(name), source_time)
-                frames[name] = frame
-                if frame is None:
-                    continue
-                offset = (frame_time(frame, source_time) - target) / 1e6
-                offsets[name] = offset
-                worst = max(worst, abs(offset))
-            if best is None or worst < best[0]:
-                best = (worst, anchor_name, target, frames, offsets)
-        _, anchor_name, anchor_ns, frames, offsets = best
+        source_time = all(frames and (getattr(frames[-1].payload, "timing", None) or {}).get("clock_valid") is True
+                          for frames in candidates.values())
+        if source_time:
+            candidates = {name: [frame for frame in frames
+                                if (getattr(frame.payload, "timing", None) or {}).get("clock_valid") is True
+                                and 0 < frame_time(frame, True) <= now_ns]
+                          for name, frames in candidates.items()}
+        frames = {name: max(values, key=lambda frame: (frame_time(frame, source_time), frame.sequence))
+                  if values else None for name, values in candidates.items()}
+        if not any(frame is not None for frame in frames.values()):
+            return None
+        if all(candidates.values()):
+            times = sorted({frame_time(frame, source_time) for values in candidates.values()
+                            for frame in values}, reverse=True)
+            for oldest_ns in times:
+                matched = {}
+                for name, values in candidates.items():
+                    eligible = [frame for frame in values
+                                if oldest_ns <= frame_time(frame, source_time)
+                                <= oldest_ns + self.tolerance_ms * 1e6]
+                    if not eligible:
+                        break
+                    matched[name] = max(eligible, key=lambda frame: (frame_time(frame, source_time), frame.sequence))
+                if len(matched) == len(self.histories):
+                    frames = matched
+                    break
+        anchor_name = self.anchor if frames[self.anchor] is not None else next(
+            name for name, frame in frames.items() if frame is not None)
+        anchor_ns = frame_time(frames[anchor_name], source_time)
+        offsets = {name: (frame_time(frame, source_time) - anchor_ns) / 1e6
+                   for name, frame in frames.items() if frame is not None}
         for name, frame in frames.items():
             if frame is not None:
                 self.last_used[name] = frame.sequence
@@ -179,9 +190,9 @@ class CameraSynchronizer:
             "offset_ms": {name: float(offset) for name, offset in pairing.offsets_ms.items()},
             "skew_ms": float(pairing.skew_ms),
             "tolerance_ms": self.tolerance_ms,
-            "aligned": bool(pairing.skew_ms <= self.tolerance_ms),
-            "method": ("per-stream frame nearest the instant that minimises the worst "
-                       "per-stream distance; no stream is rewound"),
+            "aligned": bool(all(frame is not None for frame in pairing.frames.values())
+                            and pairing.skew_ms <= self.tolerance_ms),
+            "method": "latest complete set within actual camera time spread; no stream is rewound",
             "timestamp_basis": pairing.timestamp_basis,
             "complete": all(frame is not None for frame in pairing.frames.values()),
             "clock": "Ubuntu CLOCK_MONOTONIC; mapped PC2 software acquisition or local receive, not exposure",

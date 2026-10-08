@@ -1,6 +1,8 @@
 import datetime
 import json
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -73,6 +75,164 @@ class EpisodeWriterTest(unittest.TestCase):
                  if path.is_dir() and path.name.split("_")[1] == f"{index:04d}"]
         self.assertEqual(len(paths), 1)
         return paths[0]
+
+    def quality_worker(self, body):
+        script = Path(self.temporary.name) / "quality_worker.py"
+        script.write_text("import json,sys,time\nfrom pathlib import Path\n"
+                          "def complete(path):\n"
+                          " return dict(episode=Path(path).name,state='complete',file_valid=True,"
+                          "outcome='success',total_frames=80,eligible_frames=75,exportable_frames=60,"
+                          "exportable_segments=1,longest_segment_frames=60,min_segment_frames=40,"
+                          "excluded_counts={'tracking_stale':5},error=None)\n" + body)
+        actual_popen = subprocess.Popen
+        return mock.patch.object(episode_writer.subprocess, "Popen",
+                                 side_effect=lambda command, **kwargs: actual_popen([sys.executable, str(script)], **kwargs))
+
+    def test_quality_is_async_and_close_keeps_pending_results_alive(self):
+        writer = self.make_writer(quality_report=True)
+        with self.quality_worker("for line in sys.stdin:\n time.sleep(.4)\n print(json.dumps(complete(json.loads(line))),flush=True)\n"):
+            writer.create_episode()
+            writer.add_item({})
+            writer.save_episode("success")
+            self.wait_until(writer.is_ready)
+            status = writer.status_snapshot()
+            self.assertEqual(status["quality"]["state"], "pending")
+            self.assertEqual(status["quality"]["episode"], status["last_saved"]["name"])
+            start = time.monotonic()
+            writer.close()
+            self.assertLess(time.monotonic() - start, .3)
+            self.wait_until(lambda: writer.status_snapshot()["quality"]["state"] == "complete")
+            writer._quality_process.wait(timeout=2)
+            writer._quality_thread.join(timeout=1)
+        status = writer.status_snapshot()
+        self.assertEqual(status["state"], "idle")
+        self.assertEqual(status["quality"]["exportable_frames"], 60)
+        status["quality"]["excluded_counts"]["tracking_stale"] = 999
+        self.assertEqual(writer.status_snapshot()["quality"]["excluded_counts"]["tracking_stale"], 5)
+
+    def test_latest_episode_quality_cannot_be_overwritten_by_late_previous_result(self):
+        writer = self.make_writer(quality_report=True)
+        body = ("first=json.loads(next(sys.stdin))\nsecond=json.loads(next(sys.stdin))\n"
+                "print(json.dumps(complete(second)),flush=True)\ntime.sleep(.1)\n"
+                "print(json.dumps(dict(episode=Path(first).name,state='failed',error='old result')),flush=True)\n"
+                "for line in sys.stdin: pass\n")
+        with self.quality_worker(body):
+            for _ in range(2):
+                writer.create_episode()
+                writer.add_item({})
+                writer.save_episode("success")
+                self.wait_until(writer.is_ready)
+            saved = writer.status_snapshot()["last_saved"]["name"]
+            self.wait_until(lambda: writer.status_snapshot()["quality"]["state"] == "complete")
+            writer.close()
+            writer._quality_process.wait(timeout=2)
+            writer._quality_thread.join(timeout=1)
+        status = writer.status_snapshot()
+        self.assertEqual(status["quality"]["episode"], saved)
+        self.assertEqual(status["quality"]["state"], "complete")
+        self.assertEqual(status["quality"]["error"], None)
+
+    def test_obsolete_episode_bad_statistics_cannot_fail_latest_pending_quality(self):
+        writer = self.make_writer(quality_report=True)
+        body = ("first=json.loads(next(sys.stdin))\nsecond=json.loads(next(sys.stdin))\n"
+                "print(json.dumps(dict(episode=Path(first).name,state='complete')),flush=True)\n"
+                "time.sleep(.1)\nprint(json.dumps(complete(second)),flush=True)\n"
+                "for line in sys.stdin: pass\n")
+        with self.quality_worker(body):
+            for _ in range(2):
+                writer.create_episode()
+                writer.add_item({})
+                writer.save_episode("success")
+                self.wait_until(writer.is_ready)
+            self.wait_until(lambda: writer.status_snapshot()["quality"]["state"] == "complete")
+            self.assertEqual(writer.status_snapshot()["quality"]["episode"], writer.status_snapshot()["last_saved"]["name"])
+            writer.close()
+            writer._quality_process.wait(timeout=2)
+
+    def test_quality_error_does_not_fail_saved_episode(self):
+        writer = self.make_writer(quality_report=True)
+        body = "for line in sys.stdin:\n print(json.dumps(dict(episode=Path(json.loads(line)).name,state='failed',error='checker failed')),flush=True)\n"
+        with self.quality_worker(body):
+            writer.create_episode()
+            writer.add_item({})
+            writer.save_episode("failure")
+            self.wait_until(writer.is_ready)
+            self.wait_until(lambda: writer.status_snapshot()["quality"]["state"] == "failed")
+            status = writer.status_snapshot()
+            self.assertEqual(status["error"], None)
+            self.assertEqual(status["last_saved"]["outcome"], "failure")
+            self.assertEqual(status["quality"]["error"], "checker failed")
+            writer.close()
+            writer._quality_process.wait(timeout=2)
+
+    def test_quality_worker_exit_is_reported_and_next_save_restarts_worker(self):
+        writer = self.make_writer(quality_report=True)
+        body = ("for line in sys.stdin:\n path=json.loads(line)\n"
+                " if Path(path).name.startswith('episode_0000_'): sys.exit(4)\n"
+                " print(json.dumps(complete(path)),flush=True)\n")
+        with self.quality_worker(body):
+            writer.create_episode()
+            writer.add_item({})
+            writer.save_episode("success")
+            self.wait_until(writer.is_ready)
+            self.wait_until(lambda: writer.status_snapshot()["quality"]["state"] == "failed")
+            first_process = writer._quality_process
+            first_process.wait(timeout=2)
+            writer.create_episode()
+            writer.add_item({})
+            writer.save_episode("success")
+            self.wait_until(writer.is_ready)
+            self.wait_until(lambda: writer.status_snapshot()["quality"]["state"] == "complete")
+            self.assertIsNot(writer._quality_process, first_process)
+            writer.close()
+            writer._quality_process.wait(timeout=2)
+
+    def test_quality_spawn_failure_keeps_recorded_files(self):
+        writer = self.make_writer(quality_report=True)
+        with mock.patch.object(episode_writer.subprocess, "Popen", side_effect=OSError("cannot spawn checker")):
+            writer.create_episode()
+            writer.add_item({})
+            writer.save_episode("success")
+            self.wait_until(writer.is_ready)
+        status = writer.status_snapshot()
+        self.assertEqual(status["quality"]["state"], "failed")
+        self.assertIn("cannot spawn checker", status["quality"]["error"])
+        self.assertEqual(self.manifest()["status"], "complete")
+        self.assertIsNone(status["error"])
+
+    def test_malformed_quality_result_fails_quality_only(self):
+        writer = self.make_writer(quality_report=True)
+        with self.quality_worker("for line in sys.stdin:\n print('not json',flush=True)\n"):
+            writer.create_episode()
+            writer.add_item({})
+            writer.save_episode("success")
+            self.wait_until(writer.is_ready)
+            self.wait_until(lambda: writer.status_snapshot()["quality"]["state"] == "failed")
+            self.assertIsNone(writer.status_snapshot()["error"])
+            writer.close()
+            writer._quality_process.wait(timeout=2)
+
+    def test_malformed_quality_result_does_not_lose_next_episode_results(self):
+        writer = self.make_writer(quality_report=True)
+        body = ("for line in sys.stdin:\n path=json.loads(line)\n"
+                " if Path(path).name.startswith('episode_0000_'): print('not json',flush=True)\n"
+                " else: print(json.dumps(complete(path)),flush=True)\n")
+        with self.quality_worker(body):
+            writer.create_episode()
+            writer.add_item({})
+            writer.save_episode("success")
+            self.wait_until(writer.is_ready)
+            self.wait_until(lambda: writer.status_snapshot()["quality"]["state"] == "failed")
+            process = writer._quality_process
+            writer.create_episode()
+            writer.add_item({})
+            writer.save_episode("success")
+            self.wait_until(writer.is_ready)
+            self.wait_until(lambda: writer.status_snapshot()["quality"]["state"] == "complete")
+            self.assertIs(writer._quality_process, process)
+            self.assertEqual(writer.status_snapshot()["quality"]["episode"], writer.status_snapshot()["last_saved"]["name"])
+            writer.close()
+            process.wait(timeout=2)
 
     def test_normal_multiple_episodes_real_jpeg_and_metadata(self):
         writer = self.make_writer(image_size=(544, 448), metadata={"retargeting_method": "vector"})

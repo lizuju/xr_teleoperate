@@ -15,8 +15,8 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
-from check_teleop_episode import (SOURCE_NAMES, TRAINING_GROUPS, TRAINING_CAMERAS,
-                                 training_frame_rejections, training_timing, validate_episode)
+from check_teleop_episode import (DEFAULT_MIN_SEGMENT_FRAMES, SOURCE_NAMES, TRAINING_GROUPS, TRAINING_CAMERAS,
+                                 quality_summary, training_action, training_frame_rejections, training_timing, validate_episode)
 from export_r1_training_dataset import export_dataset
 from teleop.utils.act_dataset import R1ACTDataset, load_act_data
 from teleop.utils.episode_writer import EpisodeWriter
@@ -106,6 +106,96 @@ class TrainingExportTests(unittest.TestCase):
         (directory / "episode.json").write_text(json.dumps(manifest))
         (directory / "frames.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
 
+    def add_action_alignment(self, rows):
+        for row in rows:
+            sample = row["sample"]
+            arm, hands = copy.deepcopy(sample["commands"]["arm"]), copy.deepcopy(sample["commands"]["hands"])
+            arm["published"]["request_sequence"] = arm["requested"]["sequence"]
+            sample["action_alignment"] = {
+                "schema": "r1_action_alignment_v1", "aligned": True,
+                "anchor_monotonic_ns": hands["requested"]["monotonic_ns"],
+                "arm": arm, "hands": hands,
+                "tracking_fresh": {"left": True, "right": True},
+                "hand_target_inputs": {side: {"received_monotonic_ns": sample["monotonic_ns"] - 10_000_000,
+                                              "points": [[.1, .2, .3] for _ in range(25)]}
+                                       for side in ("left", "right")}}
+
+    def test_aligned_actions_export_selected_real_requests_and_not_latest_raw_snapshot(self):
+        directory, manifest, rows = self.episode()
+        self.add_action_alignment(rows)
+        for row in rows:
+            row["sample"]["commands"]["arm"]["requested"].update(
+                arm_q=[.9] * 14, monotonic_ns=row["sample"]["monotonic_ns"] - 30_000_000)
+            row["actions"]["left_arm"]["qpos"] = [.9] * 7
+        self.write(directory, manifest, rows)
+        report = validate_episode(directory, min_segment_frames=2)
+        self.assertTrue(report["valid"], report["errors"])
+        self.assertEqual(report["training_no_imu"]["eligible_frames"], 8)
+        self.assertEqual(training_timing(rows[0]["sample"])["request_skew_ms"], 1.0)
+        self.assertEqual(training_action(rows[0])["left_arm"], [.1] * 7)
+        dataset = export_dataset(self.source, self.output, min_frames=2)
+        self.assertEqual(dataset["sources"][0]["exported_frames"], 8)
+        with h5py.File(self.output / "episode_0.hdf5") as h:
+            np.testing.assert_allclose(h["action"][0], [.1] * 14 + [.3] * 12 + [0.] * 3)
+            self.assertEqual(h["source/arm_request_ns"][0], 9_998_000_000)
+            self.assertEqual(h["source/hand_request_ns"][0], 9_999_000_000)
+            self.assertEqual(h["source/action_anchor_ns"][0], 9_999_000_000)
+            self.assertTrue(h["source/action_alignment_used"][:].all())
+            self.assertEqual(h["source/arm_request_sequence"][0], 1)
+            np.testing.assert_array_equal(h["source/hand_input_ns"][0], [9_990_000_000] * 2)
+            np.testing.assert_array_equal(h["source/hand_input_age_ms"][0], [10.0] * 2)
+            self.assertEqual(list(h["source/hand_input_ns"].attrs["sides"]), ["left", "right"])
+            self.assertIn("already include arm target shaping", h.attrs["action_semantics"])
+        saved = json.loads((directory / "frames.jsonl").read_text().splitlines()[0])
+        self.assertEqual(saved["actions"]["left_arm"]["qpos"], [.9] * 7)
+        self.assertEqual(saved["sample"]["commands"]["arm"]["requested"]["monotonic_ns"], 9_970_000_000)
+
+    def test_aligned_action_boundaries_reject_without_falling_back_to_raw_commands(self):
+        _, manifest, rows = self.episode(count=1)
+        self.add_action_alignment(rows)
+        original = rows[0]
+        mutations = {
+            "unaligned": ("actions_unaligned", lambda a: a.update(aligned=False)),
+            "unknown_schema": ("actions_unaligned", lambda a: a.update(schema="unknown")),
+            "missing_arm": ("invalid_aligned_actions", lambda a: a.update(arm=None)),
+            "missing_publication": ("arm_request_unmatched", lambda a: a["arm"].update(published=None)),
+            "wrong_arm_publication": ("arm_request_unmatched", lambda a: a["arm"]["published"].update(request_sequence=0)),
+            "early_arm_publication": ("arm_request_unmatched", lambda a: a["arm"]["published"].update(monotonic_ns=9_997_000_000)),
+            "wrong_anchor": ("actions_unaligned", lambda a: a.update(anchor_monotonic_ns=9_998_000_000)),
+            "late_arm_request": ("actions_unaligned", lambda a: a["arm"]["requested"].update(monotonic_ns=9_999_500_000)),
+            "stale_source_input": ("hand_input_stale", lambda a: a["hand_target_inputs"]["left"].update(received_monotonic_ns=9_899_000_000)),
+            "input_after_request": ("hand_input_stale", lambda a: a["hand_target_inputs"]["left"].update(received_monotonic_ns=9_999_500_000)),
+            "missing_source_inputs": ("hand_input_stale", lambda a: a.pop("hand_target_inputs")),
+            "tracking_invalid": ("actions_unaligned", lambda a: a["tracking_fresh"].update(left=False)),
+            "short_selected_arm": ("invalid_aligned_actions", lambda a: a["arm"]["requested"].update(arm_q=[.1] * 13)),
+        }
+        for name, (reason, mutate) in mutations.items():
+            with self.subTest(name=name):
+                row = copy.deepcopy(original)
+                mutate(row["sample"]["action_alignment"])
+                self.assertIn(reason, training_frame_rejections(row, manifest["info"]))
+
+    def test_selected_shape_errors_are_file_invalid_and_preserved(self):
+        directory, manifest, rows = self.episode()
+        self.add_action_alignment(rows)
+        rows[0]["sample"]["action_alignment"]["hands"]["requested"]["left_q"] = [.3] * 5
+        self.write(directory, manifest, rows)
+        report = validate_episode(directory, min_segment_frames=2)
+        self.assertFalse(report["valid"])
+        self.assertTrue(any("action_alignment.hands.requested.left_q" in error for error in report["errors"]))
+        self.assertFalse(report["training_no_imu"]["demonstration_eligible"])
+
+    def test_legacy_rows_with_recorded_hand_inputs_check_the_real_input_age(self):
+        _, manifest, rows = self.episode(count=1)
+        row = rows[0]
+        self.assertEqual(training_frame_rejections(row, manifest["info"]), [])
+        row["sample"]["hand_target_inputs"] = {
+            side: {"received_monotonic_ns": 9_990_000_000} for side in ("left", "right")}
+        self.assertEqual(training_frame_rejections(row, manifest["info"]), [])
+        row["sample"]["hand_target_inputs"]["left"]["received_monotonic_ns"] = 9_850_000_000
+        self.assertIn("hand_input_stale", training_frame_rejections(row, manifest["info"]))
+        self.assertEqual(training_timing(row["sample"])["left_hand_input_age_ms"], 150.0)
+
     def test_export_tensor_semantics_rgb_no_imu_and_no_action_shift(self):
         directory, manifest, rows = self.episode()
         result = validate_episode(directory)
@@ -122,6 +212,9 @@ class TrainingExportTests(unittest.TestCase):
             np.testing.assert_allclose(h["action"][0], [.3]*29)
             np.testing.assert_allclose(h["observations/qpos"][0], [.05]*29)
             self.assertEqual(h["source/observation_ns"][0], 9_950_000_000)
+            np.testing.assert_array_equal(h["source/hand_input_ns"][0], [0, 0])
+            np.testing.assert_array_equal(h["source/hand_input_age_ms"][0], [-1.0, -1.0])
+            self.assertEqual(h["source/hand_input_ns"].attrs["missing_value"], 0)
             self.assertEqual(h["source/feedback_ns/robot"][0], 9_951_000_000)
             self.assertEqual(h["source/hand_request_ns"][0], 9_999_000_000)
             self.assertEqual(h["source/hand_request_sequence"][0], 1)
@@ -309,9 +402,102 @@ class TrainingExportTests(unittest.TestCase):
                                 input=json.dumps(str(first))+"\n"+json.dumps(str(second))+"\n",
                                 capture_output=True, text=True, timeout=20)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("IMU 不参与训练", result.stdout)
+        self.assertIn("IMU 不参与训练", result.stderr)
+        results = [json.loads(line) for line in result.stdout.splitlines()]
+        self.assertEqual([item["episode"] for item in results], [first.name, second.name])
+        self.assertTrue(all(item["state"] == "complete" for item in results))
+        self.assertTrue(results[0]["file_valid"])
+        self.assertEqual(results[0]["min_segment_frames"], DEFAULT_MIN_SEGMENT_FRAMES)
+        self.assertEqual(results[0]["exportable_frames"], 0)
+        self.assertEqual(results[1]["outcome"], "discarded")
         self.assertEqual(json.loads((first / "quality.json").read_text())["training_no_imu"]["eligible_frames"], 8)
         self.assertFalse(json.loads((second / "quality.json").read_text())["training_no_imu"]["demonstration_eligible"])
+
+    def test_worker_survives_closed_result_pipe_and_checks_all_episodes(self):
+        first, _, _ = self.episode()
+        second, _, _ = self.episode(1, outcome="failure")
+        process = subprocess.Popen([sys.executable, str(ROOT / "tools/check_teleop_episode.py"), "--worker"],
+                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   text=True)
+        process.stdout.close()
+        process.stdin.write(json.dumps(str(first)) + "\n" + json.dumps(str(second)) + "\n")
+        process.stdin.close()
+        process.wait(timeout=20)
+        stderr = process.stderr.read()
+        process.stderr.close()
+        self.assertEqual(process.returncode, 0, stderr)
+        self.assertEqual(json.loads((first / "quality.json").read_text())["outcome"], "success")
+        self.assertEqual(json.loads((second / "quality.json").read_text())["outcome"], "failure")
+
+    def test_worker_report_failure_returns_episode_error_and_continues(self):
+        first, _, _ = self.episode()
+        (first / "quality.json").mkdir()
+        second, _, _ = self.episode(1)
+        result = subprocess.run([sys.executable, str(ROOT / "tools/check_teleop_episode.py"), "--worker"],
+                                input=json.dumps(str(first)) + "\n" + json.dumps(str(second)) + "\n",
+                                capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        results = [json.loads(line) for line in result.stdout.splitlines()]
+        self.assertEqual(results[0]["episode"], first.name)
+        self.assertEqual(results[0]["state"], "failed")
+        self.assertTrue(results[0]["error"])
+        self.assertEqual(results[1]["state"], "complete")
+        self.assertTrue((second / "quality.json").is_file())
+
+    def test_report_length_counts_match_exporter_and_custom_minimum(self):
+        directory, manifest, rows = self.episode(count=85)
+        rows[40]["sample"]["mode"] = "tracking_hold"
+        self.write(directory, manifest, rows)
+        default = validate_episode(directory)["training_no_imu"]
+        self.assertEqual(default["min_segment_frames"], 40)
+        self.assertEqual(default["eligible_frames"], 84)
+        self.assertEqual(default["longest_segment_frames"], 44)
+        self.assertEqual((default["exportable_segments"], default["exportable_frames"],
+                          default["short_segment_frames"]), (2, 84, 0))
+        report = validate_episode(directory, min_segment_frames=42)
+        expected = report["training_no_imu"]
+        self.assertEqual((expected["exportable_segments"], expected["exportable_frames"],
+                          expected["short_segment_frames"]), (1, 44, 40))
+        dataset = export_dataset(self.source, self.output, min_frames=42)
+        exported = json.loads((self.output / dataset["sources"][0]["quality_report"]).read_text())
+        self.assertEqual(exported["training_no_imu"], expected)
+        self.assertEqual(dataset["sources"][0]["exported_frames"], expected["exportable_frames"])
+        self.assertEqual(dataset["sources"][0]["short_segment_frames"], expected["short_segment_frames"])
+        self.assertEqual(len(dataset["episodes"]), expected["exportable_segments"])
+
+    def test_short_success_reports_no_exportable_segment(self):
+        directory, _, _ = self.episode(count=8)
+        report = validate_episode(directory)
+        training = report["training_no_imu"]
+        self.assertEqual(training["longest_segment_frames"], 8)
+        self.assertEqual(training["short_segment_frames"], 8)
+        self.assertFalse(training["demonstration_eligible"])
+        self.assertIn("没有达到 40 帧", quality_summary(report))
+        with self.assertRaisesRegex(ValueError, "No eligible segments"):
+            export_dataset(self.source, self.output)
+
+    def test_labels_and_incomplete_files_override_length_qualification(self):
+        directory, manifest, rows = self.episode(count=40)
+        for outcome in ("success", "failure", "discarded", "unspecified"):
+            with self.subTest(outcome=outcome):
+                manifest["outcome"] = outcome
+                self.write(directory, manifest, rows)
+                report = validate_episode(directory)
+                self.assertEqual(report["training_no_imu"]["exportable_frames"], 40)
+                self.assertEqual(report["training_no_imu"]["demonstration_eligible"], outcome == "success")
+                if outcome != "success":
+                    self.assertIn("当前标签不进入", quality_summary(report))
+        manifest.update(status="incomplete", outcome="success")
+        self.write(directory, manifest, rows)
+        report = validate_episode(directory)
+        self.assertFalse(report["training_no_imu"]["demonstration_eligible"])
+        self.assertIn("文件不完整", quality_summary(report))
+
+    def test_quality_minimum_rejects_invalid_lengths(self):
+        directory, _, _ = self.episode()
+        for value in (0, 1, True, 2.5):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                validate_episode(directory, min_segment_frames=value)
 
     def test_slow_quality_check_does_not_block_next_recording_and_survives_close(self):
         checker = self.root / "slow_checker.py"
