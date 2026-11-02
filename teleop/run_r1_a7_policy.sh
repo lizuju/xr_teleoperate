@@ -25,7 +25,7 @@ fi
 
 for argument in "$@"; do
   if [[ "$argument" == "--execute" ]]; then
-    bash "${script_dir}/run_r1_a7_vector.sh" --check-only
+    R1_PREFLIGHT_REQUIRE_CAMERA_CLOCK=1 bash "${script_dir}/run_r1_a7_vector.sh" --check-only
     break
   fi
 done
