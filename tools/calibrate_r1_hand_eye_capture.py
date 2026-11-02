@@ -377,7 +377,7 @@ def parse_args(argv=None):
         description="Capture R1 hand-eye samples (image + joint q). Does not move the robot.")
     parser.add_argument("--target", required=True, choices=sorted(TARGETS),
                         help="left_wrist | right_wrist | head (three separate sessions)")
-    parser.add_argument("--host", default="192.168.124.147")
+    parser.add_argument("--host", default="192.168.110.20")
     parser.add_argument("--port", type=int, default=None)
     parser.add_argument("--topic", default=None)
     parser.add_argument("--pattern", nargs=2, type=int, default=list(DEFAULT_PATTERN),

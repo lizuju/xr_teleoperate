@@ -222,7 +222,7 @@ class KnewAndCliTests(unittest.TestCase):
     def test_cli_defaults_match_the_field_card(self):
         args = parse_args([])
         self.assertEqual(str(args.calib), "assets/r1/camera_calibration.json")
-        self.assertEqual(args.host, "192.168.124.147")
+        self.assertEqual(args.host, "192.168.110.20")
         self.assertEqual(args.port, 55555)
         self.assertEqual(args.topic, "head_camera")
         self.assertEqual(tuple(args.pattern), (9, 6))

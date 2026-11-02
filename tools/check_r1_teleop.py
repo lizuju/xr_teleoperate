@@ -229,7 +229,7 @@ def wrist_topics(config):
 
 
 #: Label of the head stereo JPEG window, shared by the stream check and main().
-STEREO_JPEG_LABEL = "stereo JPEG (192.168.124.147:55555)"
+STEREO_JPEG_LABEL = "stereo JPEG (192.168.110.20:55555)"
 
 
 def stream_check_failure(problems):
@@ -247,7 +247,7 @@ def stream_check_failure(problems):
 
 
 def https_probe(context, port, label):
-    url = f"https://192.168.124.147:{port}/"
+    url = f"https://192.168.110.20:{port}/"
     try:
         opener = urllib.request.build_opener(
             urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=context)
@@ -297,7 +297,7 @@ def check_streams():
         with context.socket(zmq.REQ) as request:
             request.setsockopt(zmq.LINGER, 0)
             request.setsockopt(zmq.SNDTIMEO, 3000)
-            request.connect("tcp://192.168.124.147:60000")
+            request.connect("tcp://192.168.110.20:60000")
             request.send(b"GET_DATA")
             if not request.poll(3000):
                 raise RuntimeError("camera configuration timed out; check 60000 forwarding and r1-teleimager")
@@ -321,7 +321,7 @@ def check_streams():
         jpeg_feeds = [(STEREO_JPEG_LABEL, 55555, (448, 1088, 3))]
         for topic, zmq_port, _ in wrist:
             if (camera_config.get(topic) or {}).get("enable_zmq"):
-                label = f"{topic.removesuffix('_camera').replace('_', ' ')} JPEG (192.168.124.147:{zmq_port})"
+                label = f"{topic.removesuffix('_camera').replace('_', ' ')} JPEG (192.168.110.20:{zmq_port})"
                 windows[label] = StreamWindow(0.5)
                 jpeg_feeds.append((label, zmq_port, (480, 640, 3)))
         lock = threading.Lock()
@@ -352,7 +352,7 @@ def check_streams():
             socket_.setsockopt(zmq.LINGER, 0)
             socket_.setsockopt(zmq.CONFLATE, 1)
             socket_.setsockopt(zmq.SUBSCRIBE, b"")
-            socket_.connect(f"tcp://192.168.124.147:{port}")
+            socket_.connect(f"tcp://192.168.110.20:{port}")
             socket_feeds.append((label, socket_, shape))
             frame_sockets.append(socket_)
         try:

@@ -127,7 +127,7 @@ exec "$python" -u teleop_hand_and_arm.py \
   --camera-calibration "${CAMERA_CALIBRATION:-}" \
   --record-max-tracking-age-ms "${RECORD_MAX_TRACKING_AGE_MS:-100}" \
   --network-interface eno1 \
-  --img-server-ip 192.168.124.147 \
+  --img-server-ip 192.168.110.20 \
   --headless \
   "${diagnostics[@]}" \
   "$@"

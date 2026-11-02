@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Capture paired head-stereo chessboard frames for R1 fisheye calibration.
 
-Reads ZMQ ``head_camera`` (default 192.168.124.147:55555) via TeleImageClient,
+Reads ZMQ ``head_camera`` (default 192.168.110.20:55555) via TeleImageClient,
 splits one 1088x448 frame into left [:, :544] and right [:, 544:], and writes a
 pair only when BOTH eyes have 54 inner corners and the board has been held
 still. Does not start teleoperation, does not command the robot, and does not
@@ -22,7 +22,7 @@ import cv2
 import numpy as np
 
 
-DEFAULT_HOST = "192.168.124.147"
+DEFAULT_HOST = "192.168.110.20"
 DEFAULT_PORT = 55555
 DEFAULT_TOPIC = "head_camera"
 DEFAULT_PATTERN = (9, 6)
