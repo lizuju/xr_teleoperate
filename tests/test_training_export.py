@@ -336,6 +336,15 @@ class TrainingExportTests(unittest.TestCase):
         report = validate_episode(directory)
         self.assertTrue(report["valid"], report["errors"])
 
+    def test_stereo_only_widens_the_feedback_span_on_source_time(self):
+        from check_teleop_episode import feedback_target_in_camera_span
+        source = {"timing": {"stereo_skew_ns": 5_000_000}}
+        alignment = {"anchor_monotonic_ns": 1_000_000_000, "offset_ms": {"head": 0.0},
+                     "timestamp_basis": "mapped_source"}
+        self.assertTrue(feedback_target_in_camera_span(1_002_000_000, alignment, source))
+        alignment["timestamp_basis"] = "host_receive"
+        self.assertFalse(feedback_target_in_camera_span(1_002_000_000, alignment, source))
+
     def test_feedback_target_outside_the_images_is_rejected(self):
         directory, manifest, rows = self.episode(count=1)
         sample = rows[0]["sample"]

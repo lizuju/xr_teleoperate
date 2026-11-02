@@ -454,7 +454,7 @@ class R1Capture:
                 "aligned_states": {"robot": aligned_robot, "hands": aligned_hands},
                 "sensor_alignment": sensor_alignment,
                 "tf": None if self.recording_tf is None else self.recording_tf.sample(
-                    aligned_robot, pairing.anchor_ns,
+                    aligned_robot, target_ns,
                     sensor_alignment["clock_valid"] and stereo_ok
                     and pairing.skew_ms <= self.sync.tolerance_ms
                     and all(entry["fresh"] for entry in camera_sources)),

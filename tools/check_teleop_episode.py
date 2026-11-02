@@ -121,7 +121,7 @@ def feedback_target_in_camera_span(target, alignment, image_source):
         return False
     times = [anchor, *(anchor + offset * 1e6 for offset in offsets.values() if isinstance(offset, (int, float)))]
     stereo = ((image_source or {}).get("timing") or {}).get("stereo_skew_ns")
-    if type(stereo) is int and stereo >= 0:
+    if alignment.get("timestamp_basis") == "mapped_source" and type(stereo) is int and stereo >= 0:
         times.append(anchor + stereo)
     return min(times) - 1 <= target <= max(times) + 1
 
@@ -944,11 +944,13 @@ def validate_episode(path, min_segment_frames=DEFAULT_MIN_SEGMENT_FRAMES):
                     error(f"{label}.sample.tf: missing TF manifest")
                 else:
                     robot_state = (sample.get("aligned_states") or {}).get("robot")
-                    anchor_ns = (alignment or {}).get("anchor_monotonic_ns")
+                    # TF poses come from the same state as the feedback, so they share its target.
+                    tf_target_ns = (sample.get("sensor_alignment") or {}).get(
+                        "target_monotonic_ns", (alignment or {}).get("anchor_monotonic_ns"))
                     if tf.get("root_frame") != "pelvis_link" or tf_metadata.get("root_frame") != "pelvis_link":
                         error(f"{label}.sample.tf: unexpected root frame")
-                    if tf.get("target_monotonic_ns") != anchor_ns:
-                        error(f"{label}.sample.tf: timestamp differs from camera anchor")
+                    if tf.get("target_monotonic_ns") != tf_target_ns:
+                        error(f"{label}.sample.tf: timestamp differs from the feedback target")
                     expected_valid = False
                     if isinstance(robot_state, dict):
                         values = [robot_state.get("waist_q"), *(robot_state.get("head_q") or []),
@@ -991,8 +993,8 @@ def validate_episode(path, min_segment_frames=DEFAULT_MIN_SEGMENT_FRAMES):
                                 except (TypeError, ValueError, KeyError):
                                     error(f"{label}.sample.tf.{name}: invalid static transform metadata")
                     offset = None
-                    if isinstance(robot_state, dict) and type(robot_state.get("monotonic_ns")) is int and type(anchor_ns) is int:
-                        offset = (robot_state["monotonic_ns"] - anchor_ns) / 1e6
+                    if isinstance(robot_state, dict) and type(robot_state.get("monotonic_ns")) is int and type(tf_target_ns) is int:
+                        offset = (robot_state["monotonic_ns"] - tf_target_ns) / 1e6
                     if tf.get("offset_ms") != offset:
                         error(f"{label}.sample.tf.offset_ms: differs from measured robot timestamp")
                     camera_names = ["image"] + [name for name in ("left_wrist_image", "right_wrist_image") if name in source_data]
