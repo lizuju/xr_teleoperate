@@ -90,6 +90,22 @@ def frame_time(frame, source_time):
             else frame.received_monotonic_ns)
 
 
+def feedback_target_ns(pairing):
+    """When to read feedback for a set: the middle of its image times.
+
+    The anchor can sit at the edge of the set, and feedback read there lands
+    outside the images and widens the observation past the tolerance.
+    """
+    source_time = pairing.timestamp_basis == "mapped_source"
+    stamps = [frame_time(frame, source_time) for frame in pairing.frames.values() if frame is not None]
+    if source_time:
+        # The anchor stamp is the earlier eye; the later eye is an image time too.
+        stereo = pairing.frames[pairing.anchor].payload.timing.get("stereo_skew_ns")
+        if type(stereo) is int and stereo >= 0:
+            stamps.append(pairing.anchor_ns + stereo)
+    return (min(stamps) + max(stamps)) // 2
+
+
 class CameraSynchronizer:
     """Selects the latest complete camera pair within the allowed time spread."""
 

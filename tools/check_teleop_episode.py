@@ -112,6 +112,20 @@ def training_action(frame):
             "body": [waist, *(arm.get("head_q") or [])]}
 
 
+def feedback_target_in_camera_span(target, alignment, image_source):
+    """Feedback is read at the middle of the image times; older recordings read it at the anchor."""
+    if type(target) is not int or not isinstance(alignment, dict):
+        return False
+    anchor, offsets = alignment.get("anchor_monotonic_ns"), alignment.get("offset_ms")
+    if type(anchor) is not int or not isinstance(offsets, dict):
+        return False
+    times = [anchor, *(anchor + offset * 1e6 for offset in offsets.values() if isinstance(offset, (int, float)))]
+    stereo = ((image_source or {}).get("timing") or {}).get("stereo_skew_ns")
+    if type(stereo) is int and stereo >= 0:
+        times.append(anchor + stereo)
+    return min(times) - 1 <= target <= max(times) + 1
+
+
 def training_timing(sample):
     sources = sample.get("sources") or {}
     cameras = {name: ((sources.get(name) or {}).get("timing") or {}).get("mapped_monotonic_ns")
@@ -1043,8 +1057,8 @@ def validate_episode(path, min_segment_frames=DEFAULT_MIN_SEGMENT_FRAMES):
                         error(f"{label}.sample.sensor_alignment: IMU gap count mismatch")
                     report["imu_dropped_packets"] += gaps
                     target = sensor.get("target_monotonic_ns")
-                    if not isinstance(alignment, dict) or target != alignment.get("anchor_monotonic_ns"):
-                        error(f"{label}.sample.sensor_alignment: camera anchor mismatch")
+                    if not feedback_target_in_camera_span(target, alignment, source_data.get("image")):
+                        error(f"{label}.sample.sensor_alignment: feedback target outside the camera set")
                     aligned = sample.get("aligned_states") or {}
                     imu_valid = bool(imu_valid and ((aligned.get("robot") or {}).get("imu") or {}).get("valid"))
                     report["imu_invalid_frames"] += not imu_valid

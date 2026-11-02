@@ -234,6 +234,28 @@ class ObservationTests(unittest.TestCase):
         self.assertEqual(self.build(wrist=False).build(self.NOW)[2], "cameras_incomplete")
         self.assertEqual(self.build(clock_valid=False).build(self.NOW)[2], "camera_clock_invalid")
 
+    def test_feedback_is_read_mid_images_so_it_cannot_widen_the_spread(self):
+        # The head sits at the early edge of the set and hand feedback is sparse:
+        # read at the head time it would land 4 ms outside the images, over 25 ms.
+        anchor = self.NOW - 60_000_000
+        wrist = anchor + 24_000_000
+        targets = []
+        def samples(target, since, end):
+            targets.append(target)
+            return {"nearest": {"q": [0.0] * 14, "waist_q": 0.0, "head_q": [0.0, 0.0], "monotonic_ns": target}}
+        stamps = [anchor + offset * 1_000_000 for offset in (-4, 6, 16)]
+        def states(target, end):
+            stamp = min(stamps, key=lambda value: abs(value - target))
+            return {side: {"q": [0.2] * 6, "monotonic_ns": stamp} for side in ("left", "right")}
+        builder = ObservationBuilder(SimpleNamespace(get_recording_samples=samples),
+                                     SimpleNamespace(get_recording_states_at=states),
+                                     CameraSynchronizer(["head", "left_wrist", "right_wrist"]), image_hw=(6, 8))
+        received = anchor + 30_000_000
+        builder.observe(FakeFrame(1, received, anchor, (12, 32), value=100),
+                        {side: FakeFrame(1, received, wrist, (24, 32)) for side in ("left", "right")})
+        self.assertIsNone(builder.build(self.NOW)[2])
+        self.assertEqual(targets, [anchor + 12_000_000])
+
     def test_exporter_and_runtime_share_one_image_transform(self):
         import export_r1_training_dataset as exporter
         self.assertIs(exporter.prepare_training_image, prepare_training_image)

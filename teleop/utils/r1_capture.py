@@ -9,7 +9,7 @@ import numpy as np
 
 from teleop.utils.camera_calibration import (COLOR_KEYS, WRIST_COLOR_KEYS, camera_calibration_metadata,
                                              expected_cameras)
-from teleop.utils.frame_sync import CameraSynchronizer
+from teleop.utils.frame_sync import CameraSynchronizer, feedback_target_ns
 
 
 #: An action older than this is rejected for training anyway (request_age_ms), so
@@ -109,7 +109,7 @@ def capture_metadata(args, camera_config, retargeter, calibration=None, recordin
         "sensor_sync": {
             "schema": "r1_sensor_sync_v1", "feedback_tolerance_ms": 25.0,
             "clock_uncertainty_limit_ms": 5.0,
-            "method": "nearest received feedback to selected camera anchor; no interpolation or extrapolation",
+            "method": "nearest received feedback to the middle of the selected image times; no interpolation or extrapolation",
             "imu": {"quaternion_order": "wxyz", "gyroscope_unit": "rad/s",
                     "accelerometer_unit": "m/s^2", "rpy_unit": "rad",
                     "temperature_unit": "SDK raw int16; temperature scale not verified",
@@ -405,7 +405,7 @@ class R1Capture:
                 color_sequences[WRIST_COLOR_KEYS[side]] = int(wrist.sequence)
         if pairing is not None:
             image_source["offset_ms"] = float(pairing.offsets_ms.get("head", 0.0))
-        target_ns = pairing.anchor_ns
+        target_ns = feedback_target_ns(pairing)
         robot_samples = self.arm.get_recording_samples(target_ns, self.last_imu_sequence, now, feedback_end_ns)
         if robot_samples["imu_packets"]:
             self.last_imu_sequence = robot_samples["imu_packets"][-1]["sequence"]
@@ -454,7 +454,7 @@ class R1Capture:
                 "aligned_states": {"robot": aligned_robot, "hands": aligned_hands},
                 "sensor_alignment": sensor_alignment,
                 "tf": None if self.recording_tf is None else self.recording_tf.sample(
-                    aligned_robot, target_ns,
+                    aligned_robot, pairing.anchor_ns,
                     sensor_alignment["clock_valid"] and stereo_ok
                     and pairing.skew_ms <= self.sync.tolerance_ms
                     and all(entry["fresh"] for entry in camera_sources)),
