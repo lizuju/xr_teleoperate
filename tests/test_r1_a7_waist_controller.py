@@ -57,7 +57,7 @@ class R1A7WaistControllerTest(unittest.TestCase):
         controller.crc = types.SimpleNamespace(Crc=lambda _: 0)
         controller.lowcmd_publisher = types.SimpleNamespace(Write=self.record_command)
         self.lowstate = types.SimpleNamespace(
-            motor_state=[types.SimpleNamespace(q=0.0, dq=0.0, tau_est=0.0) for _ in range(35)],
+            motor_state=[types.SimpleNamespace(q=0.0, dq=0.0, tau_est=0.0, vol=38.0, temperature=[30, 31]) for _ in range(35)],
             monotonic_timestamp=self.now,
             sequence=1,
         )

@@ -2178,6 +2178,8 @@ class R1_A7_ArmController:
         self.subscribe_running = True
         self.active = False
         self.lowstate_sequence = 0
+        self.lowstate_rejected = {}
+        self._last_lowstate_rejection_log = 0.0
         self.recording_history = deque(maxlen=1024)
         self.recording_lock = threading.Lock()
         self.lowstate_buffer = DataBuffer()
@@ -2331,12 +2333,39 @@ class R1_A7_ArmController:
                 logger_mp.error(f"[R1_A7_ArmController] Failed to parse motor state: {error}")
                 self._last_lowstate_error_log = now
 
+    def _lowstate_rejection(self, msg):
+        if not np.isfinite([(motor.q, motor.dq, getattr(motor, "tau_est", 0.0), motor.vol)
+                            for motor in msg.motor_state]).all():
+            return "nonfinite", ""
+        if self.simulation_mode:
+            return None, ""
+        for joint in (R1_A7_JointIndex.kWaistYaw, *R1_A7_JointArmIndex, *R1_A7_JointHeadIndex):
+            motor = msg.motor_state[joint]
+            # A lost motor zeroes its whole block while the packet CRC stays valid.
+            # q=0 alone is a real pose, so voltage and temperature must be gone too.
+            if (motor.q == motor.dq == getattr(motor, "tau_est", 0.0) == motor.vol == 0.0
+                    and all(value == 0 for value in motor.temperature)):
+                return "empty_motor_block", f" joint={joint.name}"
+        return None, ""
+
     def _ingest_motor_state(self, msg):
+        received_at = time.monotonic()
+        rejection, detail = self._lowstate_rejection(msg)
+        if rejection is not None:
+            self.lowstate_rejected[rejection] = self.lowstate_rejected.get(rejection, 0) + 1
+            if received_at - self._last_lowstate_rejection_log >= 1.0:
+                logger_mp.warning(
+                    f"[R1_A7_ArmController] Rejected motor feedback: {rejection}{detail}; "
+                    f"rejected={self.lowstate_rejected}. Waiting for complete feedback; "
+                    "feedback timeout remains 0.25s."
+                )
+                self._last_lowstate_rejection_log = received_at
+            return
         self.lowstate_sequence += 1
         lowstate = R1_A7_LowState(
             mode_machine=msg.mode_machine,
             sequence=self.lowstate_sequence,
-            monotonic_timestamp=time.monotonic(),
+            monotonic_timestamp=received_at,
         )
         for id in range(R1_A7_Num_Motors):
             lowstate.motor_state[id].q = msg.motor_state[id].q

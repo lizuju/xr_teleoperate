@@ -58,15 +58,17 @@ class RecordingHistoryTests(unittest.TestCase):
         controller = next(node for node in tree.body if isinstance(node, ast.ClassDef)
                           and node.name == 'R1_A7_ArmController')
         controller.body = [node for node in controller.body if isinstance(node, ast.FunctionDef)
-                           and node.name in ('_ingest_motor_state', '_recording_state', 'get_recording_samples')]
+                           and node.name in ('_ingest_motor_state', '_lowstate_rejection', '_recording_state',
+                                             'get_recording_samples')]
         exec(compile(ast.Module(body=classes + [controller], type_ignores=[]), '<controller>', 'exec'), namespace)
         self.arm = namespace['R1_A7_ArmController']()
         self.arm.lowstate_sequence = 0
+        self.arm.simulation_mode = False
         self.arm.recording_lock = threading.Lock()
         self.arm.recording_history = deque(maxlen=3)
         self.arm.lowstate_buffer = namespace['DataBuffer']()
         self.message = SimpleNamespace(mode_machine=1, tick=77,
-                                       motor_state=[SimpleNamespace(q=0.2, dq=0.1, tau_est=0.5)]*35,
+                                       motor_state=[SimpleNamespace(q=0.2, dq=0.1, tau_est=0.5, vol=38.0, temperature=[30, 31])]*35,
                                        imu_state=SimpleNamespace(quaternion=[1, 0, 0, 0], gyroscope=[1, 2, 3],
                                                                  accelerometer=[4, 5, 6], rpy=[0.1, 0.2, 0.3], temperature=29))
 
