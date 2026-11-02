@@ -44,7 +44,7 @@ def parse_args(argv=None):
     parser.add_argument("--max-start-delta", type=float, default=0.35, help="Refuse to start if the first arm target is further than this (rad)")
     parser.add_argument("--allow-out-of-range-start", action="store_true", help="Start even if the live pose is outside the training range")
     parser.add_argument("--max-tracking-error", type=float, default=0.5, help="Hold if arm error stays above this (rad)")
-    parser.add_argument("--max-chunk-age", type=float, default=0.5, help="Hold if the policy has been silent this long (s)")
+    parser.add_argument("--max-chunk-age", type=float, default=0.5, help="Hold if the policy has been silent this long, and drop results older than this (s)")
     parser.add_argument("--ensemble-k", type=float, default=0.01)
     # Teleop's shaper settings, which the training actions already went through. 0 disables the shaper.
     parser.add_argument("--arm-target-velocity-limit", type=float, default=6.0)
@@ -69,6 +69,7 @@ class PolicyRun:
         self.ignore_before_tick = 0
         self.last_chunk_at = None
         self.observation_failures = {}
+        self.stale_chunks = 0
         self.sent = 0
         self.inference_ms, self.round_trip_ms = [], []
         self.target_error = {name: [] for name in ("left_arm", "right_arm", "left_ee", "right_ee", "body")}
@@ -86,8 +87,12 @@ class PolicyRun:
         if response is not None:
             (tick, sent_at), inference_ms, chunk = response
             if tick >= self.ignore_before_tick:
-                self.ensemble.add(tick, chunk)
-                self.last_chunk_at = now
+                # Age counts from the request: a late result still comes from the old observation.
+                if now - sent_at <= self.guard.max_chunk_age_s:
+                    self.ensemble.add(tick, chunk)
+                    self.last_chunk_at = now
+                else:
+                    self.stale_chunks += 1
             self.inference_ms.append(inference_ms)
             self.round_trip_ms.append((now - sent_at) * 1e3)
         if self.client.idle:
@@ -111,6 +116,7 @@ class PolicyRun:
 
     def summary(self):
         return {"ticks": self.tick, "requests": self.sent, "observation_failures": self.observation_failures,
+                "stale_chunks": self.stale_chunks,
                 "inference_ms": summarize(self.inference_ms), "round_trip_ms": summarize(self.round_trip_ms),
                 "target_minus_live_max": {name: summarize(values) for name, values in self.target_error.items()},
                 "clamped_ticks": self.guard.clamped_ticks}
@@ -185,7 +191,8 @@ def execute_loop(run, arm, hand, guard, gravity, period, stop, args):
         target, pose = run.step()
         snapshot = arm.get_recording_snapshot()
         tracking = float(np.abs(np.asarray(snapshot["requested"]["arm_q"]) - np.asarray(snapshot["state"]["q"])).max())
-        reason = guard.check(started, run.last_chunk_at, tracking, run.client.failed)
+        # Not started: a stall inside step() must stop this tick, not the next one.
+        reason = guard.check(time.monotonic(), run.last_chunk_at, tracking, run.client.failed)
         if reason is None and target is None:
             reason = guard.tripped = "the last policy chunk ran out"
         if reason is not None:
