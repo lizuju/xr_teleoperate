@@ -66,7 +66,7 @@ class FakeSubscriber:
                                             gyroscope=[0.0]*3, accelerometer=[0.0, 0.0, 9.81],
                                             rpy=[0.0]*3, temperature=30),
             motor_state=[
-                types.SimpleNamespace(q=0.01 * index, dq=-0.001 * index, tau_est=0.0)
+                types.SimpleNamespace(q=0.01 * index, dq=-0.001 * index, tau_est=0.0, vol=38.0, temperature=[30, 31])
                 for index in range(35)
             ],
         )

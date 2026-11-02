@@ -24,7 +24,8 @@ def motor_state(value=0.1):
                            imu_state=SimpleNamespace(quaternion=[1, 0, 0, 0], gyroscope=[0]*3,
                                                      accelerometer=[0, 0, 9.81], rpy=[0]*3, temperature=30),
                            motor_state=[
-        SimpleNamespace(q=value + index / 100, dq=-index / 1000, tau_est=index / 1000) for index in range(35)
+        SimpleNamespace(q=value + index / 100, dq=-index / 1000, tau_est=index / 1000, vol=38.0,
+                        temperature=[30, 31]) for index in range(35)
     ])
 
 
@@ -168,7 +169,7 @@ class R1A7FeedbackShutdownTest(unittest.TestCase):
         controller = self.controller_class(deferred_activation=True)
         try:
             legacy = motor_state()
-            legacy.motor_state = [SimpleNamespace(q=0.1 + index / 100, dq=0.0) for index in range(35)]
+            legacy.motor_state = [SimpleNamespace(q=0.1 + index / 100, dq=0.0, vol=38.0, temperature=[30, 31]) for index in range(35)]
             controller._subscribe_motor_state(legacy)      # must not raise
             np.testing.assert_allclose(controller.get_current_dual_arm_tau(), np.zeros(14))
         finally:
