@@ -29,7 +29,7 @@ task_goal="$2"
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 dev_root="$(cd -- "${script_dir}/../.." && pwd)"
-bash "${script_dir}/run_r1_a7_vector.sh" --check-only
+R1_PREFLIGHT_REQUIRE_CAMERA_CLOCK=1 bash "${script_dir}/run_r1_a7_vector.sh" --check-only
 check_only=false
 if [[ "${3:-}" == "--check-only" ]]; then
   check_only=true

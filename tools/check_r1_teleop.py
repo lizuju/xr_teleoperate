@@ -4,6 +4,7 @@ import importlib.machinery
 import importlib.util
 import json
 import math
+import os
 from pathlib import Path
 import socket
 import ssl
@@ -283,6 +284,55 @@ def check_local_and_https():
     return context
 
 
+# ClockMapping allows 100 ppm of drift; chrony slews a large offset at up to 83333 ppm.
+CAMERA_CLOCK_RATE_LIMIT_PPM = 1000.0
+CAMERA_CLOCK_WINDOW_S = 2.0
+# Set by the launchers whose data or commands depend on mapped camera times.
+REQUIRE_CAMERA_CLOCK_ENV = "R1_PREFLIGHT_REQUIRE_CAMERA_CLOCK"
+
+
+def clock_probe(request, attempts=5):
+    """Our clock and PC2's at the midpoint of the round trip with the least delay."""
+    best = None
+    for _ in range(attempts):
+        sent_ns = time.monotonic_ns()
+        request.send(b"GET_CLOCK")
+        if not request.poll(3000):
+            raise RuntimeError("camera clock request timed out; check 60000 forwarding and r1-teleimager")
+        reply = request.recv_json()
+        received_ns = time.monotonic_ns()
+        if type(reply.get("receive_ns")) is not int or type(reply.get("send_ns")) is not int:
+            raise RuntimeError("camera server did not report its clock")
+        if best is None or received_ns - sent_ns < best[0]:
+            best = (received_ns - sent_ns, (sent_ns + received_ns) / 2, (reply["receive_ns"] + reply["send_ns"]) / 2)
+    return best[1:]
+
+
+def clock_rate_ppm(first, last):
+    return ((last[1] - first[1]) / (last[0] - first[0]) - 1) * 1e6
+
+
+def camera_clock_problem(rate_ppm):
+    if abs(rate_ppm) <= CAMERA_CLOCK_RATE_LIMIT_PPM:
+        return None
+    return (f"PC2's clock runs {rate_ppm:+.0f} ppm against this machine: chrony is slewing it, so camera times "
+            "cannot be mapped and frames are unusable for training until it finishes. "
+            "Check System time with: ssh unitree-pc2 'chronyc tracking'")
+
+
+def check_camera_clock(request):
+    first = clock_probe(request)
+    time.sleep(CAMERA_CLOCK_WINDOW_S)
+    rate_ppm = clock_rate_ppm(first, clock_probe(request))
+    problem = camera_clock_problem(rate_ppm)
+    if problem is None:
+        print(f"[OK] PC2 clock rate {rate_ppm:+.0f} ppm against this machine", flush=True)
+    elif os.environ.get(REQUIRE_CAMERA_CLOCK_ENV) == "1":
+        raise RuntimeError(problem)
+    else:
+        print(f"[WARN] {problem}. Teleoperation itself still works", flush=True)
+
+
 def check_streams():
     import zmq
     from unitree_sdk2py.core.channel import ChannelFactoryInitialize, ChannelSubscriber
@@ -303,7 +353,8 @@ def check_streams():
                 raise RuntimeError("camera configuration timed out; check 60000 forwarding and r1-teleimager")
             camera_config = unwrap_camera_config(request.recv_json())
             validate_camera_config(camera_config)
-        print("[OK] stereo camera configuration (1088x448, RTP 5002/5003)", flush=True)
+            print("[OK] stereo camera configuration (1088x448, RTP 5002/5003)", flush=True)
+            check_camera_clock(request)
         wrist = wrist_topics(camera_config)
         if wrist:
             print("[OK] wrist camera configuration: " + ", ".join(

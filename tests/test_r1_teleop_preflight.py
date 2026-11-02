@@ -1,9 +1,19 @@
 import math
+from contextlib import redirect_stdout
+import io
+import os
+from pathlib import Path
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 from tools.check_r1_teleop import (
+    REQUIRE_CAMERA_CLOCK_ENV,
     StreamWindow,
+    camera_clock_problem,
+    check_camera_clock,
+    clock_probe,
+    clock_rate_ppm,
     jpeg_decoder,
     jpeg_is_complete,
     stream_check_failure,
@@ -187,6 +197,73 @@ class WristCameraConfigTest(unittest.TestCase):
             wrist_topics(config),
             [("left_wrist_camera", 55556, 60002), ("right_wrist_camera", 55557, 60003)],
         )
+
+
+class FakeClockRequest:
+    def __init__(self, replies, answers=True):
+        self.replies, self.answers = list(replies), answers
+        self.sent = []
+
+    def send(self, payload):
+        self.sent.append(payload)
+
+    def poll(self, timeout_ms):
+        return self.answers
+
+    def recv_json(self):
+        return self.replies.pop(0)
+
+
+class CameraClockTest(unittest.TestCase):
+    def test_rate_is_the_camera_clock_against_ours(self):
+        self.assertAlmostEqual(clock_rate_ppm((0, 5_000_000_000), (2_000_000_000, 7_000_020_000)), 10.0)
+        self.assertAlmostEqual(clock_rate_ppm((0, 0), (2_000_000_000, 2_170_754_000)), 85377.0)
+
+    def test_probe_keeps_the_round_trip_with_the_least_delay(self):
+        request = FakeClockRequest([{"receive_ns": 900, "send_ns": 910}, {"receive_ns": 2000, "send_ns": 2010}])
+        with patch("tools.check_r1_teleop.time.monotonic_ns", side_effect=[0, 500, 1000, 1010]):
+            self.assertEqual(clock_probe(request, attempts=2), (1005.0, 2005.0))
+        self.assertEqual(request.sent, [b"GET_CLOCK", b"GET_CLOCK"])
+
+    def test_probe_fails_when_the_server_does_not_answer_or_report_its_clock(self):
+        with self.assertRaisesRegex(RuntimeError, "timed out"):
+            clock_probe(FakeClockRequest([], answers=False))
+        with self.assertRaisesRegex(RuntimeError, "did not report"):
+            clock_probe(FakeClockRequest([{"cameras": {}}]))
+
+    def test_only_a_slew_is_a_problem(self):
+        for rate in (0.0, 30.0, -30.0, 500.0, -999.0):
+            self.assertIsNone(camera_clock_problem(rate))
+        for rate in (85377.0, -85377.0, 1500.0):
+            self.assertIn("chrony", camera_clock_problem(rate))
+
+    def check(self, last, required):
+        output = io.StringIO()
+        env = {REQUIRE_CAMERA_CLOCK_ENV: "1"} if required else {}
+        with patch("tools.check_r1_teleop.clock_probe", side_effect=[(0, 0), last]), \
+                patch("tools.check_r1_teleop.time.sleep"), patch.dict(os.environ, env), redirect_stdout(output):
+            if not required:
+                os.environ.pop(REQUIRE_CAMERA_CLOCK_ENV, None)
+            check_camera_clock(object())
+        return output.getvalue()
+
+    def test_slew_only_warns_for_plain_teleop(self):
+        self.assertIn("[WARN]", self.check((2_000_000_000, 2_170_754_000), required=False))
+
+    def test_slew_refuses_recording_and_execution(self):
+        with self.assertRaisesRegex(RuntimeError, "chrony"):
+            self.check((2_000_000_000, 2_170_754_000), required=True)
+
+    def test_normal_rate_passes_in_both_modes(self):
+        for required in (False, True):
+            self.assertIn("[OK]", self.check((2_000_000_000, 2_000_060_000), required))
+
+    def test_recording_and_execution_launchers_require_the_camera_clock(self):
+        teleop = Path(__file__).resolve().parents[1] / "teleop"
+        needed = f'{REQUIRE_CAMERA_CLOCK_ENV}=1 bash "${{script_dir}}/run_r1_a7_vector.sh" --check-only'
+        for name in ("run_r1_a7_capture.sh", "run_r1_a7_policy.sh"):
+            self.assertIn(needed, (teleop / name).read_text(), name)
+        self.assertNotIn(REQUIRE_CAMERA_CLOCK_ENV, (teleop / "run_r1_a7_vector.sh").read_text())
 
 
 class StreamCheckFailureTest(unittest.TestCase):
