@@ -82,6 +82,22 @@ class CameraSynchronizerTest(unittest.TestCase):
         self.assertAlmostEqual(pairing.offsets_ms["right_wrist"], 12.0)
         self.assertAlmostEqual(pairing.skew_ms, 24.0)
 
+    def test_complete_only_uses_frames_arrived_by_the_cutoff(self):
+        for stream in ("head", "left_wrist", "right_wrist"):
+            self.sync.offer(stream, Frame(1, 100 * MS))
+            self.sync.offer(stream, Frame(2, 130 * MS))
+        pairing = self.sync.pair(120 * MS, complete_only=True)
+        self.assertEqual({frame.sequence for frame in pairing.frames.values()}, {1})
+        self.assertEqual(self.sync.pair(140 * MS, complete_only=True).frames["head"].sequence, 2)
+
+    def test_complete_only_refuses_a_partial_set_and_advances_nothing(self):
+        self.sync.offer("head", Frame(1, 100 * MS))
+        self.sync.offer("left_wrist", Frame(1, 100 * MS))
+        self.sync.offer("right_wrist", Frame(1, 150 * MS))
+        self.assertIsNone(self.sync.pair(120 * MS, complete_only=True))
+        self.assertEqual(self.sync.last_used, {})
+        self.assertEqual(self.sync.pair(120 * MS).anchor, "head")
+
     def test_pair_is_none_only_when_no_stream_has_anything(self):
         self.assertIsNone(self.sync.pair(100 * MS))
         # One stream alone still yields a pairing; the others are simply absent,

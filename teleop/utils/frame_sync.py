@@ -127,12 +127,14 @@ class CameraSynchronizer:
     def latest(self, stream):
         return self.histories[stream].latest()
 
-    def pair(self, now_ns):
+    def pair(self, now_ns, complete_only=False):
         """Prefer the freshest complete set whose actual time spread is allowed.
 
         Freshness is the oldest camera time in the set. With no qualifying set,
         record the latest available images and their actual spread. Every image
         recorded advances its sequence floor, including an unaligned sample.
+        With ``complete_only``, return None and advance nothing unless every
+        stream has a frame available by ``now_ns``.
         """
         candidates = {}
         for name, history in self.histories.items():
@@ -148,6 +150,8 @@ class CameraSynchronizer:
                                 if (getattr(frame.payload, "timing", None) or {}).get("clock_valid") is True
                                 and 0 < frame_time(frame, True) <= now_ns]
                           for name, frames in candidates.items()}
+        if complete_only and not all(candidates.values()):
+            return None
         frames = {name: max(values, key=lambda frame: (frame_time(frame, source_time), frame.sequence))
                   if values else None for name, values in candidates.items()}
         if not any(frame is not None for frame in frames.values()):

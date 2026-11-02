@@ -55,7 +55,8 @@ class TrainingExportTests(unittest.TestCase):
                 cv2.imwrite(str(directory / name), np.full((12, 16, 3), [20, 60, 200], np.uint8))
                 colors[k] = name
             for n in ("image", "left_wrist_image", "right_wrist_image"):
-                sources[n].update(repeated=False, offset_ms=0.0)
+                sources[n].update(repeated=False, offset_ms=0.0, age_ms=2.0,
+                                  received_monotonic_ns=now - 2_000_000)
                 sources[n]["timing"] = {
                     "source_monotonic_ns": anchor-1_000_000_000, "mapped_monotonic_ns": anchor,
                     "clock_offset_ns": 1_000_000_000, "clock_id": "pc2",
@@ -175,6 +176,39 @@ class TrainingExportTests(unittest.TestCase):
                 mutate(row["sample"]["action_alignment"])
                 self.assertIn(reason, training_frame_rejections(row, manifest["info"]))
 
+    def test_nothing_observed_after_the_decision_reaches_training(self):
+        _, manifest, rows = self.episode(count=1)
+        self.add_action_alignment(rows)
+        original = rows[0]
+        decision = original["sample"]["action_alignment"]["anchor_monotonic_ns"]
+        self.assertEqual(training_frame_rejections(original, manifest["info"]), [])
+        self.assertEqual(training_timing(original["sample"])["observation_after_decision_ms"], -1.0)
+        self.assertEqual(training_timing(original["sample"])["observation_age_ms"], 52.0)
+        late = decision + 1_000_000
+        def camera_receive(sample): sample["sources"]["left_wrist_image"]["received_monotonic_ns"] = late
+        def camera_source(sample):
+            sample["sources"]["image"]["timing"].update(mapped_monotonic_ns=late, stereo_skew_ns=0,
+                                                        source_monotonic_ns=late - 1_000_000_000)
+        def second_eye(sample):
+            sample["sources"]["image"]["timing"]["stereo_skew_ns"] = late - sample["camera_alignment"]["anchor_monotonic_ns"]
+        def arm_feedback(sample): sample["aligned_states"]["robot"]["monotonic_ns"] = late
+        def hand_feedback(sample): sample["aligned_states"]["hands"]["right"]["monotonic_ns"] = late
+        for mutate in (camera_receive, camera_source, second_eye, arm_feedback, hand_feedback):
+            with self.subTest(mutate.__name__):
+                row = copy.deepcopy(original)
+                mutate(row["sample"])
+                self.assertIn("observation_after_decision", training_frame_rejections(row, manifest["info"]))
+        exactly_at_decision = copy.deepcopy(original)
+        exactly_at_decision["sample"]["aligned_states"]["robot"]["monotonic_ns"] = decision
+        self.assertNotIn("observation_after_decision", training_frame_rejections(exactly_at_decision, manifest["info"]))
+
+    def test_legacy_rows_use_the_recorded_hand_request_as_the_decision(self):
+        _, manifest, rows = self.episode(count=1)
+        row = rows[0]
+        self.assertEqual(training_frame_rejections(row, manifest["info"]), [])
+        row["sample"]["sources"]["image"]["received_monotonic_ns"] = row["sample"]["monotonic_ns"]
+        self.assertIn("observation_after_decision", training_frame_rejections(row, manifest["info"]))
+
     def test_selected_shape_errors_are_file_invalid_and_preserved(self):
         directory, manifest, rows = self.episode()
         self.add_action_alignment(rows)
@@ -219,7 +253,7 @@ class TrainingExportTests(unittest.TestCase):
             self.assertEqual(h["source/hand_request_ns"][0], 9_999_000_000)
             self.assertEqual(h["source/hand_request_sequence"][0], 1)
             self.assertEqual(h["source/observation_skew_ms"][0], 5.0)
-            self.assertEqual(h["source/observation_age_ms"][0], 53.0)
+            self.assertEqual(h["source/observation_age_ms"][0], 52.0)
             self.assertEqual(h["source/arm_observation_delay_ms"][0], 48.0)
             self.assertEqual(h["source/hands_observation_delay_ms"][0], 49.0)
             self.assertEqual(h["source/camera_timing/image/clock_id"].asstr()[0], "pc2")
@@ -296,14 +330,14 @@ class TrainingExportTests(unittest.TestCase):
         sample["sensor_alignment"]["target_monotonic_ns"] -= 200_000_000
         for state in (sample["aligned_states"]["robot"], *sample["aligned_states"]["hands"].values()):
             state["monotonic_ns"] -= 200_000_000
-        self.assertEqual(training_timing(sample)["observation_age_ms"], 253.0)
+        self.assertEqual(training_timing(sample)["observation_age_ms"], 252.0)
         self.assertIn("observation_age", training_frame_rejections(rows[0], manifest["info"]))
         self.write(directory, manifest, rows)
         report = validate_episode(directory)
         self.assertTrue(report["valid"], report["errors"])
         self.assertEqual(report["training_no_imu"]["eligible_frames"], 0)
         self.assertEqual(report["training_no_imu"]["timing_basis"], "mapped_source")
-        self.assertEqual(report["training_no_imu"]["timing"]["observation_age_ms"]["p95"], 253.0)
+        self.assertEqual(report["training_no_imu"]["timing"]["observation_age_ms"]["p95"], 252.0)
 
     def test_loader_rejects_previous_observation_semantics(self):
         self.episode()

@@ -122,7 +122,8 @@ def training_timing(sample):
     result = {"camera_ns": cameras, "feedback_ns": feedback, "request_ns": requests,
               "observation_ns": anchor, "observation_skew_ms": None, "observation_age_ms": None,
               "request_skew_ms": None, "arm_observation_delay_ms": None, "hands_observation_delay_ms": None,
-              "left_hand_input_age_ms": None, "right_hand_input_age_ms": None}
+              "left_hand_input_age_ms": None, "right_hand_input_age_ms": None,
+              "observation_after_decision_ms": None}
     inputs = training_hand_inputs(sample)
     for side in ("left", "right"):
         stamp = (inputs.get(side) or {}).get("received_monotonic_ns")
@@ -135,9 +136,18 @@ def training_timing(sample):
         stamps.append(cameras["image"] + stereo_skew)
     else:
         stamps.append(None)
+    # The completed hand request is the decision. Nothing the policy is trained
+    # to see may have been acquired or received after it, on either clock.
+    received = [(sources.get(name) or {}).get("received_monotonic_ns") for name in cameras]
+    decision = requests["hands"]
+    if type(decision) is int and all(type(t) is int and t > 0 for t in (*stamps, *received)):
+        result["observation_after_decision_ms"] = (max(*stamps, *received) - decision) / 1e6
     if type(now) is int and all(type(t) is int and 0 < t <= now for t in stamps):
         result["observation_skew_ms"] = (max(stamps) - min(stamps)) / 1e6
-        result["observation_age_ms"] = (now - min(stamps)) / 1e6
+        # Age at the decision: time spent after it, up to the recording tick, was
+        # never part of what the policy would have been reacting to.
+        reference = decision if type(decision) is int and 0 < decision <= now else now
+        result["observation_age_ms"] = (reference - min(stamps)) / 1e6
     if type(now) is int and all(type(t) is int and 0 < t <= now for t in requests.values()):
         result["request_skew_ms"] = abs(requests["arm"] - requests["hands"]) / 1e6
         if type(anchor) is int and 0 < anchor <= now:
@@ -213,6 +223,8 @@ def training_frame_rejections(frame, info):
     elif any(value is None or value < -TRAINING_TIME_LIMITS["observation_skew_ms"]
              for value in (timing["arm_observation_delay_ms"], timing["hands_observation_delay_ms"])):
         reasons.append("request_before_observation")
+    if timing["observation_after_decision_ms"] is None or timing["observation_after_decision_ms"] > 0:
+        reasons.append("observation_after_decision")
     commands = training_commands(sample)
     arm = commands.get("arm") or {}
     hands = (commands.get("hands") or {}).get("published") or {}
@@ -487,7 +499,8 @@ def validate_episode(path, min_segment_frames=DEFAULT_MIN_SEGMENT_FRAMES):
     training_exclusions = Counter()
     timing_samples = {key: [] for key in ("observation_skew_ms", "observation_age_ms", "request_skew_ms",
                                           "arm_observation_delay_ms", "hands_observation_delay_ms",
-                                          "left_hand_input_age_ms", "right_hand_input_age_ms")}
+                                          "left_hand_input_age_ms", "right_hand_input_age_ms",
+                                          "observation_after_decision_ms")}
     timing_bases = Counter()
     training_previous_ns = None
     training_previous_idx = None

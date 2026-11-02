@@ -84,6 +84,10 @@ class RecordingHistoryTests(unittest.TestCase):
         self.assertLessEqual(result['nearest']['monotonic_ns'], 10_035_000_000)
         self.assertEqual(result['nearest']['tick'], 79)
         self.assertEqual(len(self.arm.get_recording_samples(10_040_000_000, None, 11_000_000_000)['imu_packets']), 1)
+        limited = self.arm.get_recording_samples(10_035_000_000, 1, 10_035_000_000, 10_025_000_000)
+        self.assertLessEqual(limited['nearest']['monotonic_ns'], 10_025_000_000)
+        self.assertEqual([p['sequence'] for p in limited['imu_packets']], [3, 4])
+        self.assertIsNone(self.arm.get_recording_samples(10_035_000_000, 1, 10_035_000_000, 9_000_000_000)['nearest'])
 
 
 class CaptureTimingTests(unittest.TestCase):

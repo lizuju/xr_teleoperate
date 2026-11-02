@@ -39,7 +39,7 @@ def export_dataset(source, output, min_frames=DEFAULT_MIN_SEGMENT_FRAMES):
         "image_size_hw": list(IMAGE_HW), "image_color_order": "RGB",
         "training_inputs": ["observations/qpos", "observations/images"], "imu_used": False,
         "action_semantics": "Bounded causal accepted-request alignment from sample.action_alignment: the latest historical arm target accepted at or before the completed hand request. Arm targets already include arm target shaping; hand targets precede hand smoothing. Only older rows without this block use original same-row actions. Actual acceptance timestamps are retained; no interpolation or fabricated times.",
-        "observation_semantics": "Camera-source-time paired images and aligned_states feedback. Software timestamps, not exposure synchronization.",
+        "observation_semantics": "Camera-source-time paired images and aligned_states feedback, all acquired and received at or before the completed hand request. Software timestamps, not exposure synchronization.",
         "timing": "Original samples and measured intervals retained; no interpolation. Split at rejected rows and gaps >1.5 nominal periods.",
         "deployment_contract": "Reproduce recorded source-time observation pairing and freshness checks. Consume the already accepted targets at the recorded action anchor, preserving publisher limits and hand smoothing safeguards.",
         "hand_request_time": "Recorded paired-target acceptance time and sequence, linked to successful hand publications; input age is checked against hand_target_inputs when present. Not physical execution time.",
