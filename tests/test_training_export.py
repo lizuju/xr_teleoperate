@@ -320,6 +320,32 @@ class TrainingExportTests(unittest.TestCase):
                 mutate(row["sample"])
                 self.assertIn(reason, training_frame_rejections(row, manifest["info"]))
 
+    def retarget_feedback(self, sample, target):
+        sample["sensor_alignment"]["target_monotonic_ns"] = target
+        aligned = sample["aligned_states"]
+        for name, state in (("robot", aligned["robot"]), ("left_hand_feedback", aligned["hands"]["left"]),
+                            ("right_hand_feedback", aligned["hands"]["right"])):
+            sample["sensor_alignment"]["feedback_offset_ms"][name] = (state["monotonic_ns"] - target) / 1e6
+
+    def test_feedback_target_may_be_anywhere_inside_the_images(self):
+        directory, manifest, rows = self.episode(count=1)
+        sample = rows[0]["sample"]
+        anchor = sample["camera_alignment"]["anchor_monotonic_ns"]
+        self.retarget_feedback(sample, anchor + sample["sources"]["image"]["timing"]["stereo_skew_ns"])
+        self.write(directory, manifest, rows)
+        report = validate_episode(directory)
+        self.assertTrue(report["valid"], report["errors"])
+
+    def test_feedback_target_outside_the_images_is_rejected(self):
+        directory, manifest, rows = self.episode(count=1)
+        sample = rows[0]["sample"]
+        anchor = sample["camera_alignment"]["anchor_monotonic_ns"]
+        self.retarget_feedback(sample, anchor + sample["sources"]["image"]["timing"]["stereo_skew_ns"] + 1_000_000)
+        self.write(directory, manifest, rows)
+        report = validate_episode(directory)
+        self.assertFalse(report["valid"])
+        self.assertTrue(any("feedback target" in error for error in report["errors"]), report["errors"])
+
     def test_fresh_receive_cannot_hide_old_observation_and_report_uses_actual_basis(self):
         directory, manifest, rows = self.episode(count=1)
         sample = rows[0]["sample"]

@@ -17,6 +17,8 @@ import threading
 import cv2
 import numpy as np
 
+from teleop.utils.frame_sync import feedback_target_ns
+
 
 IMAGE_HW = (240, 320)
 GROUP_SLICES = {"left_arm": slice(0, 7), "right_arm": slice(7, 14), "left_ee": slice(14, 20),
@@ -116,8 +118,9 @@ class ObservationBuilder:
         if type(stereo_skew) is not int or stereo_skew < 0:
             return None, None, "stereo_unaligned"
         stamps.append(head.timing["mapped_monotonic_ns"] + stereo_skew)
-        robot = self.arm.get_recording_samples(pairing.anchor_ns, None, now_ns)["nearest"]
-        hands = self.hand.get_recording_states_at(pairing.anchor_ns, now_ns)
+        target_ns = feedback_target_ns(pairing)
+        robot = self.arm.get_recording_samples(target_ns, None, now_ns)["nearest"]
+        hands = self.hand.get_recording_states_at(target_ns, now_ns)
         if robot is None or hands.get("left") is None or hands.get("right") is None:
             return None, None, "feedback_missing"
         stamps += [robot["monotonic_ns"], hands["left"]["monotonic_ns"], hands["right"]["monotonic_ns"]]

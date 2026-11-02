@@ -1,6 +1,6 @@
 import unittest
 
-from teleop.utils.frame_sync import CameraSynchronizer, StreamHistory
+from teleop.utils.frame_sync import CameraSynchronizer, StreamHistory, feedback_target_ns
 
 
 MS = 1_000_000
@@ -335,6 +335,34 @@ class CameraSynchronizerTest(unittest.TestCase):
         pairing = self.sync.pair(210 * MS)
         self.assertEqual(pairing.frames["head"].sequence, 1)
         self.assertFalse(self.sync.alignment(pairing)["aligned"])
+
+    def timed(self, sequence, mapped, stereo=None):
+        timing = {"clock_valid": True, "mapped_monotonic_ns": mapped * MS}
+        if stereo is not None:
+            timing["stereo_skew_ns"] = stereo * MS
+        return Frame(sequence, (mapped + 30) * MS, timing=timing)
+
+    def test_feedback_target_is_the_middle_of_all_image_times(self):
+        self.sync.offer("head", self.timed(1, 100, stereo=8))
+        self.sync.offer("left_wrist", self.timed(1, 120))
+        self.sync.offer("right_wrist", self.timed(1, 96))
+        self.assertEqual(feedback_target_ns(self.sync.pair(200 * MS)), 108 * MS)
+
+    def test_feedback_target_counts_the_later_eye(self):
+        self.sync.offer("head", self.timed(1, 100, stereo=20))
+        self.sync.offer("left_wrist", self.timed(1, 100))
+        self.sync.offer("right_wrist", self.timed(1, 104))
+        self.assertEqual(feedback_target_ns(self.sync.pair(200 * MS)), 110 * MS)
+
+    def test_feedback_target_without_source_time_uses_receive_times(self):
+        self.sync.offer("head", Frame(1, 100 * MS))
+        self.sync.offer("left_wrist", Frame(1, 88 * MS))
+        self.sync.offer("right_wrist", Frame(1, 112 * MS))
+        self.assertEqual(feedback_target_ns(self.sync.pair(120 * MS)), 100 * MS)
+
+    def test_feedback_target_of_a_partial_set_is_the_frame_it_has(self):
+        self.sync.offer("head", Frame(1, 100 * MS))
+        self.assertEqual(feedback_target_ns(self.sync.pair(120 * MS)), 100 * MS)
 
     def test_single_stream_pairing_has_zero_skew(self):
         sync = CameraSynchronizer(["head"], tolerance_ms=25.0)
