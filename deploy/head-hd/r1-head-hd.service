@@ -1,0 +1,17 @@
+[Unit]
+Description=R1 head raw video for the Vision Pro first-person view
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=unitree
+WorkingDirectory=/home/unitree/unitree_r1_dev/r1_head_hd
+ExecStart=/home/unitree/miniconda3/envs/teleimager/bin/python3.10 -u head_hd_server.py
+# Recording and training run on r1-teleimager; under load they come first.
+Nice=5
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,13 @@
+[Unit]
+Description=R1 head raw video WebRTC signaling gateway (60004)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/home/hnh/unitree_r1_dev/.venv-xr/bin/python -u /home/hnh/unitree_r1_dev/r1_webrtc_gateway.py --bind-port 60004 --upstream-port 60004
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target
