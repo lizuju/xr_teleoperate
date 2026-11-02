@@ -1,1 +1,7 @@
+# .venv-train only; the teleop environment (.venv-xr) must not change.
+--extra-index-url https://download.pytorch.org/whl/cu124
+torch==2.5.1+cu124
+torchvision==0.20.1+cu124
+numpy==1.26.4
 h5py==3.14.0
+opencv-python-headless==4.10.0.84
