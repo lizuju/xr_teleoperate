@@ -31,7 +31,8 @@ class Snapshot:
     def __init__(self, data):
         self.data = data
 
-    def get_recording_samples(self, target_ns, since_sequence, end_ns):
+    def get_recording_samples(self, target_ns, since_sequence, end_ns, nearest_end_ns=None):
+        self.nearest_end_ns = nearest_end_ns
         state = self.data["state"]
         packet = {key: state[key] for key in ("monotonic_ns", "sequence", "tick")}
         packet.update(state["imu"])
@@ -39,6 +40,7 @@ class Snapshot:
                 "imu_packets": [packet] if since_sequence != state["sequence"] else []}
 
     def get_recording_states_at(self, target_ns, end_ns):
+        self.states_end_ns = end_ns
         return copy.deepcopy(self.data["state"])
 
     def get_recording_snapshot(self):
@@ -176,6 +178,59 @@ class CaptureTests(unittest.TestCase):
         self.assertEqual(frame["sample"]["commands"]["arm"]["requested"], self.arm.data["requested"])
         self.assertEqual(aligned["hand_target_inputs"], self.inputs)
         self.assertLessEqual(aligned["arm"]["requested"]["monotonic_ns"], aligned["anchor_monotonic_ns"])
+
+    def decision_at(self, age_ms):
+        """Make the hand request (and a matching arm request) ``age_ms`` old."""
+        anchor = time.monotonic_ns() - int(age_ms * 1e6)
+        self.hand.data["requested"]["monotonic_ns"] = anchor
+        self.arm.data["requested"]["monotonic_ns"] = anchor
+        return anchor
+
+    def test_observation_stops_at_the_decision_and_the_late_frame_rides_the_next_row(self):
+        anchor = self.decision_at(20)
+        early = SimpleNamespace(bgr=self.image.bgr, sequence=10, received_monotonic_ns=anchor - 5_000_000)
+        late = SimpleNamespace(bgr=self.image.bgr, sequence=11, received_monotonic_ns=anchor + 5_000_000)
+        self.capture.observe(early)
+        frame = self.capture.frame(self.xr, late, "following")
+        aligned = frame["sample"]["action_alignment"]
+        self.assertEqual(aligned["observation_cutoff_monotonic_ns"], anchor)
+        self.assertEqual(frame["color_sequences"]["color_0"], 10)
+        self.assertEqual(self.arm.nearest_end_ns, anchor)
+        self.assertEqual(self.hand.states_end_ns, anchor)
+        self.decision_at(1)
+        following = self.capture.frame(self.xr, late, "following")
+        self.assertEqual(following["color_sequences"]["color_0"], 11)
+
+    def test_a_row_with_no_image_by_the_decision_records_without_a_cutoff(self):
+        self.decision_at(20)
+        self.image.received_monotonic_ns = time.monotonic_ns()
+        frame = self.capture.frame(self.xr, self.image, "following")
+        self.assertIsNone(frame["sample"]["action_alignment"]["observation_cutoff_monotonic_ns"])
+        self.assertEqual(frame["color_sequences"]["color_0"], self.image.sequence)
+        self.assertGreater(self.hand.states_end_ns, self.hand.data["requested"]["monotonic_ns"])
+
+    def test_an_action_too_old_to_train_on_does_not_rewind_the_image(self):
+        anchor = self.decision_at(150)
+        early = SimpleNamespace(bgr=self.image.bgr, sequence=10, received_monotonic_ns=anchor - 5_000_000)
+        fresh = SimpleNamespace(bgr=self.image.bgr, sequence=11, received_monotonic_ns=time.monotonic_ns())
+        self.capture.observe(early)
+        frame = self.capture.frame(self.xr, fresh, "following")
+        self.assertIsNone(frame["sample"]["action_alignment"]["observation_cutoff_monotonic_ns"])
+        self.assertEqual(frame["color_sequences"]["color_0"], 11)
+
+    def test_a_camera_gap_at_the_decision_does_not_fail_the_episode(self):
+        anchor = self.decision_at(20)
+        old = SimpleNamespace(bgr=self.image.bgr, sequence=10, received_monotonic_ns=anchor - 600_000_000)
+        fresh = SimpleNamespace(bgr=self.image.bgr, sequence=11, received_monotonic_ns=time.monotonic_ns())
+        self.capture.observe(old)
+        frame = self.capture.frame(self.xr, fresh, "following")
+        self.assertIsNone(frame["sample"]["action_alignment"]["observation_cutoff_monotonic_ns"])
+        self.assertEqual(frame["color_sequences"]["color_0"], 11)
+
+    def test_paused_rows_are_paired_at_capture_time(self):
+        self.decision_at(20)
+        frame = self.capture.frame(self.xr, self.image, "paused")
+        self.assertIsNone(frame["sample"]["action_alignment"]["observation_cutoff_monotonic_ns"])
 
     def test_unavailable_or_future_history_does_not_fall_back_to_raw_actions(self):
         self.hand.data["requested"]["monotonic_ns"] -= 2_000_000

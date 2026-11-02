@@ -2703,13 +2703,15 @@ class R1_A7_ArmController:
             "waist_q": float(lowstate.motor_state[R1_A7_JointIndex.kWaistYaw].q),
         }
 
-    def get_recording_samples(self, target_ns, since_sequence, end_ns):
+    def get_recording_samples(self, target_ns, since_sequence, end_ns, nearest_end_ns=None):
         with self.recording_lock:
             history = [entry for entry in self.recording_history
                        if int(entry.monotonic_timestamp * 1e9) <= end_ns]
         if not history:
             return {"nearest": None, "imu_packets": [], "dropped": 0}
-        nearest = min(history, key=lambda entry: abs(int(entry.monotonic_timestamp * 1e9) - target_ns))
+        nearest_end_ns = end_ns if nearest_end_ns is None else nearest_end_ns
+        nearest = min((entry for entry in history if int(entry.monotonic_timestamp * 1e9) <= nearest_end_ns),
+                      key=lambda entry: abs(int(entry.monotonic_timestamp * 1e9) - target_ns), default=None)
         pending = history[-1:] if since_sequence is None else [
             entry for entry in history if entry.sequence > since_sequence]
         packets = [{"monotonic_ns": int(entry.monotonic_timestamp * 1e9),
@@ -2717,7 +2719,8 @@ class R1_A7_ArmController:
                    for entry in pending]
         dropped = (max(0, pending[0].sequence - since_sequence - 1)
                    if since_sequence is not None and pending else 0)
-        return {"nearest": self._recording_state(nearest), "imu_packets": packets, "dropped": dropped}
+        return {"nearest": None if nearest is None else self._recording_state(nearest),
+                "imu_packets": packets, "dropped": dropped}
 
     def get_recording_snapshot(self):
         lowstate = self._get_fresh_lowstate()

@@ -12,6 +12,12 @@ from teleop.utils.camera_calibration import (COLOR_KEYS, WRIST_COLOR_KEYS, camer
 from teleop.utils.frame_sync import CameraSynchronizer
 
 
+#: An action older than this is rejected for training anyway (request_age_ms), so
+#: pairing to it would only trade a fresh image for an old one.
+OBSERVATION_CUTOFF_MAX_AGE_NS = 100_000_000
+HEAD_IMAGE_TIMEOUT_S = 0.5
+
+
 def color_image_specs(camera_config):
     """Describe every colour stream this run records, keyed by colour key.
 
@@ -160,7 +166,10 @@ def capture_metadata(args, camera_config, retargeter, calibration=None, recordin
             "sample.action_alignment": ("Training selects the latest accepted arm request at or before the completed "
                                         "hand request, with corresponding successful publications and actual hand inputs. "
                                         "No interpolation, future request, or crossing an episode start or arm hold. "
-                                        "Raw actions, commands and XR retain their original capture times."),
+                                        "Raw actions, commands and XR retain their original capture times. "
+                                        "observation_cutoff_monotonic_ns is that hand request time when images and "
+                                        "aligned feedback were limited to what had arrived by then; null means the "
+                                        "row was paired at capture time instead."),
             "sample.imu": "latest SDK IMU with the same receive sequence and tick as robot state",
             "sample.imu_packets": "unresampled IMU packet batch since previous recording sample",
             "states.*.torque": ("measured joint torque; an empty list means the source exposes no "
@@ -250,6 +259,21 @@ class R1Capture:
         for side in self.wrist_image_shapes:
             self.sync.offer(f"{side}_wrist", (wrist_images or {}).get(side))
 
+    def _pair_observation(self, cutoff_ns, now):
+        """Pair cameras from what had arrived by the action's decision time.
+
+        Returns the pairing and the cutoff it honoured. An action too old to
+        train on, or a cutoff with no complete usable set, pairs at capture time
+        with no cutoff so the recording itself carries on; the offline checker
+        then rejects that row if anything in it arrived after the decision.
+        """
+        if cutoff_ns is not None and 0 <= now - cutoff_ns <= OBSERVATION_CUTOFF_MAX_AGE_NS:
+            pairing = self.sync.pair(cutoff_ns, complete_only=True)
+            if (pairing is not None
+                    and now - pairing.frames["head"].received_monotonic_ns <= HEAD_IMAGE_TIMEOUT_S * 1e9):
+                return pairing, cutoff_ns
+        return self.sync.pair(now), None
+
     def frame(self, tele_data, image, mode, wrist_images=None):
         arm = self.arm.get_recording_snapshot()
         hand_sample = self.hand_loop.get_recording_sample()
@@ -286,11 +310,13 @@ class R1Capture:
         if image is None or image.bgr is None:
             raise RuntimeError("Capture lost the decoded stereo image; episode is incomplete")
         self.observe(image, wrist_images)
-        pairing = self.sync.pair(now)
+        pairing, cutoff_ns = self._pair_observation(hand_anchor_ns if action_alignment["aligned"] else None, now)
+        action_alignment["observation_cutoff_monotonic_ns"] = cutoff_ns
+        feedback_end_ns = now if cutoff_ns is None else cutoff_ns
         if pairing is None or pairing.frames.get("head") is None:
             raise RuntimeError("Capture stereo image has no valid timestamp; episode is incomplete")
         image = pairing.frames["head"].payload
-        image_source = source(image.received_monotonic_ns, 0.5, sequence=image.sequence)
+        image_source = source(image.received_monotonic_ns, HEAD_IMAGE_TIMEOUT_S, sequence=image.sequence)
         image_source["timing"] = getattr(image, "timing", None)
         if not image_source["fresh"] or image.sequence <= 0:
             raise RuntimeError("Capture stereo image is stale; episode is incomplete")
@@ -380,11 +406,11 @@ class R1Capture:
         if pairing is not None:
             image_source["offset_ms"] = float(pairing.offsets_ms.get("head", 0.0))
         target_ns = pairing.anchor_ns
-        robot_samples = self.arm.get_recording_samples(target_ns, self.last_imu_sequence, now)
+        robot_samples = self.arm.get_recording_samples(target_ns, self.last_imu_sequence, now, feedback_end_ns)
         if robot_samples["imu_packets"]:
             self.last_imu_sequence = robot_samples["imu_packets"][-1]["sequence"]
         aligned_robot = robot_samples["nearest"]
-        aligned_hands = self.hand.get_recording_states_at(target_ns, now)
+        aligned_hands = self.hand.get_recording_states_at(target_ns, feedback_end_ns)
         aligned_sources = {"robot": aligned_robot,
                            **{f"{side}_hand_feedback": value for side, value in aligned_hands.items()}}
         offsets = {name: None if value is None else (value["monotonic_ns"] - target_ns) / 1e6
