@@ -28,7 +28,7 @@ Ubuntu 中使用现有虚拟环境，先确认没有另一个程序占用 8012�
 cd /home/hnh/unitree_r1_dev/xr_teleoperate/teleop
 /home/hnh/unitree_r1_dev/.venv-xr/bin/python teleop_hand_and_arm.py \
   --input-mode hand --ee linker_o6 --hand-only --dry-run \
-  --display-mode pass-through --img-server-ip 192.168.124.147 \
+  --display-mode pass-through --img-server-ip 192.168.110.20 \
   --linker-o6-method vector --record \
   --task-dir /home/hnh/unitree_r1_dev/o6-dex-recordings --task-name vector
 ```

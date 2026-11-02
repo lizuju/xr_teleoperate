@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Live tape-measure check of R1 head fisheye stereo ranging.
 
-Reads ZMQ ``head_camera`` (default 192.168.124.147:55555) via TeleImageClient,
+Reads ZMQ ``head_camera`` (default 192.168.110.20:55555) via TeleImageClient,
 splits one 1088x448 frame into left [:, :544] and right [:, 544:], detects a
 chessboard on both eyes, undistorts the corners with fisheye Knew (never None),
 and triangulates with P = Knew[I|0], P' = Knew'[R|t] from
