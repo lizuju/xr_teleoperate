@@ -51,7 +51,7 @@ def teleop_pids():
         except (FileNotFoundError, PermissionError, ProcessLookupError):
             continue
         names = [Path(os.fsdecode(arg)).name for arg in args if arg]
-        if "teleop_hand_and_arm.py" in names or "replay_r1_episode_on_robot.py" in names:
+        if {"teleop_hand_and_arm.py", "replay_r1_episode_on_robot.py", "run_r1_act_policy.py"} & set(names):
             pid = process.name
             if pid != str(os.getpid()):
                 found.append(pid)

@@ -8,22 +8,37 @@ from torch.utils.data import DataLoader, Dataset
 
 
 class R1ACTDataset(Dataset):
-    """ACT tensors with explicit source-episode splits and no real-robot -1 shift."""
+    """ACT tensors with explicit source-episode splits and no real-robot -1 shift.
+
+    One sample per usable observation. Its action chunk runs on through every later
+    row of the segment, including rows whose own observation was not usable.
+    """
 
     def __init__(self, root, split="train", chunk_size=40):
         self.root = Path(root)
         self.metadata = json.loads((self.root / "dataset.json").read_text())
-        if self.metadata.get("schema") != "r1_act_hdf5_v2" or self.metadata.get("status") != "complete":
+        if self.metadata.get("schema") != "r1_act_hdf5_v3" or self.metadata.get("status") != "complete":
             raise ValueError("Dataset export is not complete or has an unknown schema")
         if split not in ("train", "val") or chunk_size <= 0:
             raise ValueError("Use train/val and a positive chunk_size")
         self.chunk_size = chunk_size
         selected = set(self.metadata["splits"][split])
         self.episodes = [e for e in self.metadata["episodes"] if e["episode_id"] in selected]
-        self.ends = np.cumsum([e["frames"] for e in self.episodes])
+        self.ends = np.cumsum([e["anchors"] for e in self.episodes])
         stats = self.metadata["normalization"]
         self.stats = {key: np.asarray(stats[key], dtype=np.float32)
                       for key in ("qpos_mean", "qpos_std", "action_mean", "action_std")}
+        self._files = {}
+
+    def __getstate__(self):
+        # h5py handles do not survive a DataLoader worker; each process opens its own.
+        return {**self.__dict__, "_files": {}}
+
+    def _file(self, episode):
+        handle = self._files.get(episode["episode_id"])
+        if handle is None:
+            handle = self._files[episode["episode_id"]] = h5py.File(self.root / episode["file"], "r")
+        return handle
 
     def __len__(self):
         return int(self.ends[-1]) if len(self.ends) else 0
@@ -34,11 +49,12 @@ class R1ACTDataset(Dataset):
         episode_index = int(np.searchsorted(self.ends, index, side="right"))
         episode = self.episodes[episode_index]
         frame_index = index - (int(self.ends[episode_index - 1]) if episode_index else 0)
-        with h5py.File(self.root / episode["file"], "r") as h:
-            images = np.stack([h["observations/images/" + name][frame_index]
-                               for name in self.metadata["camera_names"]])
-            qpos = h["observations/qpos"][frame_index]
-            actions = h["action"][frame_index:frame_index + self.chunk_size]
+        h = self._file(episode)
+        images = np.stack([h["observations/images/" + name][frame_index]
+                           for name in self.metadata["camera_names"]])
+        qpos = h["observations/qpos"][frame_index]
+        row = int(h["source/anchor_index"][frame_index])
+        actions = h["action"][row:row + self.chunk_size]
         qpos = (qpos - self.stats["qpos_mean"]) / self.stats["qpos_std"]
         padded = np.zeros((self.chunk_size, self.metadata["action_dim"]), np.float32)
         padded[:len(actions)] = (actions - self.stats["action_mean"]) / self.stats["action_std"]
@@ -47,9 +63,11 @@ class R1ACTDataset(Dataset):
                 torch.from_numpy(qpos), torch.from_numpy(padded), torch.from_numpy(is_pad))
 
 
-def load_act_data(root, batch_size=8, chunk_size=40, num_workers=0):
+def load_act_data(root, batch_size=8, chunk_size=40, num_workers=0, pin_memory=False):
     train = R1ACTDataset(root, "train", chunk_size)
     val = R1ACTDataset(root, "val", chunk_size)
-    train_loader = DataLoader(train, batch_size=batch_size, shuffle=True, num_workers=num_workers)
-    val_loader = DataLoader(val, batch_size=batch_size, shuffle=False, num_workers=num_workers) if len(val) else None
+    options = {"batch_size": batch_size, "num_workers": num_workers, "pin_memory": pin_memory,
+               "persistent_workers": num_workers > 0}
+    train_loader = DataLoader(train, shuffle=True, drop_last=len(train) >= batch_size, **options)
+    val_loader = DataLoader(val, shuffle=False, **options) if len(val) else None
     return train_loader, val_loader, train.stats, train.metadata

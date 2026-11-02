@@ -1,24 +1,28 @@
 #!/usr/bin/env python3
 import argparse
 from collections import OrderedDict
+from fnmatch import fnmatch
 import hashlib
 import json
 from pathlib import Path
 import random
+import sys
 
 import cv2
 import h5py
 import numpy as np
 
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 from check_teleop_episode import (DEFAULT_MIN_SEGMENT_FRAMES, TRAINING_CAMERAS, TRAINING_GROUPS,
-                                 TRAINING_TIME_LIMITS, episode_file, training_observation,
+                                 TRAINING_TIME_LIMITS, episode_file, training_frame_rejections, training_observation,
                                  training_action, training_commands, training_hand_inputs, training_timing, validate_episode)
+from teleop.utils.act_runtime import IMAGE_HW, prepare_training_image
 
 
-IMAGE_HW = (240, 320)
-
-
-def export_dataset(source, output, min_frames=DEFAULT_MIN_SEGMENT_FRAMES):
+def export_dataset(source, output, min_frames=DEFAULT_MIN_SEGMENT_FRAMES, val_sources=()):
     source, output = Path(source).resolve(), Path(output).resolve()
     if min_frames < 2:
         raise ValueError("min_frames must be at least 2")
@@ -33,14 +37,15 @@ def export_dataset(source, output, min_frames=DEFAULT_MIN_SEGMENT_FRAMES):
     output.mkdir(parents=True)
     (output / "quality").mkdir()
     dataset = {
-        "schema": "r1_act_hdf5_v2", "status": "building", "source": str(source),
+        "schema": "r1_act_hdf5_v3", "status": "building", "source": str(source),
         "state_dim": sum(TRAINING_GROUPS.values()), "action_dim": sum(TRAINING_GROUPS.values()),
         "joint_groups": TRAINING_GROUPS, "camera_names": list(TRAINING_CAMERAS.values()),
         "image_size_hw": list(IMAGE_HW), "image_color_order": "RGB",
         "training_inputs": ["observations/qpos", "observations/images"], "imu_used": False,
         "action_semantics": "Bounded causal accepted-request alignment from sample.action_alignment: the latest historical arm target accepted at or before the completed hand request. Arm targets already include arm target shaping; hand targets precede hand smoothing. Only older rows without this block use original same-row actions. Actual acceptance timestamps are retained; no interpolation or fabricated times.",
         "observation_semantics": "Camera-source-time paired images and aligned_states feedback, all acquired and received at or before the completed hand request. Software timestamps, not exposure synchronization.",
-        "timing": "Original samples and measured intervals retained; no interpolation. Split at rejected rows and gaps >1.5 nominal periods.",
+        "timing": "Original samples and measured intervals retained; no interpolation. A segment is a run of usable actions, split at unusable actions and gaps >1.5 nominal periods.",
+        "anchor_semantics": "observations/* and the per-observation source/* datasets hold only rows that passed every training check. source/anchor_index gives each one's row in action, timestamp and the per-row source/* datasets. A row whose observation failed still contributes its real action to earlier chunks but is never trained from.",
         "deployment_contract": "Reproduce recorded source-time observation pairing and freshness checks. Consume the already accepted targets at the recorded action anchor, preserving publisher limits and hand smoothing safeguards.",
         "hand_request_time": "Recorded paired-target acceptance time and sequence, linked to successful hand publications; input age is checked against hand_target_inputs when present. Not physical execution time.",
         "time_limits_ms": TRAINING_TIME_LIMITS.copy(),
@@ -106,17 +111,21 @@ def export_dataset(source, output, min_frames=DEFAULT_MIN_SEGMENT_FRAMES):
                 for key, spec in info.get("images", {}).items() if key in TRAINING_CAMERAS}
             rows = [json.loads(line) for line in (directory / "frames.jsonl").open()]
             image_cache = OrderedDict()
-            for segment in report["training_no_imu"]["segments"]:
+            for segment in report["training_no_imu"]["action_segments"]:
                 begin, end = segment["start_idx"], segment["stop_idx"]
                 selected = rows[begin:end]
                 count = len(selected)
+                anchor_index = [i for i, row in enumerate(selected) if not training_frame_rejections(row, info)]
+                anchors = [selected[i] for i in anchor_index]
                 if count < min_frames:
-                    entry["short_segment_frames"] += count
+                    entry["short_segment_frames"] += len(anchors)
+                    continue
+                if not anchors:
                     continue
                 episode_id = len(dataset["episodes"])
                 filename = f"episode_{episode_id}.hdf5"
                 temporary = output / ("." + filename + ".tmp")
-                observations = [training_observation(r) for r in selected]
+                observations = [training_observation(r) for r in anchors]
                 qpos = np.array([sum((o[g] for g in TRAINING_GROUPS), [])
                                  for o in observations], dtype=np.float32)
                 aligned_actions = [training_action(r) for r in selected]
@@ -130,7 +139,9 @@ def export_dataset(source, output, min_frames=DEFAULT_MIN_SEGMENT_FRAMES):
                     h.attrs.update(sim=False, compress=False, fps=frequency, imu_used=False,
                                    action_semantics=dataset["action_semantics"], color_order="RGB", source_episode=str(directory))
                     h.create_dataset("observations/qpos", data=qpos)
-                    h.create_dataset("observations/qvel", data=np.gradient(qpos, seconds, axis=0).astype(np.float32))
+                    h.create_dataset("observations/qvel", data=(np.gradient(qpos, seconds[anchor_index], axis=0)
+                                                                if len(anchors) > 1 else np.zeros_like(qpos)).astype(np.float32))
+                    h.create_dataset("source/anchor_index", data=anchor_index, dtype="int64")
                     h["observations/qvel"].attrs["meaning"] = dataset["qvel_semantics"]
                     h.create_dataset("action", data=actions)
                     h.create_dataset("timestamp", data=seconds)
@@ -145,8 +156,8 @@ def export_dataset(source, output, min_frames=DEFAULT_MIN_SEGMENT_FRAMES):
                     h.create_dataset("source/action_alignment_used", data=["action_alignment" in r["sample"] for r in selected])
                     h.create_dataset("source/action_anchor_ns", data=[r["sample"]["action_alignment"]["anchor_monotonic_ns"]
                                      if "action_alignment" in r["sample"] else r["sample"]["monotonic_ns"] for r in selected])
-                    timings = [training_timing(r["sample"]) for r in selected]
-                    inputs = [training_hand_inputs(r["sample"]) for r in selected]
+                    timings = [training_timing(r["sample"]) for r in anchors]
+                    inputs = [training_hand_inputs(r["sample"]) for r in anchors]
                     input_stamps = h.create_dataset("source/hand_input_ns", data=[
                         [(value.get(side) or {}).get("received_monotonic_ns", 0) for side in ("left", "right")]
                         for value in inputs])
@@ -166,30 +177,29 @@ def export_dataset(source, output, min_frames=DEFAULT_MIN_SEGMENT_FRAMES):
                         for field in ("source_monotonic_ns", "clock_offset_ns", "clock_uncertainty_ns",
                                       "clock_measured_monotonic_ns"):
                             h.create_dataset("source/camera_timing/" + name + "/" + field,
-                                             data=[r["sample"]["sources"][name]["timing"][field] for r in selected])
+                                             data=[r["sample"]["sources"][name]["timing"][field] for r in anchors])
                         for field in ("clock_id", "timestamp_kind"):
                             h.create_dataset("source/camera_timing/" + name + "/" + field,
                                              dtype=h5py.string_dtype("utf-8"),
                                              data=[r["sample"]["sources"][name]["timing"].get(field, "unknown")
-                                                   for r in selected])
+                                                   for r in anchors])
                     h.create_dataset("source/camera_timing/image/stereo_skew_ns",
                                      data=[r["sample"]["sources"]["image"]["timing"]["stereo_skew_ns"]
-                                           for r in selected])
+                                           for r in anchors])
                     for name in ("robot", "left_hand_feedback", "right_hand_feedback", "image", "left_wrist_image", "right_wrist_image"):
                         h.create_dataset("source/received_ns/" + name,
-                                         data=[r["sample"]["sources"][name]["received_monotonic_ns"] for r in selected])
+                                         data=[r["sample"]["sources"][name]["received_monotonic_ns"] for r in anchors])
                     for key, camera in TRAINING_CAMERAS.items():
                         images = h.create_dataset("observations/images/" + camera,
-                                                  shape=(count, *IMAGE_HW, 3), dtype="uint8",
+                                                  shape=(len(anchors), *IMAGE_HW, 3), dtype="uint8",
                                                   chunks=(1, *IMAGE_HW, 3), compression="gzip", compression_opts=1)
-                        for i, row in enumerate(selected):
+                        for i, row in enumerate(anchors):
                             relative = row["colors"][key]
                             if relative not in image_cache:
                                 pixels = cv2.imread(str(episode_file(directory, relative)), cv2.IMREAD_COLOR)
                                 if pixels is None:
                                     raise ValueError(f"Unreadable image: {directory / relative}")
-                                pixels = cv2.resize(pixels, IMAGE_HW[::-1], interpolation=cv2.INTER_AREA)
-                                image_cache[relative] = cv2.cvtColor(pixels, cv2.COLOR_BGR2RGB)
+                                image_cache[relative] = prepare_training_image(pixels)
                                 if len(image_cache) > 16:
                                     image_cache.popitem(last=False)
                             images[i] = image_cache[relative]
@@ -197,8 +207,9 @@ def export_dataset(source, output, min_frames=DEFAULT_MIN_SEGMENT_FRAMES):
                 temporary.replace(output / filename)
                 dataset["episodes"].append({"episode_id": episode_id, "file": filename, "source_id": source_id,
                                             "start_idx": begin, "stop_idx": end, "frames": count,
+                                            "anchors": len(anchors),
                                             "duration_s": float(seconds[-1])})
-                entry["exported_frames"] += count
+                entry["exported_frames"] += len(anchors)
             if entry["exported_frames"] == 0:
                 entry["excluded_reason"] = "no_long_enough_eligible_segment"
             print(f"[EXPORT] {directory.name}: {entry['exported_frames']} frames", flush=True)
@@ -209,27 +220,30 @@ def export_dataset(source, output, min_frames=DEFAULT_MIN_SEGMENT_FRAMES):
         random.Random(42).shuffle(source_ids)
         val_count = max(1, round(len(source_ids) * .2)) if len(source_ids) > 1 else 0
         val_ids = set(source_ids[:val_count])
+        if val_sources:
+            # Named holdouts, normally a whole capture session, replace the random pick.
+            val_ids = {i for i in source_ids if any(fnmatch(Path(dataset["sources"][i]["episode"]).name, pattern)
+                                                    for pattern in val_sources)}
+            if not val_ids or len(val_ids) == len(source_ids):
+                raise ValueError(f"--val-source must leave both splits non-empty; matched {len(val_ids)} of {len(source_ids)}")
+            dataset["split_unit"] = "named_source"
         for episode in dataset["episodes"]:
             split = "val" if episode["source_id"] in val_ids else "train"
             dataset["splits"][split].append(episode["episode_id"])
         if not val_ids:
             dataset["validation_note"] = "Only one source episode; no independent validation set. Collect more episodes."
-        sums = {k: np.zeros(dataset["state_dim"], dtype=np.float64) for k in ("qpos", "action")}
-        squares = {k: value.copy() for k, value in sums.items()}
-        count = 0
+        values = {key: [] for key in ("qpos", "action")}
         for episode_id in dataset["splits"]["train"]:
             with h5py.File(output / f"episode_{episode_id}.hdf5", "r") as h:
-                for key, path in (("qpos", "observations/qpos"), ("action", "action")):
-                    values = h[path][:].astype(np.float64)
-                    sums[key] += values.sum(axis=0)
-                    squares[key] += (values * values).sum(axis=0)
-                count += len(h["action"])
-        dataset["normalization"] = {"split": "train", "frames": count}
-        for key in sums:
-            mean = sums[key] / count
-            std = np.maximum(np.sqrt(np.maximum(squares[key] / count - mean * mean, 0)), .01)
-            dataset["normalization"][key + "_mean"] = mean.tolist()
-            dataset["normalization"][key + "_std"] = std.tolist()
+                values["qpos"].append(h["observations/qpos"][:].astype(np.float64))
+                values["action"].append(h["action"][:].astype(np.float64))
+        dataset["normalization"] = {"split": "train", "frames": sum(map(len, values["qpos"]))}
+        for key, parts in values.items():
+            stacked = np.concatenate(parts)
+            dataset["normalization"][key + "_mean"] = stacked.mean(axis=0).tolist()
+            dataset["normalization"][key + "_std"] = np.maximum(stacked.std(axis=0), .01).tolist()
+            dataset["normalization"][key + "_min"] = stacked.min(axis=0).tolist()
+            dataset["normalization"][key + "_max"] = stacked.max(axis=0).tolist()
         dataset["status"] = "complete"
         save_manifest()
         return dataset
@@ -245,10 +259,13 @@ def main():
     parser.add_argument("source", type=Path, help="One task directory or one episode directory")
     parser.add_argument("--output", type=Path, required=True, help="A new directory outside the recordings")
     parser.add_argument("--min-frames", type=int, default=DEFAULT_MIN_SEGMENT_FRAMES,
-                        help=f"Minimum consecutive eligible samples per segment (default: {DEFAULT_MIN_SEGMENT_FRAMES})")
+                        help=f"Minimum consecutive usable actions per segment (default: {DEFAULT_MIN_SEGMENT_FRAMES})")
+    parser.add_argument("--val-source", action="append", default=[], metavar="GLOB",
+                        help="Hold out source episodes whose directory name matches, e.g. '*_20261107_*'. "
+                             "Default: a random 20%% of sources")
     args = parser.parse_args()
     cv2.setNumThreads(1)
-    result = export_dataset(args.source, args.output, args.min_frames)
+    result = export_dataset(args.source, args.output, args.min_frames, args.val_source)
     print(f"[EXPORT] 完成: {len(result['episodes'])} 个连续片段; train={len(result['splits']['train'])}, val={len(result['splits']['val'])}; IMU 已排除")
     print(args.output.resolve() / "dataset.json")
 

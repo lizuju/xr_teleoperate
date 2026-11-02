@@ -62,6 +62,12 @@ TRAINING_CAMERAS = {"color_0": "head_left", "color_1": "head_right",
 TRAINING_TIME_LIMITS = {"observation_skew_ms": 25.0, "observation_age_ms": 150.0,
                         "request_age_ms": 100.0, "request_skew_ms": 25.0,
                         "hand_input_age_ms": 100.0}
+# Rejections that only disqualify a row as an observation. Its action is still a
+# real accepted target, so earlier rows may keep it inside their action chunk.
+TRAINING_OBSERVATION_REASONS = frozenset((
+    "feedback_stale", "image_stale", "image_missing", "cameras_unaligned", "sensor_unaligned",
+    "camera_clock_invalid", "observation_skew", "observation_age", "invalid_observation_time",
+    "request_before_observation", "observation_after_decision", "invalid_aligned_states"))
 
 
 def training_observation(frame):
@@ -319,7 +325,7 @@ def validate_episode(path, min_segment_frames=DEFAULT_MIN_SEGMENT_FRAMES):
               "training_no_imu": {"policy": "r1_vision_joint_bc_v2", "imu_used": False,
                                   "time_limits_ms": TRAINING_TIME_LIMITS.copy(),
                                   "eligible_frames": 0, "excluded_counts": {}, "segments": [],
-                                  "min_segment_frames": min_segment_frames,
+                                  "min_segment_frames": min_segment_frames, "action_segments": [],
                                   "longest_segment_frames": 0, "exportable_segments": 0,
                                   "exportable_frames": 0, "short_segment_frames": 0,
                                   "sampling_gap_boundaries": 0}}
@@ -504,6 +510,8 @@ def validate_episode(path, min_segment_frames=DEFAULT_MIN_SEGMENT_FRAMES):
     timing_bases = Counter()
     training_previous_ns = None
     training_previous_idx = None
+    action_previous_ns = None
+    action_previous_idx = None
     with stream:
         for line_number, line in enumerate(stream, 1):
             label = f"line {line_number}"
@@ -1106,6 +1114,17 @@ def validate_episode(path, min_segment_frames=DEFAULT_MIN_SEGMENT_FRAMES):
                 training_previous_idx, training_previous_ns = idx, stamp
             else:
                 training_previous_idx = training_previous_ns = None
+            # An exportable segment is a run of usable actions; its usable observations are the anchors.
+            if not set(rejections) - TRAINING_OBSERVATION_REASONS and type(idx) is int:
+                if (action_previous_idx is not None and idx == action_previous_idx + 1 and frequency is not None
+                        and 0 < stamp - action_previous_ns <= 1.5e9 / frequency):
+                    training["action_segments"][-1]["stop_idx"] = idx + 1
+                    training["action_segments"][-1]["anchors"] += not rejections
+                else:
+                    training["action_segments"].append({"start_idx": idx, "stop_idx": idx + 1, "anchors": int(not rejections)})
+                action_previous_idx, action_previous_ns = idx, stamp
+            else:
+                action_previous_idx = action_previous_ns = None
 
     if report["frames_checked"] == 0:
         error("frames.jsonl: episode has no frames")
@@ -1218,10 +1237,11 @@ def validate_episode(path, min_segment_frames=DEFAULT_MIN_SEGMENT_FRAMES):
     training = report["training_no_imu"]
     training["excluded_counts"] = dict(training_exclusions)
     lengths = [segment["stop_idx"] - segment["start_idx"] for segment in training["segments"]]
-    training["longest_segment_frames"] = max(lengths, default=0)
-    training["exportable_segments"] = sum(length >= min_segment_frames for length in lengths)
-    training["exportable_frames"] = sum(length for length in lengths if length >= min_segment_frames)
-    training["short_segment_frames"] = sum(length for length in lengths if length < min_segment_frames)
+    action_lengths = [(segment["stop_idx"] - segment["start_idx"], segment["anchors"]) for segment in training["action_segments"]]
+    training["longest_segment_frames"] = max((length for length, _ in action_lengths), default=0)
+    training["exportable_segments"] = sum(length >= min_segment_frames and anchors > 0 for length, anchors in action_lengths)
+    training["exportable_frames"] = sum(anchors for length, anchors in action_lengths if length >= min_segment_frames)
+    training["short_segment_frames"] = sum(anchors for length, anchors in action_lengths if length < min_segment_frames)
     training["demonstration_eligible"] = (report["valid"] and report["status"] == "complete"
                                           and report["outcome"] == "success"
                                           and training["exportable_frames"] > 0)

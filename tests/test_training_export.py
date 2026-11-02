@@ -339,6 +339,68 @@ class TrainingExportTests(unittest.TestCase):
         self.assertEqual(report["training_no_imu"]["timing_basis"], "mapped_source")
         self.assertEqual(report["training_no_imu"]["timing"]["observation_age_ms"]["p95"], 252.0)
 
+    def test_a_bad_observation_stays_in_the_action_chunk_but_is_never_trained_from(self):
+        directory, manifest, rows = self.episode(count=8)
+        rows[3]["sample"]["sources"]["image"].update(received_monotonic_ns=rows[3]["sample"]["monotonic_ns"], age_ms=0.0)
+        for index, row in enumerate(rows):
+            row["actions"]["left_arm"]["qpos"] = [float(index)] * 7
+        self.write(directory, manifest, rows)
+        report = validate_episode(directory, min_segment_frames=2)["training_no_imu"]
+        self.assertEqual(report["eligible_frames"], 7)
+        self.assertEqual(len(report["segments"]), 2)
+        self.assertEqual(report["action_segments"], [{"start_idx": 0, "stop_idx": 8, "anchors": 7}])
+        self.assertEqual((report["exportable_segments"], report["exportable_frames"], report["longest_segment_frames"]), (1, 7, 8))
+        dataset = export_dataset(self.source, self.output, min_frames=2)
+        self.assertEqual(dataset["episodes"][0]["frames"], 8)
+        self.assertEqual(dataset["episodes"][0]["anchors"], 7)
+        self.assertEqual(dataset["sources"][0]["exported_frames"], 7)
+        with h5py.File(self.output / "episode_0.hdf5") as h:
+            self.assertEqual(h["source/anchor_index"][:].tolist(), [0, 1, 2, 4, 5, 6, 7])
+            self.assertEqual((h["action"].shape[0], h["observations/qpos"].shape[0],
+                              h["observations/images/head_left"].shape[0], h["source/observation_ns"].shape[0]), (8, 7, 7, 7))
+        loader = R1ACTDataset(self.output, chunk_size=3)
+        self.assertEqual(len(loader), 7)
+        recovered = loader[2][2][:, 0].numpy() * loader.stats["action_std"][0] + loader.stats["action_mean"][0]
+        np.testing.assert_allclose(recovered, [2.0, 3.0, 4.0], atol=1e-4)
+        recovered = loader[3][2][:, 0].numpy() * loader.stats["action_std"][0] + loader.stats["action_mean"][0]
+        np.testing.assert_allclose(recovered, [4.0, 5.0, 6.0], atol=1e-4)
+
+    def test_an_unusable_action_ends_the_segment_and_the_chunk(self):
+        directory, manifest, rows = self.episode(count=8)
+        rows[3]["sample"]["mode"] = "tracking_hold"
+        self.write(directory, manifest, rows)
+        report = validate_episode(directory, min_segment_frames=2)["training_no_imu"]
+        self.assertEqual([(s["start_idx"], s["stop_idx"]) for s in report["action_segments"]], [(0, 3), (4, 8)])
+        export_dataset(self.source, self.output, min_frames=2)
+        loader = R1ACTDataset(self.output, chunk_size=4)
+        self.assertEqual(loader[2][3].tolist(), [False, True, True, True])
+
+    def test_named_sources_become_the_validation_split(self):
+        for number in range(3):
+            self.episode(number=number)
+        dataset = export_dataset(self.source, self.output, min_frames=2, val_sources=["episode_0001"])
+        self.assertEqual(dataset["split_unit"], "named_source")
+        by_source = {e["episode_id"]: e["source_id"] for e in dataset["episodes"]}
+        self.assertEqual({by_source[i] for i in dataset["splits"]["val"]}, {1})
+        self.assertEqual({by_source[i] for i in dataset["splits"]["train"]}, {0, 2})
+
+    def test_named_sources_must_leave_both_splits(self):
+        for number in range(2):
+            self.episode(number=number)
+        with self.assertRaisesRegex(ValueError, "both splits"):
+            export_dataset(self.source, self.output, min_frames=2, val_sources=["nothing*"])
+
+    def test_normalization_uses_observations_for_qpos_and_all_rows_for_actions(self):
+        directory, manifest, rows = self.episode(count=4)
+        rows[1]["sample"]["sources"]["image"].update(received_monotonic_ns=rows[1]["sample"]["monotonic_ns"], age_ms=0.0)
+        for index, row in enumerate(rows):
+            row["actions"]["left_arm"]["qpos"] = [float(index)] * 7
+        self.write(directory, manifest, rows)
+        stats = export_dataset(self.source, self.output, min_frames=2)["normalization"]
+        self.assertEqual(stats["frames"], 3)
+        self.assertEqual((stats["action_min"][0], stats["action_max"][0]), (0.0, 3.0))
+        self.assertAlmostEqual(stats["action_mean"][0], 1.5)
+
     def test_loader_rejects_previous_observation_semantics(self):
         self.episode()
         dataset = export_dataset(self.source, self.output, min_frames=2)
