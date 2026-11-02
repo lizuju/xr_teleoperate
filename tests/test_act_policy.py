@@ -291,7 +291,7 @@ class RunnerSafetyTests(unittest.TestCase):
             run.ignore_before_tick = 0
             chunk = np.zeros((2, 29))
             chunk[:, 0] = 1.0
-            run.client.poll.side_effect = [((run.tick, 0.0), 1.0, chunk)] + [None] * 10
+            run.client.poll.side_effect = [((run.tick, time.monotonic()), 1.0, chunk)] + [None] * 10
             args = SimpleNamespace(max_start_delta=0.35, blend_seconds=1.0, max_seconds=1.0)
             pose = runner.execute_loop(run, arm, hand, PolicyGuard(NORMALIZATION), lambda q: np.zeros(14), 0.001, [False], args)
             self.assertEqual(pose.arm_q.tolist(), [0.0] * 14)
@@ -308,7 +308,7 @@ class RunnerSafetyTests(unittest.TestCase):
             run.ensemble = ActionEnsemble(400)
             chunk = np.zeros((400, 29))
             chunk[:, 0] = 0.3
-            run.client.poll.side_effect = [((run.tick, 0.0), 1.0, chunk)] + [None] * 1000
+            run.client.poll.side_effect = [((run.tick, time.monotonic()), 1.0, chunk)] + [None] * 1000
             args = SimpleNamespace(max_start_delta=0.35, blend_seconds=0.2, max_seconds=5.0)
             guard = PolicyGuard(NORMALIZATION, max_chunk_age_s=0.1)
             runner.execute_loop(run, arm, hand, guard, lambda q: np.zeros(14), 0.002, [False], args)
@@ -317,6 +317,71 @@ class RunnerSafetyTests(unittest.TestCase):
             self.assertEqual(commanded[0], 0.0)
             self.assertTrue(all(0.0 <= value <= 0.3 + 1e-9 for value in commanded))
             self.assertTrue(all(a <= b + 1e-9 for a, b in zip(commanded, commanded[1:])))
+
+    def test_chunk_requested_too_long_ago_is_dropped(self):
+        runner = self.load()
+        with tempfile.TemporaryDirectory() as directory:
+            run, _, _ = self.fake_run(runner, Path(directory) / "ticks.jsonl")
+            run.ensemble = ActionEnsemble(400)
+            late = np.full((400, 29), 0.3)
+            run.client.poll.return_value = ((run.tick, time.monotonic() - 0.6), 900.0, late)
+            target, _ = run.step()
+            self.assertIsNone(target)
+            self.assertIsNone(run.last_chunk_at)
+            self.assertEqual(run.summary()["stale_chunks"], 1)
+
+    def test_execute_never_commands_an_over_age_first_chunk(self):
+        runner = self.load()
+        with tempfile.TemporaryDirectory() as directory:
+            run, arm, hand = self.fake_run(runner, Path(directory) / "ticks.jsonl")
+            arm.get_recording_snapshot.return_value = {
+                "state": {"q": [0.0] * 14, "head_q": [0.0, 0.0], "waist_q": 0.0},
+                "requested": {"arm_q": [0.0] * 14}}
+            run.ensemble = ActionEnsemble(400)
+            late, fresh = np.zeros((400, 29)), np.zeros((400, 29))
+            late[:, 0], fresh[:, 0] = 0.3, 0.1
+            polls = [0]
+            def poll():
+                polls[0] += 1
+                if polls[0] == 1:
+                    return (run.tick, time.monotonic() - 0.6), 900.0, late
+                # The next request comes back on time, after the over-age one was dropped.
+                return ((run.tick, time.monotonic()), 1.0, fresh) if polls[0] == 2 else None
+            run.client.poll.side_effect = poll
+            args = SimpleNamespace(max_start_delta=0.35, blend_seconds=0.01, max_seconds=5.0)
+            guard = PolicyGuard(NORMALIZATION, max_chunk_age_s=0.1)
+            runner.execute_loop(run, arm, hand, guard, lambda q: np.zeros(14), 0.002, [False], args)
+            self.assertEqual(run.stale_chunks, 1)
+            commanded = [call.args[0][0] for call in arm.ctrl_dual_arm_and_head.call_args_list]
+            self.assertAlmostEqual(max(commanded), 0.1)
+
+    def test_execute_stops_on_the_tick_a_stalled_loop_resumes(self):
+        runner = self.load()
+        with tempfile.TemporaryDirectory() as directory:
+            run, arm, hand = self.fake_run(runner, Path(directory) / "ticks.jsonl")
+            arm.get_recording_snapshot.return_value = {
+                "state": {"q": [0.0] * 14, "head_q": [0.0, 0.0], "waist_q": 0.0},
+                "requested": {"arm_q": [0.0] * 14}}
+            run.ensemble = ActionEnsemble(400)
+            chunk = np.zeros((400, 29))
+            polls, commands_at_stall = [0], []
+            def poll():
+                polls[0] += 1
+                if polls[0] == 1:
+                    return (run.tick, time.monotonic()), 1.0, chunk
+                if polls[0] == 5:
+                    commands_at_stall.append(arm.ctrl_dual_arm_and_head.call_count)
+                    sent_at = time.monotonic()
+                    time.sleep(0.15)
+                    return (run.tick, sent_at), 1.0, chunk
+                return None
+            run.client.poll.side_effect = poll
+            args = SimpleNamespace(max_start_delta=0.35, blend_seconds=0.2, max_seconds=5.0)
+            guard = run.guard = PolicyGuard(NORMALIZATION, max_chunk_age_s=0.1)
+            runner.execute_loop(run, arm, hand, guard, lambda q: np.zeros(14), 0.002, [False], args)
+            self.assertIn("no fresh policy output", guard.tripped)
+            self.assertEqual(run.stale_chunks, 1)
+            self.assertEqual(arm.ctrl_dual_arm_and_head.call_count, commands_at_stall[0])
 
 
 @unittest.skipUnless(HAS_TORCHVISION, "needs .venv-train")
