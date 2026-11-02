@@ -510,6 +510,15 @@ class PalmCaptureTests(unittest.TestCase):
         self.assertAlmostEqual(target, (min(times) + max(times)) / 2, delta=2)
         self.assertNotEqual(target, alignment["anchor_monotonic_ns"])
 
+    def test_tf_is_labelled_with_the_feedback_target_its_state_was_read_at(self):
+        targets = []
+        tf = SimpleNamespace(sample=lambda robot, target, valid: targets.append(target) or {"schema": "r1_tf_v1"})
+        capture = R1Capture(self.arm, self.hand, self.loop, 0.25, (16, 32),
+                            wrist_image_shapes={"left": (8, 16), "right": (8, 16)}, recording_tf=tf)
+        frame = self.sample(left=palm_at(40, 11, 14), right=palm_at(90, 12, 0), head_offset_ms=6, capture=capture)
+        self.assertEqual(targets, [frame["sample"]["sensor_alignment"]["target_monotonic_ns"]])
+        self.assertNotEqual(targets[0], frame["sample"]["camera_alignment"]["anchor_monotonic_ns"])
+
     def test_a_skew_over_the_tolerance_is_flagged_not_hidden(self):
         tight = R1Capture(self.arm, self.hand, self.loop, 0.25, (16, 32),
                           wrist_image_shapes={"left": (8, 16), "right": (8, 16)},
