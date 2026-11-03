@@ -50,7 +50,7 @@ def export_dataset(source, output, min_frames=DEFAULT_MIN_SEGMENT_FRAMES, val_so
         "hand_request_time": "Recorded paired-target acceptance time and sequence, linked to successful hand publications; input age is checked against hand_target_inputs when present. Not physical execution time.",
         "time_limits_ms": TRAINING_TIME_LIMITS.copy(),
         "qvel_semantics": "Finite differences of aligned qpos over decision ticks, including repeated observations; not physical joint velocity or a training input.",
-        "image_transform": "OpenCV INTER_AREA resize from each original image to 320x240, then BGR to RGB; original calibration needs the recorded x/y pixel scaling.",
+        "image_transform": f"OpenCV INTER_AREA resize from each original image to {IMAGE_HW[1]}x{IMAGE_HW[0]}, then BGR to RGB; original calibration needs the recorded x/y pixel scaling.",
         "min_segment_frames": min_frames, "sources": [], "episodes": [],
         "splits": {"train": [], "val": []}, "split_unit": "original_episode", "split_seed": 42,
     }
