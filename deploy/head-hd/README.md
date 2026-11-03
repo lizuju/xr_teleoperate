@@ -6,7 +6,7 @@
 PC1 原图 (RTP JPEG, UDP 5004/5005)
   → PC2 r1-head-hd：解码后分两路
       ZMQ 55555：每眼 640×544 JPEG，30 fps，用于录制和策略
-      WebRTC 60004：每眼 960×816，H.264 30 fps 10 Mbps，用于头显
+      WebRTC 60004：每眼 1280×1088，H.264 30 fps 15 Mbps，用于头显
   → Ubuntu r1-camera-forward-60004：转发 WebRTC 协商
   → Vision Pro App：按 head-optics.json 去畸变和双目校正
 ```
@@ -60,4 +60,4 @@ python fit_head_optics.py left.jpg right.jpg head-optics.json
 
 - `rtpjpegdepay` 会在相机的完整 JPEG 前面再加一个 JPEG 头。直接解码得到纯灰色画面，尺寸和帧率却都正常，要从第二个 SOI 开始解码。
 - App 只接受 `timestamp_kind` 为 `pc2_rtp_decoded_receive` 的时间信息。
-- 码率是固定的。aiortc 的带宽估计曾把编码器压到最低档，所以没有跟随它调整。网络较弱时改 `BITRATE_BPS`。
+- 码率是固定的。aiortc 的带宽估计曾把编码器压到最低档，所以没有跟随它调整。网络较弱或出现 `video_source_stale` 时，先把 `BITRATE_BPS` 降到 10 Mbps，只需重启服务，不用重装 App；每眼 1280×1088 下画质只比 15 Mbps 低约 0.9 dB。
