@@ -62,14 +62,14 @@ def head_document():
         "board": {"type": "checkerboard", "squares_x": 9, "squares_y": 6, "square_size_m": 0.030},
         "cameras": {
             "head_left": {
-                "image_size": [544, 448],
+                "image_size": [640, 544],
                 "camera_matrix": [[131.59, 0.0, 287.48], [0.0, 130.56, 214.52], [0.0, 0.0, 1.0]],
                 "distortion_model": "fisheye",
                 "distortion_coefficients": [0.2485, 0.3494, 0.0, 0.0],
                 "reprojection_error_px": 0.25,
             },
             "head_right": {
-                "image_size": [544, 448],
+                "image_size": [640, 544],
                 "camera_matrix": [[131.91, 0.0, 286.69], [0.0, 131.07, 215.06], [0.0, 0.0, 1.0]],
                 "distortion_model": "fisheye",
                 "distortion_coefficients": [0.2479, 0.3462, 0.0, 0.0],

@@ -259,7 +259,7 @@ class ObservationTests(unittest.TestCase):
     def test_exporter_and_runtime_share_one_image_transform(self):
         import export_r1_training_dataset as exporter
         self.assertIs(exporter.prepare_training_image, prepare_training_image)
-        self.assertEqual(exporter.IMAGE_HW, (240, 320))
+        self.assertEqual(exporter.IMAGE_HW, (544, 640))
 
 
 @unittest.skipUnless(HAS_PINOCCHIO, "needs pinocchio")
@@ -294,6 +294,14 @@ class RunnerSafetyTests(unittest.TestCase):
         args = self.load().parse_args(["policy.pt"])
         self.assertEqual((args.arm_target_velocity_limit, args.arm_target_accel_limit, args.arm_dq_limit), (6.0, 40.0, 6.0))
         self.assertFalse(args.execute)
+
+    def test_policy_trained_on_other_head_images_is_refused(self):
+        runner = self.load()
+        config = {"head_camera": {"image_shape": [544, 1280]}}
+        runner.check_policy_cameras({"source_image_sizes": {"color_0": [640, 544]}}, config)
+        for dataset in ({}, {"source_image_sizes": {"color_0": [544, 448]}}):
+            with self.assertRaisesRegex(RuntimeError, "Export and train again"):
+                runner.check_policy_cameras(dataset, config)
 
     def test_shadow_mode_reads_but_never_commands(self):
         runner = self.load()
@@ -408,6 +416,16 @@ class RunnerSafetyTests(unittest.TestCase):
 
 @unittest.skipUnless(HAS_TORCHVISION, "needs .venv-train")
 class ModelTests(unittest.TestCase):
+    def test_checkpoint_records_the_camera_images_it_trained_on(self):
+        import train_r1_act
+        sizes = {"color_0": [640, 544]}
+        metadata = {"schema": "r1_act_hdf5_v3", "fps": 40.0, "joint_names": [], "camera_names": [],
+                    "image_size_hw": [544, 640], "source_image_sizes": sizes}
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "dataset.json").write_text("{}")
+            info = train_r1_act.dataset_info(directory, metadata, SimpleNamespace(dataset=[]), None)
+        self.assertEqual(info["source_image_sizes"], sizes)
+
     def setUp(self):
         import torch
         from teleop.utils.act_policy import ACTPolicy

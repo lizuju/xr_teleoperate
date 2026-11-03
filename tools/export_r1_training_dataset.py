@@ -106,6 +106,10 @@ def export_dataset(source, output, min_frames=DEFAULT_MIN_SEGMENT_FRAMES, val_so
             entry["calibration"] = info.get("camera_calibration")
             entry["launch_arguments"] = info.get("launch_arguments")
             entry["code_sha256"] = info.get("code_sha256")
+            sizes = {key: [spec["width"], spec["height"]] for key, spec in info.get("images", {}).items()
+                     if key in TRAINING_CAMERAS}
+            if dataset.setdefault("source_image_sizes", sizes) != sizes:
+                raise ValueError("Mixed camera image sizes; export these recordings separately")
             entry["image_pixel_scale_xy"] = {
                 key: [IMAGE_HW[1] / spec["width"], IMAGE_HW[0] / spec["height"]]
                 for key, spec in info.get("images", {}).items() if key in TRAINING_CAMERAS}

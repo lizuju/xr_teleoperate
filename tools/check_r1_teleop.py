@@ -175,15 +175,16 @@ def jpeg_is_complete(payload):
 def validate_camera_config(config):
     head = config.get("head_camera", {})
     expected = {
-        "type": "rtp_h264_stereo",
-        "image_shape": [448, 1088],
+        "type": "rtp_jpeg_stereo",
+        "image_shape": [544, 1280],
         "binocular": True,
         "enable_zmq": True,
         "zmq_port": 55555,
         "enable_webrtc": True,
         "webrtc_port": 60001,
-        "left_rtp_port": 5002,
-        "right_rtp_port": 5003,
+        "left_rtp_port": 5004,
+        "right_rtp_port": 5005,
+        "external_publisher": True,
     }
     for name, value in expected.items():
         if head.get(name) != value:
@@ -353,7 +354,7 @@ def check_streams():
                 raise RuntimeError("camera configuration timed out; check 60000 forwarding and r1-teleimager")
             camera_config = unwrap_camera_config(request.recv_json())
             validate_camera_config(camera_config)
-            print("[OK] stereo camera configuration (1088x448, RTP 5002/5003)", flush=True)
+            print("[OK] stereo camera configuration (1280x544, RTP 5004/5005)", flush=True)
             check_camera_clock(request)
         wrist = wrist_topics(camera_config)
         if wrist:
@@ -369,7 +370,7 @@ def check_streams():
             STEREO_JPEG_LABEL: StreamWindow(0.5),
         }
         # (label, port, expected shape) for every JPEG feed the XR scene consumes.
-        jpeg_feeds = [(STEREO_JPEG_LABEL, 55555, (448, 1088, 3))]
+        jpeg_feeds = [(STEREO_JPEG_LABEL, 55555, (544, 1280, 3))]
         for topic, zmq_port, _ in wrist:
             if (camera_config.get(topic) or {}).get("enable_zmq"):
                 label = f"{topic.removesuffix('_camera').replace('_', ' ')} JPEG (192.168.110.20:{zmq_port})"
@@ -461,6 +462,12 @@ def main():
         try:
             https_probe(context, 60001, "head stereo")
             print("[OK] verified WebRTC HTTPS for the head stereo plane", flush=True)
+            try:
+                https_probe(context, 60004, "Vision Pro head video")
+                print("[OK] verified WebRTC HTTPS for the Vision Pro head video", flush=True)
+            except RuntimeError as error:
+                print(f"[WARN] {error}; the Vision Pro first-person view will have no picture until "
+                      "r1-head-hd and its gateway are running", flush=True)
         except RuntimeError as error:
             if STEREO_JPEG_LABEL in healthy:
                 print(f"[WARN] {error}; the head image still arrives over ZMQ, so only the "

@@ -57,7 +57,7 @@ SQUARE = 0.030
 EXPECTED = inner_corner_count(PATTERN)
 
 
-def checkerboard_bgr(width=544, height=448, pattern=PATTERN, square_px=40, margin=32):
+def checkerboard_bgr(width=640, height=544, pattern=PATTERN, square_px=40, margin=32):
     image = np.full((height, width, 3), 240, dtype=np.uint8)
     cols, rows = pattern
     for row in range(rows + 1):
@@ -177,12 +177,12 @@ def synthetic_detected_pairs(count, baseline=0.060, seed=0, image_size=HEAD_EYE_
 
 class SplitAndDetectTests(unittest.TestCase):
     def test_split_is_hard_544_not_half_of_something_else(self):
-        frame = np.zeros((448, 1088, 3), dtype=np.uint8)
-        frame[:, :544] = (0, 0, 255)
-        frame[:, 544:] = (0, 255, 0)
+        frame = np.zeros((544, 1280, 3), dtype=np.uint8)
+        frame[:, :640] = (0, 0, 255)
+        frame[:, 640:] = (0, 255, 0)
         left, right = split_head_stereo(frame)
-        self.assertEqual(left.shape, (448, 544, 3))
-        self.assertEqual(right.shape, (448, 544, 3))
+        self.assertEqual(left.shape, (544, 640, 3))
+        self.assertEqual(right.shape, (544, 640, 3))
         self.assertTrue(np.all(left[:, :, 2] == 255))
         self.assertTrue(np.all(right[:, :, 1] == 255))
 
@@ -197,7 +197,7 @@ class SplitAndDetectTests(unittest.TestCase):
         self.assertEqual(len(corners), EXPECTED)
 
     def test_detect_corners_rejects_blank(self):
-        ok, corners = detect_corners(np.full((448, 544, 3), 180, dtype=np.uint8), PATTERN)
+        ok, corners = detect_corners(np.full((544, 640, 3), 180, dtype=np.uint8), PATTERN)
         self.assertFalse(ok)
         self.assertIsNone(corners)
 
@@ -212,7 +212,7 @@ class CaptureLoopTests(unittest.TestCase):
         self.left.mkdir()
         self.right.mkdir()
         self.board = checkerboard_bgr()
-        self.blank = np.full((448, 544, 3), 40, dtype=np.uint8)
+        self.blank = np.full((544, 640, 3), 40, dtype=np.uint8)
 
     def test_saves_only_when_both_eyes_have_54_corners(self):
         frames = [
@@ -232,8 +232,8 @@ class CaptureLoopTests(unittest.TestCase):
         self.assertTrue((self.right / "000.png").is_file())
         left = cv2.imread(str(self.left / "000.png"))
         right = cv2.imread(str(self.right / "000.png"))
-        self.assertEqual(left.shape, (448, 544, 3))
-        self.assertEqual(right.shape, (448, 544, 3))
+        self.assertEqual(left.shape, (544, 640, 3))
+        self.assertEqual(right.shape, (544, 640, 3))
 
     def test_space_on_single_eye_does_not_write(self):
         saved = run_capture_loop(
@@ -356,7 +356,7 @@ class HoldoutAndQualityTests(unittest.TestCase):
 
     def test_quality_rejects_too_few_pairs_and_insane_baseline(self):
         result = FitResult(
-            n_usable=12, n_train=8, n_holdout=4, image_size=(544, 448),
+            n_usable=12, n_train=8, n_holdout=4, image_size=(640, 544),
             pattern=(9, 6), square=0.030,
             K_left=np.eye(3), D_left=np.zeros((4, 1)),
             K_right=np.eye(3), D_right=np.zeros((4, 1)),
@@ -371,7 +371,7 @@ class HoldoutAndQualityTests(unittest.TestCase):
 
     def test_quality_rejects_high_rms(self):
         result = FitResult(
-            n_usable=40, n_train=30, n_holdout=10, image_size=(544, 448),
+            n_usable=40, n_train=30, n_holdout=10, image_size=(640, 544),
             pattern=(9, 6), square=0.030,
             K_left=np.eye(3), D_left=np.zeros((4, 1)),
             K_right=np.eye(3), D_right=np.zeros((4, 1)),
@@ -387,7 +387,7 @@ class HoldoutAndQualityTests(unittest.TestCase):
 class FitAndSchemaTests(unittest.TestCase):
     def test_head_only_json_passes_the_production_loader(self):
         result = FitResult(
-            n_usable=40, n_train=30, n_holdout=10, image_size=(544, 448),
+            n_usable=40, n_train=30, n_holdout=10, image_size=(640, 544),
             pattern=(9, 6), square=0.030,
             K_left=np.array([[180.0, 0.0, 272.0], [0.0, 180.0, 224.0], [0.0, 0.0, 1.0]]),
             D_left=np.array([0.01, -0.02, 0.0, 0.0]),
@@ -449,7 +449,7 @@ class FitAndSchemaTests(unittest.TestCase):
             left.mkdir()
             right.mkdir()
             board = checkerboard_bgr()
-            blank = np.full((448, 544, 3), 80, dtype=np.uint8)
+            blank = np.full((544, 640, 3), 80, dtype=np.uint8)
             cv2.imwrite(str(left / "000.png"), board)
             cv2.imwrite(str(right / "000.png"), board)
             cv2.imwrite(str(left / "001.png"), board)
@@ -504,12 +504,12 @@ class FitAndSchemaTests(unittest.TestCase):
         self.assertEqual(args.holdout, 10)
 
     def test_initial_K_is_never_identity_or_zero(self):
-        K = _initial_K((544, 448))
+        K = _initial_K((640, 544))
         self.assertGreater(K[0, 0], 50.0)
         self.assertGreater(K[1, 1], 50.0)
-        self.assertAlmostEqual(K[0, 0], 0.9 * 448.0)
-        self.assertAlmostEqual(K[0, 2], 272.0)
-        self.assertAlmostEqual(K[1, 2], 224.0)
+        self.assertAlmostEqual(K[0, 0], 0.9 * 544.0)
+        self.assertAlmostEqual(K[0, 2], 320.0)
+        self.assertAlmostEqual(K[1, 2], 272.0)
         self.assertNotAlmostEqual(K[0, 0], 1.0)
         self.assertNotAlmostEqual(K[1, 1], 1.0)
         self.assertGreater(abs(K[0, 0]), 1.0)

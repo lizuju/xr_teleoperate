@@ -20,7 +20,7 @@ import numpy as np
 from teleop.utils.frame_sync import feedback_target_ns
 
 
-IMAGE_HW = (240, 320)
+IMAGE_HW = (544, 640)
 GROUP_SLICES = {"left_arm": slice(0, 7), "right_arm": slice(7, 14), "left_ee": slice(14, 20),
                 "right_ee": slice(20, 26), "body": slice(26, 29)}
 ACTION_DIM = 29

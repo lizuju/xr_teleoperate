@@ -1,7 +1,7 @@
 {
   "schema": "r1_camera_calibration_v1",
-  "created": "2026-09-22",
-  "note": "DFOPTIX A3 10x7 squares, OpenCV (9,6) inner, 0.030 m; head fisheye @ 544x448; head stereo preserved; left_wrist, right_wrist plumb_bob @ 640x480; hand_eye eye-in-hand (wrist\u2192wrist_yaw_link solved after H-unmirror; image_mirror=horizontal \u2014 use prepare_image_for_hand_eye / project_link_points_to_pixels on raw wrist JPEGs; head\u2192head_yaw_link, no mirror)",
+  "created": "2026-11-02",
+  "note": "head fisheye @ 640x544 from raw 5004/5005 at half size, fitted to the factory calibration in cam_param.txt; head stereo from the same file; head hand_eye unchanged from 2026-09-22, measured on the old 544x448 stream, recalibrate before relying on head TF; head stereo preserved; left_wrist, right_wrist plumb_bob @ 640x480; hand_eye eye-in-hand (wrist\u2192wrist_yaw_link solved after H-unmirror; image_mirror=horizontal \u2014 use prepare_image_for_hand_eye / project_link_points_to_pixels on raw wrist JPEGs; head\u2192head_yaw_link, no mirror)",
   "board": {
     "type": "checkerboard",
     "squares_x": 9,
@@ -11,19 +11,19 @@
   "cameras": {
     "head_left": {
       "image_size": [
-        544,
-        448
+        640,
+        544
       ],
       "camera_matrix": [
         [
-          131.59077275956216,
+          246.2135,
           0.0,
-          287.47891790220876
+          320.31
         ],
         [
           0.0,
-          130.56138382333265,
-          214.51650864149352
+          246.5735,
+          269.958
         ],
         [
           0.0,
@@ -33,28 +33,27 @@
       ],
       "distortion_model": "fisheye",
       "distortion_coefficients": [
-        0.24853825742990737,
-        0.3493581787778408,
-        0.0,
-        0.0
-      ],
-      "reprojection_error_px": 0.25448897397242376
+        -0.05033964472017,
+        0.2589407501698244,
+        -0.3147005001411777,
+        0.11329075274989103
+      ]
     },
     "head_right": {
       "image_size": [
-        544,
-        448
+        640,
+        544
       ],
       "camera_matrix": [
         [
-          131.90623141817346,
+          247.2345,
           0.0,
-          286.6888500027994
+          321.894
         ],
         [
           0.0,
-          131.06505181678398,
-          215.0569562550653
+          247.502,
+          264.242
         ],
         [
           0.0,
@@ -64,12 +63,11 @@
       ],
       "distortion_model": "fisheye",
       "distortion_coefficients": [
-        0.24794721041618614,
-        0.34622909807519897,
-        0.0,
-        0.0
-      ],
-      "reprojection_error_px": 0.23963769038618782
+        -0.03068228756716949,
+        0.193649635516985,
+        -0.26233922969686013,
+        0.10835335138081977
+      ]
     },
     "left_wrist": {
       "image_size": [
@@ -144,28 +142,27 @@
       "right": "head_right",
       "rotation": [
         [
-          0.9996773332443791,
-          -0.00249302444127719,
-          0.025278730714616577
+          0.999999,
+          0.00122443,
+          0.00117381
         ],
         [
-          0.00240123548005804,
-          0.999990416333645,
-          0.0036607798394328816
+          -0.00122391,
+          0.999999,
+          -0.000442841
         ],
         [
-          -0.025287614865309366,
-          -0.003598898442396321,
-          0.9996737390090955
+          -0.00117435,
+          0.000441404,
+          0.999999
         ]
       ],
       "translation_m": [
-        -0.05908939414006427,
-        -9.615232560739953e-05,
-        0.0008693596736777319
+        -0.060282078721383234,
+        -0.00021719428363047195,
+        0.00029667138741832526
       ],
-      "baseline_m": 0.05909586729503002,
-      "epipolar_error_px": 0.2804857951612574
+      "baseline_m": 0.0602832
     }
   },
   "hand_eye": {

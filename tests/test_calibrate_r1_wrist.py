@@ -123,18 +123,18 @@ def head_document():
     return {
         "schema": "r1_camera_calibration_v1",
         "created": "2026-09-20",
-        "note": "DFOPTIX A3 10x7 squares, OpenCV (9,6) inner, 0.030 m; head fisheye @ 544x448; head stereo only this pass (wrists not included)",
+        "note": "DFOPTIX A3 10x7 squares, OpenCV (9,6) inner, 0.030 m; head fisheye @ 640x544; head stereo only this pass (wrists not included)",
         "board": {"type": "checkerboard", "squares_x": 9, "squares_y": 6, "square_size_m": 0.030},
         "cameras": {
             "head_left": {
-                "image_size": [544, 448],
+                "image_size": [640, 544],
                 "camera_matrix": [[131.59, 0.0, 287.48], [0.0, 130.56, 214.52], [0.0, 0.0, 1.0]],
                 "distortion_model": "fisheye",
                 "distortion_coefficients": [0.2485, 0.3494, 0.0, 0.0],
                 "reprojection_error_px": 0.2545,
             },
             "head_right": {
-                "image_size": [544, 448],
+                "image_size": [640, 544],
                 "camera_matrix": [[131.91, 0.0, 286.69], [0.0, 131.07, 215.06], [0.0, 0.0, 1.0]],
                 "distortion_model": "fisheye",
                 "distortion_coefficients": [0.2479, 0.3462, 0.0, 0.0],
@@ -209,10 +209,10 @@ class DetectAndShapeTests(unittest.TestCase):
         self.assertEqual(out.shape, (480, 640, 3))
 
     def test_wrong_frame_size_is_rejected(self):
-        with self.assertRaisesRegex(FrameShapeError, "1088x448"):
-            require_wrist_frame(np.zeros((448, 1088, 3), dtype=np.uint8))
-        with self.assertRaisesRegex(FrameShapeError, "544x448"):
-            require_wrist_frame(np.zeros((448, 544, 3), dtype=np.uint8))
+        with self.assertRaisesRegex(FrameShapeError, "1280x544"):
+            require_wrist_frame(np.zeros((544, 1280, 3), dtype=np.uint8))
+        with self.assertRaisesRegex(FrameShapeError, "640x544"):
+            require_wrist_frame(np.zeros((544, 640, 3), dtype=np.uint8))
 
     def test_detect_corners_finds_54_on_a_synthetic_board(self):
         image = checkerboard_bgr()
@@ -373,7 +373,7 @@ class HoldoutAndQualityTests(unittest.TestCase):
         self.assertTrue(any("train RMS" in item for item in errors))
 
     def test_quality_rejects_wrong_image_size(self):
-        errors = quality_errors(self._result(image_size=(544, 448)))
+        errors = quality_errors(self._result(image_size=(640, 544)))
         self.assertTrue(any("image_size" in item for item in errors))
 
 

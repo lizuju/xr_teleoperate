@@ -61,6 +61,7 @@ def dataset_info(root, metadata, train_loader, val_loader):
             "manifest_sha256": hashlib.sha256((Path(root) / "dataset.json").read_bytes()).hexdigest(),
             "fps": metadata["fps"], "task": metadata.get("task"), "joint_names": metadata["joint_names"],
             "camera_names": metadata["camera_names"], "image_size_hw": metadata["image_size_hw"],
+            "source_image_sizes": metadata.get("source_image_sizes"),
             "train_frames": len(train_loader.dataset), "val_frames": 0 if val_loader is None else len(val_loader.dataset),
             "independent_validation": val_loader is not None}
 

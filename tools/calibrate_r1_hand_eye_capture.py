@@ -64,8 +64,8 @@ try:
         split_head_stereo,
     )
 except ImportError:  # pragma: no cover
-    HEAD_FRAME_SIZE = (1088, 448)
-    HEAD_SPLIT_X = 544
+    HEAD_FRAME_SIZE = (1280, 544)
+    HEAD_SPLIT_X = 640
 
     def split_head_stereo(frame, split_x=HEAD_SPLIT_X, expected_size=HEAD_FRAME_SIZE):
         height, width = frame.shape[:2]

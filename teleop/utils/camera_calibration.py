@@ -24,7 +24,7 @@ CALIBRATION_SCHEMA = "r1_camera_calibration_v1"
 DEFAULT_CALIBRATION_RELPATH = Path("assets/r1/camera_calibration.json")
 
 # colour key -> camera name. color_0/color_1 are the head stereo pair (the
-# 1088-wide frame split into two 544 halves); color_2/color_3 are the palm
+# 1280-wide frame split into two 640 halves); color_2/color_3 are the palm
 # cameras. The mapping is fixed, so a key always names the same camera no
 # matter which subset of cameras a given run happens to record. This matches
 # the long-standing upstream mapping in the non-R1_A7 recording path.

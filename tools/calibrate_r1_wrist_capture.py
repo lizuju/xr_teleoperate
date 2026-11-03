@@ -78,10 +78,10 @@ def require_wrist_frame(frame, expected_size=WRIST_FRAME_SIZE):
             "Use ZMQ 55556 topic left_wrist_camera or 55557 topic right_wrist_camera; "
             "do not use head 55555 or WebRTC 60002/60003."
         )
-        if width == 1088 and height == 448:
+        if width == 1280 and height == 544:
             hint = "this looks like concatenated head stereo (55555), not a wrist camera. " + hint
-        elif width == 544 and height == 448:
-            hint = "this looks like one head eye (544x448), not a wrist camera. " + hint
+        elif width == 640 and height == 544:
+            hint = "this looks like one head eye (640x544), not a wrist camera. " + hint
         raise FrameShapeError(
             f"wrist frame is {width}x{height}, expected {expected_width}x{expected_height}. {hint}"
         )
