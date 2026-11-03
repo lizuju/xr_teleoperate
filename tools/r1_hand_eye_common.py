@@ -73,9 +73,9 @@ TARGETS = {
         "port": 55555,
         "topic": "head_camera",
         "service": "r1-camera-forward-55555.service",
-        "image_size": (544, 448),
+        "image_size": (640, 544),
         "distortion_model": "fisheye",
-        "stereo_frame_size": (1088, 448),
+        "stereo_frame_size": (1280, 544),
         "also_camera": "head_right",
     },
 }

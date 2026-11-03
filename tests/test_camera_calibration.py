@@ -33,8 +33,8 @@ def document():
         "created": "2026-09-15",
         "board": {"type": "checkerboard", "squares_x": 9, "squares_y": 6, "square_size_m": 0.030},
         "cameras": {
-            "head_left": camera(544, 448),
-            "head_right": camera(544, 448),
+            "head_left": camera(640, 544),
+            "head_right": camera(640, 544),
             "left_wrist": camera(640, 480, fx=400.0),
             "right_wrist": camera(640, 480, fx=400.0),
         },
@@ -74,7 +74,7 @@ class CalibrationFileTest(unittest.TestCase):
         self.assertEqual(len(calibration["sha256"]), 64)
         self.assertEqual(sorted(calibration["cameras"]), ["head_left", "head_right",
                                                           "left_wrist", "right_wrist"])
-        self.assertEqual(calibration["cameras"]["head_left"]["image_size"], [544, 448])
+        self.assertEqual(calibration["cameras"]["head_left"]["image_size"], [640, 544])
         self.assertEqual(calibration["board"]["square_size_m"], 0.030)
         self.assertEqual(calibration["stereo"]["head"]["baseline_m"], 0.06)
         self.assertEqual(calibration["hand_eye"]["left_wrist"]["frame"], "left_wrist_yaw_link")
@@ -106,7 +106,7 @@ class CalibrationFileTest(unittest.TestCase):
 
     def test_image_size_is_checked(self):
         broken = document()
-        broken["cameras"]["head_left"]["image_size"] = [544.5, 448]
+        broken["cameras"]["head_left"]["image_size"] = [640.5, 544]
         self.assertRejected(broken, "positive integer width and height")
 
     def test_distortion_model_is_checked(self):
@@ -317,7 +317,7 @@ class CalibrationMetadataTest(unittest.TestCase):
     def test_full_coverage_reports_calibrated(self):
         block = camera_calibration_metadata(
             self.calibration(), ["head_left", "head_right", "left_wrist", "right_wrist"],
-            {"head_left": (544, 448), "head_right": (544, 448),
+            {"head_left": (640, 544), "head_right": (640, 544),
              "left_wrist": (640, 480), "right_wrist": (640, 480)})
         self.assertEqual(block["status"], "calibrated")
         self.assertEqual(block["missing_cameras"], [])

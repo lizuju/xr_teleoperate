@@ -182,7 +182,7 @@ class KnewAndCliTests(unittest.TestCase):
         self.assertEqual(knew[0, 0], 132.0)
 
     def test_undistort_image_rejects_none_knew(self):
-        image = np.full((448, 544, 3), 180, dtype=np.uint8)
+        image = np.full((544, 640, 3), 180, dtype=np.uint8)
         K = np.array([[132.0, 0.0, 272.0], [0.0, 132.0, 224.0], [0.0, 0.0, 1.0]])
         D = np.array([[0.25], [0.35], [0.0], [0.0]])
         with self.assertRaises(RangeError) as ctx:
@@ -191,7 +191,7 @@ class KnewAndCliTests(unittest.TestCase):
         self.assertIn("Knew", str(ctx.exception))
 
     def test_opencv_undistort_image_knew_none_goes_black(self):
-        image = np.zeros((448, 544, 3), dtype=np.uint8)
+        image = np.zeros((544, 640, 3), dtype=np.uint8)
         image[:] = (40, 90, 180)
         image[174:274, 222:322] = 255
         K = np.array([[132.0, 0.0, 272.0], [0.0, 132.0, 224.0], [0.0, 0.0, 1.0]], dtype=np.float64)
@@ -250,7 +250,7 @@ class GeometryLoadTests(unittest.TestCase):
             self.assertIsNotNone(geometry.Knew_left)
             self.assertTrue(np.allclose(geometry.Knew_left, geometry.K_left))
             self.assertAlmostEqual(geometry.baseline_m, 0.0591, places=4)
-            self.assertEqual(geometry.image_size, (544, 448))
+            self.assertEqual(geometry.image_size, (640, 544))
             self.assertAlmostEqual(geometry.K_left[0, 0], 131.59, places=2)
 
     def test_load_rejects_missing_stereo_and_wrong_model(self):
@@ -290,8 +290,8 @@ class TriangulationTests(unittest.TestCase):
 
     def test_synthetic_board_at_half_metre_recovers_median_z(self):
         left, right = project_stereo_board(self.geometry, z_m=0.50)
-        self.assertTrue(in_image(left, 544, 448))
-        self.assertTrue(in_image(right, 544, 448))
+        self.assertTrue(in_image(left, 640, 544))
+        self.assertTrue(in_image(right, 640, 544))
         reading = triangulate_corners(left, right, self.geometry, pattern=PATTERN, tape=0.50)
         self.assertAlmostEqual(reading.z_med_m, 0.50, delta=0.005)
         self.assertAlmostEqual(reading.mid_plane_m, 0.50, delta=0.008)
@@ -389,7 +389,7 @@ class RangeLoopTests(unittest.TestCase):
         self.geometry = load_head_stereo_geometry(
             write_calib(self.temporary.name, head_document(fx=132.0, baseline=0.0591)))
         self.left_pts, self.right_pts = project_stereo_board(self.geometry, z_m=0.50)
-        self.blank = np.full((448, 544, 3), 40, dtype=np.uint8)
+        self.blank = np.full((544, 640, 3), 40, dtype=np.uint8)
 
     def test_space_snapshots_median_z_and_q_quits(self):
         detect = ScriptedDetect(self.left_pts, self.right_pts)
@@ -421,10 +421,10 @@ class RangeLoopTests(unittest.TestCase):
         self.assertTrue(any("not snapped" in str(item) for item in messages))
 
     def test_split_layout_matches_live_jpeg(self):
-        left = np.full((448, 544, 3), 10, dtype=np.uint8)
-        right = np.full((448, 544, 3), 200, dtype=np.uint8)
+        left = np.full((544, 640, 3), 10, dtype=np.uint8)
+        right = np.full((544, 640, 3), 200, dtype=np.uint8)
         split_left, split_right = split_head_stereo(stereo_frame(left, right))
-        self.assertEqual(split_left.shape, (448, 544, 3))
+        self.assertEqual(split_left.shape, (544, 640, 3))
         self.assertEqual(int(split_left[0, 0, 0]), 10)
         self.assertEqual(int(split_right[0, 0, 0]), 200)
 

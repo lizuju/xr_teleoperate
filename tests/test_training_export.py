@@ -261,7 +261,7 @@ class TrainingExportTests(unittest.TestCase):
             np.testing.assert_array_equal(h["observations/images/head_left"][0, 0, 0], [200, 60, 20])
         loader = R1ACTDataset(self.output, chunk_size=4)
         images, qpos, actions, padding = loader[6]
-        self.assertEqual(tuple(images.shape), (4, 3, 240, 320))
+        self.assertEqual(tuple(images.shape), (4, 3, 544, 640))
         self.assertEqual(tuple(qpos.shape), (29,))
         self.assertEqual(padding.tolist(), [False, False, True, True])
         recovered = actions[0].numpy() * loader.stats["action_std"] + loader.stats["action_mean"]

@@ -25,9 +25,9 @@ from tools.check_r1_teleop import (
 
 
 HEAD_CAMERA = {
-    "type": "rtp_h264_stereo", "image_shape": [448, 1088], "binocular": True,
+    "type": "rtp_jpeg_stereo", "image_shape": [544, 1280], "binocular": True,
     "enable_zmq": True, "zmq_port": 55555, "enable_webrtc": True,
-    "webrtc_port": 60001, "left_rtp_port": 5002, "right_rtp_port": 5003,
+    "webrtc_port": 60001, "left_rtp_port": 5004, "right_rtp_port": 5005, "external_publisher": True,
 }
 
 
@@ -87,16 +87,16 @@ class FeedbackValidationTest(unittest.TestCase):
 
     def test_monocular_or_wrong_size_config_cannot_pass(self):
         head = {
-            "type": "rtp_h264_stereo", "image_shape": [448, 1088], "binocular": True,
+            "type": "rtp_jpeg_stereo", "image_shape": [544, 1280], "binocular": True,
             "enable_zmq": True, "zmq_port": 55555, "enable_webrtc": True,
-            "webrtc_port": 60001, "left_rtp_port": 5002, "right_rtp_port": 5003,
+            "webrtc_port": 60001, "left_rtp_port": 5004, "right_rtp_port": 5005, "external_publisher": True,
         }
         validate_camera_config({"head_camera": head})
         head["binocular"] = False
         with self.assertRaisesRegex(ValueError, "binocular"):
             validate_camera_config({"head_camera": head})
         head["binocular"] = True
-        head["image_shape"] = [448, 544]
+        head["image_shape"] = [544, 640]
         with self.assertRaisesRegex(ValueError, "image_shape"):
             validate_camera_config({"head_camera": head})
 

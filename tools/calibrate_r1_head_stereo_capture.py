@@ -2,7 +2,7 @@
 """Capture paired head-stereo chessboard frames for R1 fisheye calibration.
 
 Reads ZMQ ``head_camera`` (default 192.168.110.20:55555) via TeleImageClient,
-splits one 1088x448 frame into left [:, :544] and right [:, 544:], and writes a
+splits one 1280x544 frame into left [:, :640] and right [:, 640:], and writes a
 pair only when BOTH eyes have 54 inner corners and the board has been held
 still. Does not start teleoperation, does not command the robot, and does not
 touch wrist cameras or WebRTC 60002/60003.
@@ -28,9 +28,9 @@ DEFAULT_TOPIC = "head_camera"
 DEFAULT_PATTERN = (9, 6)
 DEFAULT_SQUARE_M = 0.030
 DEFAULT_OUT_ROOT = Path("~/r1-cam-calib")
-HEAD_FRAME_SIZE = (1088, 448)  # width, height of the concatenated stereo JPEG
-HEAD_SPLIT_X = 544
-HEAD_EYE_SIZE = (544, 448)
+HEAD_FRAME_SIZE = (1280, 544)  # width, height of the concatenated stereo JPEG
+HEAD_SPLIT_X = 640
+HEAD_EYE_SIZE = (640, 544)
 WINDOW_NAME = "head_stereo"
 QUIT_NOTE = "q is NOT e-stop; capture stopped. The robot was not commanded."
 
@@ -40,7 +40,7 @@ class CaptureError(RuntimeError):
 
 
 class FrameShapeError(CaptureError):
-    """Raised when the ZMQ frame is not the 1088x448 head stereo layout."""
+    """Raised when the ZMQ frame is not the 1280x544 head stereo layout."""
 
 
 def inner_corner_count(pattern):
@@ -48,7 +48,7 @@ def inner_corner_count(pattern):
 
 
 def split_head_stereo(frame, split_x=HEAD_SPLIT_X, expected_size=HEAD_FRAME_SIZE):
-    """Split one concatenated head frame into left and right 544x448 images."""
+    """Split one concatenated head frame into left and right 640x544 images."""
     if frame is None:
         raise FrameShapeError("no head stereo frame")
     if getattr(frame, "ndim", 0) != 3:

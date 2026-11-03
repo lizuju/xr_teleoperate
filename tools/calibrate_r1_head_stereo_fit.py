@@ -62,7 +62,7 @@ MIN_FOCAL_PX = 40.0
 MAX_FOCAL_PX = 2000.0
 DEFAULT_NOTE = (
     "DFOPTIX A3 10x7 squares, OpenCV (9,6) inner, 0.030 m; "
-    "head fisheye @ 544x448; head stereo only this pass (wrists not included)"
+    "head fisheye @ 640x544; head stereo only this pass (wrists not included)"
 )
 
 

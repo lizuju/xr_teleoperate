@@ -216,6 +216,15 @@ def check_policy_metadata(meta):
         raise RuntimeError(f"Unexpected policy cameras: {dataset['camera_names']}")
 
 
+def check_policy_cameras(dataset, camera_config):
+    """A policy is only valid on the head images it trained on."""
+    height, width = camera_config["head_camera"]["image_shape"]
+    trained = dataset.get("source_image_sizes", {}).get("color_0")
+    if trained != [width // 2, height]:
+        raise RuntimeError(f"Policy trained on head eye size {trained}, but the stream is "
+                           f"{[width // 2, height]}. Export and train again from recordings of this stream.")
+
+
 def main(argv=None):
     args = parse_args(argv)
     if not args.checkpoint.is_file():
@@ -256,6 +265,7 @@ def main(argv=None):
         hand = LinkerO6Controller()
         hand.wait_until_ready(timeout=3.0)
         img_client = TeleImagerCameraClient(server_host=args.img_server_ip, request_bgr=True)
+        check_policy_cameras(meta["dataset"], img_client.get_cam_config())
 
         def cameras():
             return img_client.get_head_frame(), {"left": correct_palm_frame(img_client.get_left_wrist_frame()),
@@ -264,7 +274,7 @@ def main(argv=None):
         sync = CameraSynchronizer(["head", "left_wrist", "right_wrist"], anchor="head")
         guard = PolicyGuard(meta["normalization"], max_tracking_error=args.max_tracking_error,
                             max_chunk_age_s=args.max_chunk_age)
-        run = PolicyRun(arm, hand, cameras, client, ObservationBuilder(arm, hand, sync),
+        run = PolicyRun(arm, hand, cameras, client, ObservationBuilder(arm, hand, sync, image_hw=tuple(meta["dataset"]["image_size_hw"])),
                         ActionEnsemble(client.chunk_size, args.ensemble_k), guard, log_dir / "ticks.jsonl")
         stop = [False]
         started = threading.Event()

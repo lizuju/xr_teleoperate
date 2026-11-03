@@ -24,7 +24,7 @@ def color_image_specs(camera_config):
     `color_0`/`color_1` are the two halves of the head stereo frame and
     `color_2`/`color_3` the palm cameras, matching the long-standing upstream
     mapping. The per-key sizes matter because the streams no longer share one
-    resolution: a head half is 544x448 while a wrist frame is 640x480.
+    resolution: a head half is 640x544 while a wrist frame is 640x480.
     """
     head = camera_config.get("head_camera") or {}
     height, width = head.get("image_shape") or [480, 640]
