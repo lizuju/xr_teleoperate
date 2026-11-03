@@ -1,7 +1,7 @@
 """Publish the raw head cameras for recording, training and the Vision Pro.
 
 The only receiver of UDP 5004/5005. ZMQ JPEG at half the raw size feeds recording and
-policies; WebRTC at 0.75 of it feeds the headset. A separate process from r1-teleimager
+policies; WebRTC at the full raw size feeds the headset. A separate process from r1-teleimager
 on purpose: a head camera fault here does not stop the wrist cameras. The app undistorts
 and rectifies on its GPU from head-optics.json, whose image_size must match
 VIEWER_EYE_SCALE. The roster on port 60000 is still served by r1-teleimager.
@@ -29,18 +29,18 @@ ZMQ_PORT = 55555
 # 60004 for the app; 60001 for the older Safari view and the preflight check.
 WEBRTC_PORTS = (60001, 60004)
 JPEG_QUALITY = 90
-# Scaled by the JPEG decoder: 1280x1088 becomes 640x544 and 960x816. The recording image
+# Scaled by the JPEG decoder: 1280x1088 becomes 640x544 for recording. The recording image
 # must not depend on whether a headset is watching, or a policy would see different
 # pixels from the ones it trained on, so it is always decoded on its own.
 RECORDING_EYE_SCALE = (1, 2)
-VIEWER_EYE_SCALE = (3, 4)
-ENCODER_THREADS = 2
+VIEWER_EYE_SCALE = (1, 1)
+ENCODER_THREADS = 3
 # Only the headset stream crosses Wi-Fi, so only it is thinned. Recording keeps every frame.
 VIEWER_FPS = 30
 GOP_LENGTH = 2 * VIEWER_FPS
 # Fixed on purpose: the receiver's bandwidth estimate starts low and can pin this
 # stream near its minimum on a link that carries it fine. Lower it for a weak network.
-BITRATE_BPS = 10_000_000
+BITRATE_BPS = 15_000_000
 # Half a 30 fps frame period: anything further apart is a different frame pair.
 MAX_PAIR_SKEW_S = 0.017
 HEADER = struct.Struct("!4sBdI")

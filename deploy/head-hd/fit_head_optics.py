@@ -17,9 +17,10 @@ import numpy as np
 
 CAM_PARAM_URL = "http://192.168.123.161:9080/cam_param.txt"
 RAW_SIZE = (1280, 1088)
-EYE_SIZE = (960, 816)
+EYE_SIZE = RAW_SIZE
 RENDER_SIZE = (1280, 1088)
-SCALE = EYE_SIZE[0] / RAW_SIZE[0]
+# The pitch and roll fit stays at this size, so a new stream size does not move the rectification.
+REFINE_SIZE = (960, 816)
 MAX_FIT_RADIUS_PX = 760  # Beyond the lens circle there is no image.
 REFINE_STEPS = 3
 
@@ -51,12 +52,13 @@ def fit_fisheye(eye):
     return coefficients
 
 
-def scaled_matrix(matrix):
+def scaled_matrix(matrix, size):
+    scale = size[0] / RAW_SIZE[0]
     matrix = matrix.copy()
-    matrix[0, 0] *= SCALE
-    matrix[1, 1] *= SCALE
-    matrix[0, 2] = (matrix[0, 2] + 0.5) * SCALE - 0.5
-    matrix[1, 2] = (matrix[1, 2] + 0.5) * SCALE - 0.5
+    matrix[0, 0] *= scale
+    matrix[1, 1] *= scale
+    matrix[0, 2] = (matrix[0, 2] + 0.5) * scale - 0.5
+    matrix[1, 2] = (matrix[1, 2] + 0.5) * scale - 0.5
     return matrix
 
 
@@ -83,7 +85,7 @@ def load_eye(path):
     # A frame saved straight from rtpjpegdepay has a generated header before the real JPEG.
     start = data.find(b"\xff\xd8", 2)
     image = cv2.imdecode(np.frombuffer(data[start:] if start > 0 else data, np.uint8), cv2.IMREAD_COLOR)
-    return cv2.resize(image, EYE_SIZE, interpolation=cv2.INTER_AREA)
+    return cv2.resize(image, REFINE_SIZE, interpolation=cv2.INTER_AREA)
 
 
 def vertical_errors(left, right, focal):
@@ -142,13 +144,15 @@ def main():
         "head_calibrated_at": "factory EEPROM, read 2026-11-02", "baseline_m": baseline_m,
         "pixel_convention": "OpenCV integer coordinates are pixel centres; normalized texture UV=(pixel+0.5)/size",
         "rectification_rotation_convention": "raw optical ray to rectified optical ray; inverse sampling uses transpose",
-        "source_image_geometry": "1920x816 SBS from raw 1280x1088 RTP JPEG 5004/5005 scaled by 0.75; left then right; fisheye coefficients fitted to the factory rational model",
-        "left": {"camera_matrix": scaled_matrix(left_matrix).tolist(), "distortion_coefficients": fit_fisheye(left_eye).tolist(),
+        "source_image_geometry": "2560x1088 SBS from raw 1280x1088 RTP JPEG 5004/5005 at full size; left then right; fisheye coefficients fitted to the factory rational model",
+        "left": {"camera_matrix": scaled_matrix(left_matrix, REFINE_SIZE).tolist(), "distortion_coefficients": fit_fisheye(left_eye).tolist(),
                  "rectification_rotation": left_rectify.tolist()},
-        "right": {"camera_matrix": scaled_matrix(right_matrix).tolist(), "distortion_coefficients": fit_fisheye(right_eye).tolist(),
+        "right": {"camera_matrix": scaled_matrix(right_matrix, REFINE_SIZE).tolist(), "distortion_coefficients": fit_fisheye(right_eye).tolist(),
                   "rectification_rotation": right_rectify.tolist()},
     }
     refine(profile, load_eye(args.left), load_eye(args.right))
+    profile["left"]["camera_matrix"] = scaled_matrix(left_matrix, EYE_SIZE).tolist()
+    profile["right"]["camera_matrix"] = scaled_matrix(right_matrix, EYE_SIZE).tolist()
     profile["rectification_note"] = "factory R and T, then pitch and roll refined from ORB matches on one static scene"
     with open(args.output, "w") as output:
         json.dump(profile, output, indent=2)
