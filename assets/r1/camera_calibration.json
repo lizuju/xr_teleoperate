@@ -1,7 +1,7 @@
 {
   "schema": "r1_camera_calibration_v1",
   "created": "2026-11-02",
-  "note": "head fisheye @ 640x544 from raw 5004/5005 at half size, fitted to the factory calibration in cam_param.txt; head stereo from the same file; head hand_eye unchanged from 2026-09-22, measured on the old 544x448 stream, recalibrate before relying on head TF; head stereo preserved; left_wrist, right_wrist plumb_bob @ 640x480; hand_eye eye-in-hand (wrist\u2192wrist_yaw_link solved after H-unmirror; image_mirror=horizontal \u2014 use prepare_image_for_hand_eye / project_link_points_to_pixels on raw wrist JPEGs; head\u2192head_yaw_link, no mirror)",
+  "note": "head fisheye @ 640x544 from raw 5004/5005 at half size, fitted to the factory calibration in cam_param.txt; head stereo from the same file; head hand_eye removed because it was measured on the old 544x448 stream; recalibrate to get head TF back; head stereo preserved; left_wrist, right_wrist plumb_bob @ 640x480; hand_eye eye-in-hand (wrist→wrist_yaw_link solved after H-unmirror; image_mirror=horizontal — use prepare_image_for_hand_eye / project_link_points_to_pixels on raw wrist JPEGs; head→head_yaw_link, no mirror)",
   "board": {
     "type": "checkerboard",
     "squares_x": 9,
@@ -223,62 +223,6 @@
       "rotation_rms_deg": 2.21206000577341,
       "translation_rms_m": 0.017483772480948095,
       "image_mirror": "horizontal"
-    },
-    "head_left": {
-      "camera": "head_left",
-      "frame": "head_yaw_link",
-      "rotation": [
-        [
-          0.03760558230758093,
-          -0.3729302353306551,
-          0.9270970066587044
-        ],
-        [
-          -0.9989608473475062,
-          0.009876726670289049,
-          0.044493547139248135
-        ],
-        [
-          -0.025749672736946727,
-          -0.9278068170942173,
-          -0.3721712838296871
-        ]
-      ],
-      "translation_m": [
-        0.06513638243073637,
-        0.0413202958002386,
-        -0.019471294856720937
-      ],
-      "rotation_rms_deg": 2.9135347289408053,
-      "translation_rms_m": 0.02375798384192328
-    },
-    "head_right": {
-      "camera": "head_right",
-      "frame": "head_yaw_link",
-      "rotation": [
-        [
-          0.013253882876515672,
-          -0.3763569409007416,
-          0.9263799369721536
-        ],
-        [
-          -0.9997399352294416,
-          0.012206938065856139,
-          0.019262724897801002
-        ],
-        [
-          -0.018557922732019883,
-          -0.926394324086073,
-          -0.3760972743918523
-        ]
-      ],
-      "translation_m": [
-        0.06375613021648986,
-        0.10038601826503098,
-        -0.018184102218074216
-      ],
-      "rotation_rms_deg": 2.9135347289408053,
-      "translation_rms_m": 0.02375798384192328
     }
   }
 }
