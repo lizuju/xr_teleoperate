@@ -1,10 +1,12 @@
 # 头部原图高清视频
 
-把头部相机的 1280×1088 原图发给 Vision Pro 第一人称画面。录制和训练继续用 `r1-teleimager` 的 544×448，不经过这里。
+接收头部相机的 1280×1088 原图，同时提供 Vision Pro 第一人称画面和录制、训练用的图像。`r1-teleimager` 继续负责腕部相机和端口 60000 的相机列表。
 
 ```
 PC1 原图 (RTP JPEG, UDP 5004/5005)
-  → PC2 r1-head-hd：解码，缩放到每眼 960×816，H.264 12 Mbps，WebRTC 60004
+  → PC2 r1-head-hd：解码后分两路
+      ZMQ 55555：每眼 640×544 JPEG，30 fps，用于录制和策略
+      WebRTC 60004：每眼 960×816，H.264 30 fps 10 Mbps，用于头显
   → Ubuntu r1-camera-forward-60004：转发 WebRTC 协商
   → Vision Pro App：按 head-optics.json 去畸变和双目校正
 ```
@@ -25,15 +27,26 @@ systemctl --user enable --now r1-camera-forward-60004.service
 
 4. 重新编译并安装 App。
 
-## 验证
+## 把录制和训练切到原图
 
-不戴头显也可以测端到端。在 PC2 上用 teleimager 环境运行，会打印帧率、发送间隔和丢包：
+先在 PC2 上把 teleimager 更新到带 `external_publisher` 的版本，然后运行：
 
 ```bash
-~/miniconda3/envs/teleimager/bin/python3.10 head_hd_test_client.py https://127.0.0.1:60004/offer 30 /tmp/snap.jpg
+~/miniconda3/envs/teleimager/bin/python3.10 switch_head_source.py raw
+./apply_raw_head.sh
 ```
 
-这个客户端和服务抢 CPU，它收到的画面偶尔会卡顿。判断服务是否正常，要看 `server rtp send` 这一行。
+Ubuntu 上的录制、训练和预检代码要一起更新。切换前录的数据和训练的模型不能和新数据混用，策略程序会拒绝旧模型。
+
+退回旧画面用 `rollback_raw_head.sh`，Ubuntu 上的代码也要一起退回。
+
+## 验证
+
+在 PC2 上看服务日志。`published` 是录制帧率，`viewer` 是发给头显的帧率，头显连上后 `viewers` 为 1：
+
+```bash
+journalctl -u r1-head-hd -n 5 --no-pager
+```
 
 ## 相机参数
 

@@ -12,6 +12,8 @@ ExecStart=/home/unitree/miniconda3/envs/teleimager/bin/python3.10 -u head_hd_ser
 Nice=5
 Restart=always
 RestartSec=3
+# logging_mp leaves a child that ignores SIGTERM; without this a restart waits 90 s.
+TimeoutStopSec=3
 
 [Install]
 WantedBy=multi-user.target
