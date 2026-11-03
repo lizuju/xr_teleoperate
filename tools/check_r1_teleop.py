@@ -462,18 +462,19 @@ def main():
         try:
             https_probe(context, 60001, "head stereo")
             print("[OK] verified WebRTC HTTPS for the head stereo plane", flush=True)
-            try:
-                https_probe(context, 60004, "Vision Pro head video")
-                print("[OK] verified WebRTC HTTPS for the Vision Pro head video", flush=True)
-            except RuntimeError as error:
-                print(f"[WARN] {error}; the Vision Pro first-person view will have no picture until "
-                      "r1-head-hd and its gateway are running", flush=True)
         except RuntimeError as error:
             if STEREO_JPEG_LABEL in healthy:
                 print(f"[WARN] {error}; the head image still arrives over ZMQ, so only the "
                       f"optional WebRTC scene element is unavailable", flush=True)
             else:
                 raise
+        # The first-person view has its own stream, so check it whatever 60001 did.
+        try:
+            https_probe(context, 60004, "Vision Pro head video")
+            print("[OK] verified WebRTC HTTPS for the Vision Pro head video", flush=True)
+        except RuntimeError as error:
+            print(f"[WARN] {error}; the Vision Pro first-person view will have no picture until "
+                  "r1-head-hd and its gateway are running", flush=True)
     except KeyboardInterrupt:
         print("[STOP] preflight cancelled; teleoperation was not started", file=sys.stderr)
         return 130
