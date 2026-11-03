@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
+from tools import check_r1_teleop
 from tools.check_r1_teleop import (
     REQUIRE_CAMERA_CLOCK_ENV,
     StreamWindow,
@@ -264,6 +265,35 @@ class CameraClockTest(unittest.TestCase):
         for name in ("run_r1_a7_capture.sh", "run_r1_a7_policy.sh"):
             self.assertIn(needed, (teleop / name).read_text(), name)
         self.assertNotIn(REQUIRE_CAMERA_CLOCK_ENV, (teleop / "run_r1_a7_vector.sh").read_text())
+
+
+class HeadsetVideoProbeTest(unittest.TestCase):
+    def run_main(self, failing_ports):
+        probed = []
+
+        def probe(_context, port, _label):
+            probed.append(port)
+            if port in failing_ports:
+                raise RuntimeError(f"port {port} is down")
+
+        output = io.StringIO()
+        with patch.object(check_r1_teleop, "check_runtime_version"), \
+                patch.object(check_r1_teleop, "check_local_and_https"), \
+                patch.object(check_r1_teleop, "check_streams", return_value={check_r1_teleop.STEREO_JPEG_LABEL}), \
+                patch.object(check_r1_teleop, "https_probe", probe), redirect_stdout(output):
+            code = check_r1_teleop.main()
+        return code, probed, output.getvalue()
+
+    def test_headset_video_is_probed_when_the_scene_plane_is_down(self):
+        code, probed, output = self.run_main({60001})
+        self.assertEqual(code, 0)
+        self.assertEqual(probed, [60001, 60004])
+        self.assertIn("[OK] verified WebRTC HTTPS for the Vision Pro head video", output)
+
+    def test_missing_headset_video_is_reported_with_the_scene_plane_up(self):
+        code, _probed, output = self.run_main({60004})
+        self.assertEqual(code, 0)
+        self.assertIn("first-person view will have no picture", output)
 
 
 class StreamCheckFailureTest(unittest.TestCase):
