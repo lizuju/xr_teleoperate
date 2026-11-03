@@ -1,0 +1,14 @@
+[Unit]
+Description=R1 head camera services: video_hub off, stereo_patch_pc1 on
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=unitree
+ExecStart=/home/unitree/unitree_r1_dev/r1_camera_services/r1_camera_services eth10 apply
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
