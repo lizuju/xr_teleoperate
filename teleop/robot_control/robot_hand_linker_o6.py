@@ -18,6 +18,9 @@ GATE_REQUIRE_RELEASE = 0
 GATE_READY = 1
 GATE_ARMED = 2
 DEFAULT_COMMAND_TORQUE = 1.0
+# Rest noise in the retargeted target is about 0.001, below one device byte (0.004)
+# and the motor's deadband, so this can stay short without adding chatter.
+COMMAND_SMOOTHING_S = 0.005
 logger = logging.getLogger(__name__)
 
 
@@ -349,7 +352,7 @@ class LinkerO6Controller:
     def update(self, left_target, right_target, tracking_fresh=(True, True)):
         if not self.active:
             raise RuntimeError("Linker O6 controller is not active")
-        # Cap the retargeted close target before the 15 ms smoother so teleop
+        # Cap the retargeted close target before the command smoother so teleop
         # cannot command a tighter grasp than the operator saved.
         left = self._capped_target(self._values(left_target, "left target"), "left")
         right = self._capped_target(self._values(right_target, "right target"), "right")
@@ -394,7 +397,7 @@ class LinkerO6Controller:
                 raise TimeoutError(message)
         targets, modes, release_times = [], [], []
         dt = min(max(now - self.action_time, 0.0), 1.0 / 30.0)
-        alpha = -math.expm1(-dt / 0.015)
+        alpha = -math.expm1(-dt / COMMAND_SMOOTHING_S)
         for target, previous, state, state_time, gate_mode, fresh, released_at in zip(
             (left, right), (self.left_action, self.right_action),
             (left_state, right_state), (left_state_time, right_state_time),
