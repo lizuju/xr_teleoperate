@@ -429,6 +429,7 @@ if __name__ == '__main__':
                         "place; following that last pose avoids the freeze-resume hitch.")
     parser.add_argument('--linker-o6-urdf-root', type=str, default='/home/hnh/unitree_r1_dev/linkerhand-urdf/O6', help='Official Linker O6 URDF root')
     parser.add_argument('--linker-o6-method', choices=['vector', 'position', 'dexpilot'], default='vector', help='dex-retargeting optimizer for Linker O6')
+    parser.add_argument('--linker-o6-frequency', type=float, default=90.0, help='Linker O6 hand loop rate; separate from --frequency because tracking arrives near 90 Hz')
     parser.add_argument('--linker-o6-live-state', type=str, default=None, help='Atomic JSON target snapshot for isolated Linker O6 simulation')
     parser.add_argument('--arm-translation-scale', type=float, default=0.87, help='R1_A7 Cartesian translation scale for the hand displacement, measured from the '
                         'activation anchor. Rotations are never scaled. The robot arm is shorter than the operator arm, so a proportional mapping is the ratio of the '
@@ -520,6 +521,8 @@ if __name__ == '__main__':
         parser.error("--tracking-timeout must be positive.")
     if not (math.isfinite(args.frequency) and args.frequency > 0.0):
         parser.error("--frequency must be positive.")
+    if not (math.isfinite(args.linker_o6_frequency) and args.linker_o6_frequency > 0.0):
+        parser.error("--linker-o6-frequency must be positive.")
     if not (math.isfinite(args.arm_translation_scale) and args.arm_translation_scale > 0.0):
         parser.error("--arm-translation-scale must be positive.")
     if not (math.isfinite(args.waist_follow_threshold_deg) and args.waist_follow_threshold_deg > 0.0):
@@ -1478,7 +1481,7 @@ if __name__ == '__main__':
             save_hand_sample(hand_ctrl.get_state(), hand_ctrl.get_action())
             linker_o6_loop = LinkerO6ControlLoop(
                 tv_wrapper.get_tele_data, linker_o6_retargeter, hand_ctrl,
-                args.frequency, args.tracking_timeout, lambda: STOP, save_hand_sample,
+                args.linker_o6_frequency, args.tracking_timeout, lambda: STOP, save_hand_sample,
                 should_pause=lambda: (R1_PAUSE is not None and R1_PAUSE.paused)
                 or (visionpro_source is not None and visionpro_source.needs_realign),
             )

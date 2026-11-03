@@ -10,7 +10,7 @@ R1实机遥操快速使用（抓杯握紧上限摘录）
 键：a 使能（六轴从 0.05 起）  3–8 选轴（thumb_pitch…pinky）  =/. 只加选中轴  -/, 只减选中轴  [/] 细调 ±0.001  o 松开  s 保存六维上限  1/2/b 左/右/双手  q 退出（不是急停）
 保存量：每手 max_close_q[6] ∈ [0,1]，不是牛顿。杯口 9 cm 写进元数据。
 文件：~/.config/xr_teleoperate/o6_grip_cap.json（schema o6_grip_cap_v2）
-下次遥操（`./teleop/run_r1_a7_vector.sh` / capture）自动加载，无需额外环境变量；在 15 ms 平滑前按侧做 elementwise min(q_i, max_i)。`apply_to=left` 且只有 `sides.left` 时只钳左手，右手完全不封顶；缺文件或该侧缺失/null = 该手不钳。旧版标量文件会迁移为六轴同值，请重新标定以分开精度。
+下次遥操（`./teleop/run_r1_a7_vector.sh` / capture）自动加载，无需额外环境变量；在指令平滑前按侧做 elementwise min(q_i, max_i)。`apply_to=left` 且只有 `sides.left` 时只钳左手，右手完全不封顶；缺文件或该侧缺失/null = 该手不钳。旧版标量文件会迁移为六轴同值，请重新标定以分开精度。
 
 雪糕机固定点示教（只读 v2；遥操另开终端摆姿，本工具不发 lowcmd、不闭手）：
   cd /home/hnh/unitree_r1_dev/xr_teleoperate
