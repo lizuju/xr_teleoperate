@@ -130,7 +130,7 @@ class RecordingTFTests(unittest.TestCase):
             self.assertEqual(report['tf_aligned_frames'], 0)
             path = episode/'frames.jsonl'
             frame = json.loads(path.read_text())
-            frame['sample']['tf']['poses_in_root']['head_left_optical'][0][3] += .1
+            frame['sample']['tf']['poses_in_root']['left_wrist_optical'][0][3] += .1
             path.write_text(json.dumps(frame)+'\n')
             report = validate_episode(episode)
             self.assertFalse(report['valid'])
