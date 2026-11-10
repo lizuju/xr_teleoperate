@@ -529,6 +529,10 @@ if __name__ == '__main__':
                         'waist was still and 3.51 deg per tick once the waist turned more than 2 deg -- a 35x amplification of uncommanded arm motion, and the direct cause of the arm '
                         'twisting during waist following. The counter-rotation is only worth its cost when something must stay put in the world, which is not what a head-triggered waist '
                         'follow is doing.')
+    parser.add_argument('--hand-occlusion-guard', choices=['on', 'off'], default='on', help='Vision Pro input: report a hand as lost while the '
+                        'headset cannot really see it -- the other hand on its line of sight, a tracked pose jumping faster than a hand moves (3 m/s or '
+                        '1000 deg/s), or the two wrists within 5 cm -- until it has been clearly visible for 0.25 s. Its arm and gripper or O6 hold '
+                        'meanwhile instead of following the pose ARKit guesses. Normal motion passes unchanged.')
     parser.add_argument('--waist-turn-speed-deg', type=float, default=30.0, help='R1_A7 with --waist-follow: peak speed of the left/right arrow-key '
                         'turns, which move the waist to the next stop 90 deg away (stops at the activation heading and +/-90 deg). Gentler than following '
                         'because the operator may be carrying something. Must be positive.')
@@ -740,6 +744,7 @@ if __name__ == '__main__':
             from teleop.utils.visionpro_source import VisionProMotionSource
             visionpro_source = VisionProMotionSource(
                 args.visionpro_ip, args.visionpro_python, args.visionpro_port, args.tracking_timeout,
+                hand_guard=getattr(args, "hand_occlusion_guard", "on") == "on",
             )
             logger_mp.info('[VISIONPRO] Native passthrough input connected; existing retargeting and IK are retained.')
         if args.arm_diagnostic_dir:
@@ -1845,7 +1850,11 @@ if __name__ == '__main__':
                 hand_present = tuple(hand_present)
                 for index, (side, hold, present) in enumerate(zip(("left", "right"), wrist_holds, hand_present)):
                     if present != hold.tracking and capture_mode != "paused":
-                        logger_mp.info(f"[R1 HAND TRACKING] {side}: {'resumed; position follows fixed reference via IK filter' if present else 'lost; holding target'}")
+                        guard_reason = None
+                        if not present and visionpro_source is not None:
+                            guard_reason = getattr(visionpro_source, "get_hand_guard_reason", lambda _side: None)(side)
+                        guard_note = f" ({guard_reason})" if isinstance(guard_reason, str) else ""
+                        logger_mp.info(f"[R1 HAND TRACKING] {side}: {'resumed; position follows fixed reference via IK filter' if present else 'lost; holding target'}{guard_note}")
                     if not present:
                         hold.hold()
                         if wrist_stabilizers is not None:
