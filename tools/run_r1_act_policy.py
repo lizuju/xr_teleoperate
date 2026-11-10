@@ -51,7 +51,7 @@ def parse_args(argv=None):
     parser.add_argument("--arm-target-accel-limit", type=float, default=40.0)
     parser.add_argument("--arm-velocity-limit", type=float, default=30.0)
     parser.add_argument("--arm-dq-limit", type=float, default=6.0)
-    parser.add_argument("--img-server-ip", default="192.168.110.20")
+    parser.add_argument("--img-server-ip", default="192.168.5.10")
     parser.add_argument("--network-interface", default=NETWORK_INTERFACE)
     parser.add_argument("--worker-python", type=Path, default=DEFAULT_WORKER_PYTHON)
     parser.add_argument("--device", default="auto", help="Inference device: auto, cuda or cpu")

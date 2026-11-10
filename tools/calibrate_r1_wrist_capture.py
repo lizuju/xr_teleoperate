@@ -22,7 +22,7 @@ import cv2
 import numpy as np
 
 
-DEFAULT_HOST = "192.168.110.20"
+DEFAULT_HOST = "192.168.5.10"
 DEFAULT_PATTERN = (9, 6)
 DEFAULT_SQUARE_M = 0.030
 DEFAULT_OUT_ROOT = Path("~/r1-cam-calib")

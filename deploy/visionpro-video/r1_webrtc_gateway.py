@@ -24,7 +24,7 @@ from aiohttp import web
 #
 # The proxy also rewrites mDNS (.local) ICE candidates in the SDP offer into the
 # IPv4 addresses the headset can reach; PC2 advertises its own hostname.
-DEFAULT_BIND_HOST = "192.168.124.147"
+DEFAULT_BIND_HOST = "192.168.5.10"
 DEFAULT_UPSTREAM_HOST = "192.168.123.164"
 UPSTREAM_PATH = "/offer"
 CERT_DIR = Path.home() / ".config/xr_teleoperate"

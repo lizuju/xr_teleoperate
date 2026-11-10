@@ -5,7 +5,7 @@ After=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/socat TCP4-LISTEN:55555,bind=192.168.110.20,reuseaddr,fork TCP4:192.168.123.164:55555
+ExecStart=/usr/bin/socat TCP4-LISTEN:55555,bind=192.168.5.10,reuseaddr,fork TCP4:192.168.123.164:55555
 Restart=always
 RestartSec=2
 
