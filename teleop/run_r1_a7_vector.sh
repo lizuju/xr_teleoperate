@@ -57,6 +57,9 @@
 #   ARM_DIAG_HZ         设了就按该频率记录诊断（复测大臂问题建议 40）
 #   ARM_DIAG_DIR        设了就把诊断 JSONL 写进该目录
 #   CAMERA_CALIBRATION  相机标定 JSON 路径；留空则用 assets/r1/camera_calibration.json（存在才读）。
+#   R1_RIGHT_EE         右手腕装的是什么：linker_o6（默认）或 dex1（宇树 Dex1-1 夹爪，PC2 上跑 dex1_1_service）。
+#                       不设时读 ~/.config/xr_teleoperate/right_ee 这个文件（一行，linker_o6 或 dex1），
+#                       所以换手以后改一次文件即可，启动命令不用变。预检会按它检查右手的反馈话题。
 #                       标定结果会写进每个 episode 的 info.camera_calibration，供后面数采/训练使用。
 #
 # 例：
@@ -84,6 +87,17 @@ if [[ ! -x "$python" ]]; then
   exit 1
 fi
 
+right_ee_file="${HOME}/.config/xr_teleoperate/right_ee"
+if [[ -z "${R1_RIGHT_EE:-}" && -r "$right_ee_file" ]]; then
+  R1_RIGHT_EE="$(tr -d '[:space:]' < "$right_ee_file")"
+fi
+R1_RIGHT_EE="${R1_RIGHT_EE:-linker_o6}"
+case "$R1_RIGHT_EE" in
+  linker_o6|dex1) ;;
+  *) echo "R1_RIGHT_EE must be linker_o6 or dex1, not '$R1_RIGHT_EE'" >&2; exit 2 ;;
+esac
+export R1_RIGHT_EE
+
 export XR_TELEOP_CERT="${HOME}/.config/xr_teleoperate/cert.pem"
 export XR_TELEOP_KEY="${HOME}/.config/xr_teleoperate/key.pem"
 
@@ -108,6 +122,7 @@ exec "$python" -u teleop_hand_and_arm.py \
   --display-mode immersive \
   --arm R1_A7 \
   --ee linker_o6 \
+  --right-ee "$R1_RIGHT_EE" \
   --linker-o6-method vector \
   --linker-o6-urdf-root "${dev_root}/linkerhand-urdf/O6" \
   --waist-follow \

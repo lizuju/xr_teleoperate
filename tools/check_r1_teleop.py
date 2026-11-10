@@ -117,6 +117,31 @@ class StreamWindow:
         return None
 
 
+RIGHT_EE_ENV = "R1_RIGHT_EE"
+RIGHT_EE_CHOICES = ("linker_o6", "dex1")
+# dex1_1_service reports the output shaft angle: 0 is the calibrated closed jaw and
+# about 5.4 rad fully open; outside this band the gripper is uncalibrated or not a Dex1-1.
+DEX1_STATE_RANGE = (-0.5, 6.5)
+
+
+def right_ee_from_environment():
+    value = os.environ.get(RIGHT_EE_ENV, "linker_o6") or "linker_o6"
+    if value not in RIGHT_EE_CHOICES:
+        raise ValueError(f"{RIGHT_EE_ENV} must be one of {', '.join(RIGHT_EE_CHOICES)}, not {value!r}")
+    return value
+
+
+def validate_gripper_state(message):
+    motors = message.states
+    if len(motors) < 1:
+        raise ValueError("expected one Dex1-1 motor state")
+    q = motors[0].q
+    if not math.isfinite(q):
+        raise ValueError("non-finite Dex1-1 feedback")
+    if not DEX1_STATE_RANGE[0] <= q <= DEX1_STATE_RANGE[1]:
+        raise ValueError(f"Dex1-1 q={q:.3f} rad outside {DEX1_STATE_RANGE}; calibrate it with the jaws closed")
+
+
 def validate_state(message, hand=False):
     motors = message.states if hand else message.motor_state
     if len(motors) != (6 if hand else 35):
@@ -334,7 +359,7 @@ def check_camera_clock(request):
         print(f"[WARN] {problem}. Teleoperation itself still works", flush=True)
 
 
-def check_streams():
+def check_streams(right_ee="linker_o6"):
     import zmq
     from unitree_sdk2py.core.channel import ChannelFactoryInitialize, ChannelSubscriber
     from unitree_sdk2py.idl.unitree_go.msg.dds_ import MotorStates_
@@ -366,7 +391,8 @@ def check_streams():
         windows = {
             "rt/lowstate (robot feedback on eno1)": StreamWindow(0.25),
             "rt/linker/left/state (left O6 bridge)": StreamWindow(0.25),
-            "rt/linker/right/state (right O6 bridge)": StreamWindow(0.25),
+            ("rt/dex1/right/state (right Dex1-1 gripper)" if right_ee == "dex1"
+             else "rt/linker/right/state (right O6 bridge)"): StreamWindow(0.25),
             STEREO_JPEG_LABEL: StreamWindow(0.5),
         }
         # (label, port, expected shape) for every JPEG feed the XR scene consumes.
@@ -383,7 +409,10 @@ def check_streams():
             def receive(message):
                 now = time.monotonic()
                 try:
-                    validate_state(message, hand)
+                    if name.startswith("rt/dex1/"):
+                        validate_gripper_state(message)
+                    else:
+                        validate_state(message, hand)
                     if not hand and crc.Crc(message) != int(message.crc):
                         raise ValueError("R1 lowstate CRC mismatch")
                     error = None
@@ -458,7 +487,10 @@ def main():
         # shared memory; the WebRTC plane is only negotiated on headsets that support a
         # second element, and this one does not. So a dead 60001 upstream is a warning
         # while the ZMQ feed is healthy, and a hard failure only when it is not.
-        healthy = check_streams()
+        right_ee = right_ee_from_environment()
+        if right_ee == "dex1":
+            print("[CHECK] right wrist: Dex1-1 gripper (R1_RIGHT_EE=dex1); left wrist: Linker O6", flush=True)
+        healthy = check_streams(right_ee)
         try:
             https_probe(context, 60001, "head stereo")
             print("[OK] verified WebRTC HTTPS for the head stereo plane", flush=True)

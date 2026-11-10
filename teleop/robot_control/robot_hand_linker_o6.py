@@ -21,15 +21,25 @@ DEFAULT_COMMAND_TORQUE = 1.0
 # Rest noise in the retargeted target is about 0.001, below one device byte (0.004)
 # and the motor's deadband, so this can stay short without adding chatter.
 COMMAND_SMOOTHING_S = 0.005
+SIDES = ("left", "right")
 logger = logging.getLogger(__name__)
 
 
+def _copy(values):
+    return None if values is None else values.copy()
+
+
 class LinkerO6Controller:
-    def __init__(self, grip_cap_path=None, apply_grip_cap=True):
-        self.left_publisher = ChannelPublisher("rt/linker/left/cmd", MotorCmds_)
-        self.left_publisher.Init()
-        self.right_publisher = ChannelPublisher("rt/linker/right/cmd", MotorCmds_)
-        self.right_publisher.Init()
+    def __init__(self, grip_cap_path=None, apply_grip_cap=True, sides=SIDES):
+        # A side left out has no O6 on it (for example a gripper on that wrist):
+        # it gets no DDS endpoints, its state and action read as None, and it
+        # never holds up readiness or the feedback timeout.
+        sides = tuple(sides)
+        if not sides or len(set(sides)) != len(sides) or any(side not in SIDES for side in sides):
+            raise ValueError("sides must be a non-empty subset of ('left', 'right')")
+        self.sides = sides
+        self.left_publisher = self._publisher("left")
+        self.right_publisher = self._publisher("right")
 
         self.state_lock = threading.Lock()
         self.recording_history = {side: deque(maxlen=256) for side in ("left", "right")}
@@ -63,12 +73,31 @@ class LinkerO6Controller:
 
         self.left_state_error = None
         self.right_state_error = None
-        self.left_subscriber = ChannelSubscriber("rt/linker/left/state", MotorStates_)
-        self.left_subscriber.Init(self._on_left_state, 1)
-        self.right_subscriber = ChannelSubscriber("rt/linker/right/state", MotorStates_)
-        self.right_subscriber.Init(self._on_right_state, 1)
+        self.left_subscriber = self._subscriber("left", self._on_left_state)
+        self.right_subscriber = self._subscriber("right", self._on_right_state)
         if apply_grip_cap:
             self.load_grip_cap(grip_cap_path)
+
+    def _publisher(self, side):
+        if side not in self.sides:
+            return None
+        publisher = ChannelPublisher(f"rt/linker/{side}/cmd", MotorCmds_)
+        publisher.Init()
+        return publisher
+
+    def _subscriber(self, side, handler):
+        if side not in self.sides:
+            return None
+        subscriber = ChannelSubscriber(f"rt/linker/{side}/state", MotorStates_)
+        subscriber.Init(handler, 1)
+        return subscriber
+
+    def _raise_state_error(self):
+        # Caller holds state_lock.
+        for side in self.sides:
+            error = getattr(self, f"{side}_state_error")
+            if error is not None:
+                raise error
 
     def load_grip_cap(self, path=None):
         """Load an operator-confirmed max close. Missing file leaves hands uncapped."""
@@ -232,26 +261,22 @@ class LinkerO6Controller:
         if not np.isfinite(timeout) or timeout <= 0.0:
             raise ValueError("timeout must be positive")
         with self.state_lock:
-            left_floor = self.left_state_count
-            right_floor = self.right_state_count
+            floors = {side: getattr(self, f"{side}_state_count") for side in self.sides}
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             with self.state_lock:
-                if self.left_state_error is not None:
-                    raise self.left_state_error
-                if self.right_state_error is not None:
-                    raise self.right_state_error
-                ready = self.left_state is not None and self.right_state is not None
+                self._raise_state_error()
+                ready = all(getattr(self, f"{side}_state") is not None for side in self.sides)
                 if require_new:
-                    ready = (
-                        ready
-                        and self.left_state_count > left_floor
-                        and self.right_state_count > right_floor
+                    ready = ready and all(
+                        getattr(self, f"{side}_state_count") > floor for side, floor in floors.items()
                     )
             if ready:
                 return
             time.sleep(0.01)
-        raise TimeoutError("Timed out waiting for both Linker O6 state topics")
+        if self.sides == SIDES:
+            raise TimeoutError("Timed out waiting for both Linker O6 state topics")
+        raise TimeoutError(f"Timed out waiting for the {self.sides[0]} Linker O6 state topic")
 
     @staticmethod
     def _command(values, mode, speed, torque):
@@ -270,14 +295,18 @@ class LinkerO6Controller:
             (
                 "left",
                 self.left_publisher,
+                None if self.left_publisher is None else
                 self._command(left_values, modes[0], speed if modes[0] else 0.0, torque if modes[0] else 0.0),
             ),
             (
                 "right",
                 self.right_publisher,
+                None if self.right_publisher is None else
                 self._command(right_values, modes[1], speed if modes[1] else 0.0, torque if modes[1] else 0.0),
             ),
         ):
+            if publisher is None:
+                continue
             try:
                 if publisher.Write(message, timeout=COMMAND_TIMEOUT) is not True:
                     raise RuntimeError(f"Failed to publish {side} Linker O6 command")
@@ -300,15 +329,12 @@ class LinkerO6Controller:
 
     def _state_snapshot(self):
         with self.state_lock:
-            if self.left_state_error is not None:
-                raise self.left_state_error
-            if self.right_state_error is not None:
-                raise self.right_state_error
-            if self.left_state is None or self.right_state is None:
+            self._raise_state_error()
+            if any(getattr(self, f"{side}_state") is None for side in self.sides):
                 raise RuntimeError("Linker O6 state is not ready")
             return (
-                self.left_state.copy(),
-                self.right_state.copy(),
+                _copy(self.left_state),
+                _copy(self.right_state),
                 self.left_state_time,
                 self.right_state_time,
                 self.left_gate_mode,
@@ -343,7 +369,7 @@ class LinkerO6Controller:
         self.left_action = left_state
         self.right_action = right_state
         with self.state_lock:
-            self.requested_targets = (left_state.copy(), right_state.copy())
+            self.requested_targets = (_copy(left_state), _copy(right_state))
             self.requested_monotonic_ns = int(time.monotonic() * 1e9)
             self.requested_sequence += 1
         self.action_time = time.monotonic()
@@ -354,35 +380,39 @@ class LinkerO6Controller:
             raise RuntimeError("Linker O6 controller is not active")
         # Cap the retargeted close target before the command smoother so teleop
         # cannot command a tighter grasp than the operator saved.
-        left = self._capped_target(self._values(left_target, "left target"), "left")
-        right = self._capped_target(self._values(right_target, "right target"), "right")
+        left = (self._capped_target(self._values(left_target, "left target"), "left")
+                if "left" in self.sides else None)
+        right = (self._capped_target(self._values(right_target, "right target"), "right")
+                 if "right" in self.sides else None)
         with self.state_lock:
-            self.requested_targets = (left.copy(), right.copy())
+            self.requested_targets = (_copy(left), _copy(right))
             self.requested_monotonic_ns = int(time.monotonic() * 1e9)
             self.requested_sequence += 1
             request_sequence = self.requested_sequence
         left_state, right_state, left_state_time, right_state_time, left_mode, right_mode = self._state_snapshot()
         now = time.monotonic()
-        if (
-            now - left_state_time >= STATE_TIMEOUT
-            or now - right_state_time >= STATE_TIMEOUT
-        ):
+
+        def stale(state_time, side):
+            return side in self.sides and now - state_time >= STATE_TIMEOUT
+
+        def age_text(age, side):
+            return f"{age * 1000:.1f}" if side in self.sides else "off"
+
+        if stale(left_state_time, "left") or stale(right_state_time, "right"):
             # A callback may have replaced the snapshot while this thread was descheduled.
             with self.state_lock:
-                if self.left_state_error is not None:
-                    raise self.left_state_error
-                if self.right_state_error is not None:
-                    raise self.right_state_error
+                self._raise_state_error()
                 now = time.monotonic()
-                left_state, right_state = self.left_state.copy(), self.right_state.copy()
+                left_state, right_state = _copy(self.left_state), _copy(self.right_state)
                 left_state_time, right_state_time = self.left_state_time, self.right_state_time
                 left_mode, right_mode = self.left_gate_mode, self.right_gate_mode
-                left_age, right_age = now - left_state_time, now - right_state_time
+                left_age = now - left_state_time if "left" in self.sides else 0.0
+                right_age = now - right_state_time if "right" in self.sides else 0.0
                 counts = (self.left_state_count, self.right_state_count)
             if left_age >= STATE_TIMEOUT or right_age >= STATE_TIMEOUT:
                 message = (
                     "Linker O6 state feedback is stale: "
-                    f"left_age_ms={left_age * 1000:.1f} right_age_ms={right_age * 1000:.1f} "
+                    f"left_age_ms={age_text(left_age, 'left')} right_age_ms={age_text(right_age, 'right')} "
                     f"left_count={counts[0]} right_count={counts[1]} "
                     f"gate_modes=({left_mode},{right_mode}) "
                     f"update_gap_ms={(now - self.action_time) * 1000:.1f} limit_ms={STATE_TIMEOUT * 1000:.0f}"
@@ -398,11 +428,16 @@ class LinkerO6Controller:
         targets, modes, release_times = [], [], []
         dt = min(max(now - self.action_time, 0.0), 1.0 / 30.0)
         alpha = -math.expm1(-dt / COMMAND_SMOOTHING_S)
-        for target, previous, state, state_time, gate_mode, fresh, released_at in zip(
-            (left, right), (self.left_action, self.right_action),
+        for side, target, previous, state, state_time, gate_mode, fresh, released_at in zip(
+            SIDES, (left, right), (self.left_action, self.right_action),
             (left_state, right_state), (left_state_time, right_state_time),
             (left_mode, right_mode), tracking_fresh, self.release_times,
         ):
+            if side not in self.sides:
+                targets.append(None)
+                modes.append(0)
+                release_times.append(None)
+                continue
             enabled = fresh and gate_mode != GATE_REQUIRE_RELEASE and (
                 released_at is None or (gate_mode == GATE_READY and state_time > released_at)
             )
@@ -431,9 +466,9 @@ class LinkerO6Controller:
         return left, right
 
     def get_action(self):
-        if self.left_action is None or self.right_action is None:
+        if any(getattr(self, f"{side}_action") is None for side in self.sides):
             raise RuntimeError("Linker O6 action is not ready")
-        return self.left_action.copy(), self.right_action.copy()
+        return _copy(self.left_action), _copy(self.right_action)
 
     def get_recording_states_at(self, target_ns, end_ns):
         with self.state_lock:
@@ -443,7 +478,7 @@ class LinkerO6Controller:
 
     def get_recording_snapshot(self):
         with self.state_lock:
-            if self.left_state is None or self.right_state is None:
+            if any(getattr(self, f"{side}_state") is None for side in self.sides):
                 raise RuntimeError("Linker O6 state is not ready")
             states = {}
             for side, values, aux, timestamp, sequence, mode in (
@@ -452,6 +487,8 @@ class LinkerO6Controller:
                 ("right", self.right_state, self.right_aux, self.right_state_time,
                  self.right_state_count, self.right_gate_mode),
             ):
+                if side not in self.sides:
+                    continue
                 aux = aux or {}
                 states[side] = {
                     "q": values.tolist(), "monotonic_ns": int(timestamp * 1e9),
@@ -463,8 +500,8 @@ class LinkerO6Controller:
             return {
                 "state": states,
                 "requested": None if self.requested_targets is None else {
-                    "left_q": self.requested_targets[0].tolist(),
-                    "right_q": self.requested_targets[1].tolist(),
+                    "left_q": None if self.requested_targets[0] is None else self.requested_targets[0].tolist(),
+                    "right_q": None if self.requested_targets[1] is None else self.requested_targets[1].tolist(),
                     "monotonic_ns": self.requested_monotonic_ns,
                     "sequence": self.requested_sequence,
                 },
@@ -488,8 +525,8 @@ class LinkerO6Controller:
                     left_state, right_state, _, _, _, _ = self._state_snapshot()
                 except (ValueError, RuntimeError):
                     with self.state_lock:
-                        left_state = self.left_state.copy()
-                        right_state = self.right_state.copy()
+                        left_state = _copy(self.left_state)
+                        right_state = _copy(self.right_state)
                 try:
                     self._write_pair(left_state, right_state, (0, 0), 0.0, 0.0)
                 except Exception as error:
@@ -501,6 +538,8 @@ class LinkerO6Controller:
                 self.left_subscriber,
                 self.right_subscriber,
             ):
+                if endpoint is None:
+                    continue
                 try:
                     endpoint.Close()
                 except Exception as error:
