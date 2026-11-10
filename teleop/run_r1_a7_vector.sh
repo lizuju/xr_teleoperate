@@ -60,6 +60,9 @@
 #   R1_RIGHT_EE         右手腕装的是什么：linker_o6（默认）或 dex1（宇树 Dex1-1 夹爪，PC2 上跑 dex1_1_service）。
 #                       不设时读 ~/.config/xr_teleoperate/right_ee 这个文件（一行，linker_o6 或 dex1），
 #                       所以换手以后改一次文件即可，启动命令不用变。预检会按它检查右手的反馈话题。
+#   R1_DEX1_MIN_Q       右 Dex1-1 最小目标角度（rad）；优先使用环境变量，否则读取
+#                       ~/.config/xr_teleoperate/dex1_min_q。未设置为 0；用 tools/set_dex1_min_opening.py 保存杯子开口。
+#                       手指合拢时到该位置停止，张开仍可全开；这不是毫米或夹持力标定。
 #   WRIST_STABILIZER    默认 on：手指在动时对手腕目标做轻量平滑，时间常数 40 ms。
 #                       不再设置小动作死区，细微位移和转动每帧都会响应。
 #                       WRIST_STABILIZER_POSITION_MM（默认 3 mm）和 WRIST_STABILIZER_ROTATION_DEG（默认 3 度）
@@ -115,6 +118,17 @@ if [[ "$check_only" == true ]]; then
   exit 0
 fi
 
+dex1_min_q_file="${HOME}/.config/xr_teleoperate/dex1_min_q"
+dex1_min_q="${R1_DEX1_MIN_Q:-}"
+if [[ -z "$dex1_min_q" && -r "$dex1_min_q_file" ]]; then
+  dex1_min_q="$(tr -d '[:space:]' < "$dex1_min_q_file")"
+  if [[ -z "$dex1_min_q" ]]; then
+    echo "Saved Dex1 minimum opening is empty: $dex1_min_q_file" >&2
+    exit 2
+  fi
+fi
+dex1_min_q="${dex1_min_q:-0}"
+
 diagnostics=()
 if [[ -n "${ARM_DIAG_HZ:-}" ]]; then
   diagnostics+=(--arm-diagnostic-hz "${ARM_DIAG_HZ}")
@@ -134,6 +148,7 @@ exec "$python" -u teleop_hand_and_arm.py \
   --right-ee "$R1_RIGHT_EE" \
   --dex1-transport "${R1_DEX1_TRANSPORT:-lowcmd}" \
   --dex1-slot "${R1_DEX1_SLOT:-33}" \
+  --dex1-min-q "$dex1_min_q" \
   --wrist-stabilizer "${WRIST_STABILIZER:-on}" \
   --wrist-stabilizer-position-mm "${WRIST_STABILIZER_POSITION_MM:-3}" \
   --wrist-stabilizer-rotation-deg "${WRIST_STABILIZER_ROTATION_DEG:-3}" \

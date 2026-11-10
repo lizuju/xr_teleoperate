@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # R1_A7 录制入口（Vector + --record）
+# 右 Dex1-1 最小开口沿用 ~/.config/xr_teleoperate/dex1_min_q，可用 R1_DEX1_MIN_Q 覆盖。
 # 一次启动可连续多条：r 跟随，s 开录，y/n/x 结束并标记成功/失败/丢弃（文件保留）。
 # p 暂停保持姿态；暂停后 s 等双手稳定并重新对齐，再恢复跟随和开始下一条。
 # 每条保存目录带系统时间；再次 s 可开始下一条，无需重启。
@@ -50,6 +51,17 @@ fi
 
 export XR_TELEOP_CERT="${HOME}/.config/xr_teleoperate/cert.pem"
 export XR_TELEOP_KEY="${HOME}/.config/xr_teleoperate/key.pem"
+dex1_min_q_file="${HOME}/.config/xr_teleoperate/dex1_min_q"
+dex1_min_q="${R1_DEX1_MIN_Q:-}"
+if [[ -z "$dex1_min_q" && -r "$dex1_min_q_file" ]]; then
+  dex1_min_q="$(tr -d '[:space:]' < "$dex1_min_q_file")"
+  if [[ -z "$dex1_min_q" ]]; then
+    echo "Saved Dex1 minimum opening is empty: $dex1_min_q_file" >&2
+    exit 2
+  fi
+fi
+dex1_min_q="${dex1_min_q:-0}"
+
 diagnostics=()
 if [[ -n "${ARM_DIAG_HZ:-}" ]]; then
   diagnostics+=(--arm-diagnostic-hz "${ARM_DIAG_HZ}")
@@ -68,6 +80,7 @@ exec "${dev_root}/.venv-xr/bin/python" -u teleop_hand_and_arm.py \
   --right-ee "$right_ee" \
   --dex1-transport "${R1_DEX1_TRANSPORT:-lowcmd}" \
   --dex1-slot "${R1_DEX1_SLOT:-33}" \
+  --dex1-min-q "$dex1_min_q" \
   --wrist-stabilizer "${WRIST_STABILIZER:-on}" \
   --wrist-stabilizer-position-mm "${WRIST_STABILIZER_POSITION_MM:-3}" \
   --wrist-stabilizer-rotation-deg "${WRIST_STABILIZER_ROTATION_DEG:-3}" \

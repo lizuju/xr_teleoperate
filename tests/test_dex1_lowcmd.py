@@ -47,9 +47,9 @@ class FakeArm:
 
 
 class LowCmdGripperTest(unittest.TestCase):
-    def ready(self, **kwargs):
+    def ready(self, closed_q=0.0, **kwargs):
         arm = FakeArm(**kwargs)
-        gripper = Dex1LowCmdGripper(arm)
+        gripper = Dex1LowCmdGripper(arm, closed_q=closed_q)
         gripper.wait_until_ready(timeout=0.5)
         gripper.activate()
         return arm, gripper
@@ -69,6 +69,41 @@ class LowCmdGripperTest(unittest.TestCase):
         self.assertAlmostEqual(arm.targets[-1][1], 0.82)
         published = gripper.get_recording_snapshot()["published"]
         self.assertEqual((published["mode"], published["request_sequence"]), (1, 7))
+
+    def test_cup_minimum_clamps_pinch_requests_and_survives_holding(self):
+        arm, gripper = self.ready(q=2.3, closed_q=2.0)
+        for _ in range(8):
+            gripper.update([-1.0])
+            arm.q = arm.targets[-1][1]
+            self.assertGreaterEqual(arm.q, 2.0)
+            np.testing.assert_allclose(gripper.get_action(), [2.0])
+        self.assertAlmostEqual(arm.q, 2.0)
+        for fresh in (False, True, False, True):
+            arm.q = 2.05
+            gripper.update(gripper.get_action() if fresh else [5.4], tracking_fresh=fresh)
+            self.assertAlmostEqual(arm.targets[-1][1], 2.0)
+            self.assertEqual(gripper.get_recording_snapshot()["requested"]["q"], [2.0])
+
+    def test_below_minimum_activation_holds_before_gradual_opening(self):
+        arm, gripper = self.ready(q=0.5, closed_q=2.0)
+        self.assertEqual(arm.targets[-1], (33, 0.5))
+        for _ in range(12):
+            before = arm.q
+            gripper.update([0.0])
+            arm.q = arm.targets[-1][1]
+            self.assertGreaterEqual(arm.q, before)
+            self.assertLessEqual(arm.q - before, 0.18 + 1e-9)
+            self.assertLessEqual(arm.q, 2.0)
+        self.assertAlmostEqual(arm.q, 2.0)
+
+    def test_cup_minimum_does_not_reduce_full_opening(self):
+        arm, gripper = self.ready(q=2.0, closed_q=2.0)
+        for _ in range(22):
+            gripper.update([8.0])
+            arm.q = arm.targets[-1][1]
+            self.assertLessEqual(arm.q, 5.4)
+        np.testing.assert_allclose(gripper.get_action(), [5.4])
+        self.assertAlmostEqual(arm.q, 5.4)
 
     def test_fault_or_unpowered_slot_names_the_app_setting(self):
         for kwargs in ({"motorstate": 0x80000000}, {"vol": 0.0}):
