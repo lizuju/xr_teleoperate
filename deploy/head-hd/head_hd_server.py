@@ -40,7 +40,9 @@ VIEWER_FPS = 30
 GOP_LENGTH = 2 * VIEWER_FPS
 # Fixed on purpose: the receiver's bandwidth estimate starts low and can pin this
 # stream near its minimum on a link that carries it fine. Lower it for a weak network.
-BITRATE_BPS = 15_000_000
+# 2026-11-10: 15 -> 10 Mbps after tracking upstream delays of ~89/min over 100 ms at 15 Mbps;
+# the 2026-11-03 bench put 10 Mbps at 48.3 dB against 49.3 dB, nearly the same picture.
+BITRATE_BPS = 10_000_000
 # Half a 30 fps frame period: anything further apart is a different frame pair.
 MAX_PAIR_SKEW_S = 0.017
 HEADER = struct.Struct("!4sBdI")
