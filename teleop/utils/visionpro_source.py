@@ -8,6 +8,11 @@ import time
 
 import numpy as np
 
+try:
+    from teleop.utils.hand_trust_guard import REASONS as HAND_GUARD_REASONS, HandTrustGuard
+except ImportError:  # loaded as a top-level module next to hand_trust_guard.py
+    from hand_trust_guard import REASONS as HAND_GUARD_REASONS, HandTrustGuard
+
 
 # ARKit joint axes to WebXR joint axes, matching WebKit WKXRTrackingManager.
 JOINT_AXES = {
@@ -29,8 +34,11 @@ def rigid_matrices(value, shape):
 
 
 class VisionProMotionSource:
-    def __init__(self, host, python, port=12345, timeout=0.25):
+    def __init__(self, host, python, port=12345, timeout=0.25, hand_guard=True):
         self._lock = threading.RLock()
+        # Reports a hand as lost while the headset cannot really see it (hidden by the
+        # other hand, or a guessed pose that jumps), so its arm holds instead of following.
+        self._hand_guard = HandTrustGuard() if hand_guard else None
         self._head = np.eye(4)
         self._head[:3, 3] = [0., 1.5, -0.2]
         self._snapshot = {"motion_data_ready": False, "motion_sample_seq": 0,
@@ -198,6 +206,23 @@ class VisionProMotionSource:
                     anchor_times[key] = anchor_time
                     timestamps[key] = min(received, anchor_time + offset)
                 validity[key] = valid
+            if self._hand_guard is not None:
+                eye = (updates["head"] if "head" in updates else self._head)[:3, 3]
+                rejected = []
+                for side, other in (("left", "right"), ("right", "left")):
+                    if side in updates:
+                        if other in updates:
+                            other_positions = updates[other][:, :3, 3]
+                        elif self._valid[other] and self._hand_guard.trusted(other):
+                            other_positions = self._snapshot[f"{other}_hand_positions"]
+                        else:
+                            other_positions = None
+                        if not self._hand_guard.update(side, anchor_times[side], updates[side], eye, other_positions):
+                            rejected.append(side)
+                    if not self._hand_guard.trusted(side):
+                        validity[side] = False
+                for side in rejected:
+                    del updates[side]
             self._anchor_times, self._timestamps, self._valid = anchor_times, timestamps, validity
             self._source_diagnostics = {
                 key: packet[key] for key in (
@@ -374,7 +399,17 @@ class VisionProMotionSource:
                 result[f"{side}_status"] = "tracking" if stamp else "missing"
             stamp = self._snapshot["motion_data_timestamp"]
             result["pair_age_ms"] = (now - stamp) * 1000. if stamp else None
+            if self._hand_guard is not None:
+                result["hand_guard"] = self._hand_guard.diagnostics()
             return result
+
+    def get_hand_guard_reason(self, side):
+        """Why the guard currently treats this hand as lost, in words, or None."""
+        with self._lock:
+            if self._hand_guard is None:
+                return None
+            reason = self._hand_guard.reason(side)
+            return HAND_GUARD_REASONS.get(reason, reason)
 
     def close(self):
         self._reader_stop.set()
