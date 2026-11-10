@@ -45,6 +45,10 @@ DRY_RUN_MODE = False
 ARM_REQUEST_GENERATION = 0
 R1_A7_DEFERRED_REAL_MODE = False
 R1_PAUSE = None
+# Arrow-key waist turn ('left' or 'right'), set by the keyboard thread and taken by
+# the control loop, which alone touches the waist follower.
+WAIST_TURN_LOCK = threading.Lock()
+WAIST_TURN_REQUEST = None
 #  -------        ---------                -----------                -----------            ---------
 #   state          [Ready]      ==>        [Recording]     ==>         [AutoSave]     -->     [Ready]
 #  -------        ---------      |         -----------      |         -----------      |     ---------
@@ -58,7 +62,7 @@ R1_PAUSE = None
 #  --> auto  : Auto-transition after saving data.
 
 def on_press(key):
-    global STOP, START, RECORD_TOGGLE, RECORD_OUTCOME, ARM_REQUEST_GENERATION
+    global STOP, START, RECORD_TOGGLE, RECORD_OUTCOME, ARM_REQUEST_GENERATION, WAIST_TURN_REQUEST
     if key == 'r':
         if R1_PAUSE is not None and R1_PAUSE.paused:
             R1_PAUSE.request_resume()
@@ -90,8 +94,19 @@ def on_press(key):
             else:
                 logger_mp.info("[RECORD] Next episode requested; waiting for any previous save to finish.")
         RECORD_TOGGLE = True
+    elif key in ('left', 'right'):
+        with WAIST_TURN_LOCK:
+            WAIST_TURN_REQUEST = key
+        logger_mp.info(f"[R1 WAIST TURN] {key} turn requested.")
     else:
         logger_mp.warning(f"[on_press] {key} was pressed, but no action is defined for this key.")
+
+def take_waist_turn_request():
+    """Return the pending arrow-key turn ('left' or 'right') once, or None."""
+    global WAIST_TURN_REQUEST
+    with WAIST_TURN_LOCK:
+        key, WAIST_TURN_REQUEST = WAIST_TURN_REQUEST, None
+    return key
 
 def get_state() -> dict:
     """Return current heartbeat state"""
@@ -179,12 +194,14 @@ def anchored_wrist_target(
     return target
 
 
-def waist_follower_from_args(args, waist_actual, now):
+def waist_follower_from_args(args, waist_actual, now, turn_origin=None):
     """Build the waist follower from the launch settings.
 
     Shared by the activation and the resume paths so the two cannot drift apart.
     The getattr fallbacks are the argument defaults, so a namespace that predates
     one of these flags gets the intended behaviour rather than a silent zero.
+    turn_origin places the arrow-key turn stops; the resume path passes the
+    activation waist angle so the stops stay where they were.
     """
     return R1HeadWaistFollower(
         waist_actual,
@@ -194,7 +211,52 @@ def waist_follower_from_args(args, waist_actual, now):
         getattr(args, "waist_follow_dwell", 0.2),
         math.radians(getattr(args, "waist_follow_speed_deg", 40.0)),
         math.radians(getattr(args, "waist_follow_accel_deg", 90.0)),
+        turn_origin=turn_origin,
+        turn_velocity=math.radians(getattr(args, "waist_turn_speed_deg", 30.0)),
+        turn_acceleration=math.radians(getattr(args, "waist_turn_accel_deg", 60.0)),
     )
+
+
+def start_waist_turn(follower, key, args):
+    """Start an arrow-key turn to the next 90 deg stop and log it; return the goal or None."""
+    if getattr(args, "waist_follow_compensation", "torso") != "torso":
+        logger_mp.warning(
+            "[R1 WAIST TURN] %s ignored: world compensation would fold the arms through a 90 deg turn; "
+            "turns need --waist-follow-compensation torso.", key,
+        )
+        return None
+    start = follower.waist_target
+    goal = follower.command_turn(1 if key == "left" else -1)
+    if goal is None:
+        logger_mp.warning(
+            "[R1 WAIST TURN] %s ignored: no stop left on that side inside the waist range "
+            "(waist target %.1f deg from the start heading).", key, math.degrees(start - follower.turn_origin),
+        )
+    else:
+        logger_mp.info(
+            "[R1 WAIST TURN] %s: %.1f -> %.1f deg from the start heading at up to %.0f deg/s.",
+            key, math.degrees(start - follower.turn_origin), math.degrees(goal - follower.turn_origin),
+            math.degrees(follower.turn_velocity),
+        )
+    return goal
+
+
+def log_waist_turn_events(follower):
+    for event in follower.pop_turn_events():
+        goal = math.degrees(event["goal"] - follower.turn_origin)
+        if event["event"] == "reached":
+            logger_mp.info("[R1 WAIST TURN] reached %.1f deg from the start heading.", goal)
+        else:
+            logger_mp.warning(
+                "[R1 WAIST TURN] turn to %.1f deg stopped at %.1f deg (tracking lost or paused); "
+                "press the arrow again to continue.", goal, math.degrees(event["waist"] - follower.turn_origin),
+            )
+
+
+def waist_turn_label(follower):
+    if follower is None or not follower.turning:
+        return "idle"
+    return f"to {math.degrees(follower.turn_goal - follower.turn_origin):.0f} deg"
 
 
 class TeleImagerCameraClient:
@@ -467,6 +529,11 @@ if __name__ == '__main__':
                         'waist was still and 3.51 deg per tick once the waist turned more than 2 deg -- a 35x amplification of uncommanded arm motion, and the direct cause of the arm '
                         'twisting during waist following. The counter-rotation is only worth its cost when something must stay put in the world, which is not what a head-triggered waist '
                         'follow is doing.')
+    parser.add_argument('--waist-turn-speed-deg', type=float, default=30.0, help='R1_A7 with --waist-follow: peak speed of the left/right arrow-key '
+                        'turns, which move the waist to the next stop 90 deg away (stops at the activation heading and +/-90 deg). Gentler than following '
+                        'because the operator may be carrying something. Must be positive.')
+    parser.add_argument('--waist-turn-accel-deg', type=float, default=60.0, help='R1_A7 with --waist-follow: acceleration and braking of the arrow-key '
+                        'turns, in degrees per second squared. 30 deg/s at 60 deg/s^2 turns 90 deg in about 3.5 s. Must be positive.')
     parser.add_argument('--startup-wrist-align', action='store_true', help='R1_A7: align wrist orientation to the initial Vision Pro pose before following')
     # record mode and task info
     parser.add_argument('--record', action = 'store_true', help = 'Enable data recording mode')
@@ -577,6 +644,10 @@ if __name__ == '__main__':
         parser.error("--waist-follow-speed-deg must be positive.")
     if not (math.isfinite(args.waist_follow_accel_deg) and args.waist_follow_accel_deg > 0.0):
         parser.error("--waist-follow-accel-deg must be positive.")
+    if not (math.isfinite(args.waist_turn_speed_deg) and args.waist_turn_speed_deg > 0.0):
+        parser.error("--waist-turn-speed-deg must be positive.")
+    if not (math.isfinite(args.waist_turn_accel_deg) and args.waist_turn_accel_deg > 0.0):
+        parser.error("--waist-turn-accel-deg must be positive.")
     if args.waist_follow and (args.arm != "R1_A7" or args.hand_only or args.dry_run or args.motion):
         parser.error("--waist-follow requires R1_A7 full arm control without --motion.")
     if not (math.isfinite(args.arm_diagnostic_hz) and args.arm_diagnostic_hz > 0.0):
@@ -1504,6 +1575,11 @@ if __name__ == '__main__':
                         math.degrees(waist_follower.max_acceleration),
                         getattr(args, "waist_follow_compensation", "torso"),
                     )
+                    logger_mp.info(
+                        "[R1 WAIST TURN] [left]/[right] arrow turns the waist to the next stop on that side "
+                        "(start heading or +/-90 deg) at up to %.0f deg/s; keep facing forward while it turns.",
+                        math.degrees(waist_follower.turn_velocity),
+                    )
                 if STOP:
                     continue
                 if args.ee == "linker_o6":
@@ -1727,8 +1803,16 @@ if __name__ == '__main__':
                                 compensate_wrist_for_waist(pose, r1_waist_yaw_reference, actual_waist_yaw)
                                 for pose in (r1_robot_left_reference, r1_robot_right_reference)
                             )
+                        if waist_follower is not None and waist_follower.turning:
+                            logger_mp.warning(
+                                "[R1 WAIST TURN] the pause stopped the turn to %.1f deg at %.1f deg; "
+                                "press the arrow again to continue.",
+                                math.degrees(waist_follower.turn_goal - r1_waist_yaw_reference),
+                                math.degrees(actual_waist_yaw - r1_waist_yaw_reference),
+                            )
                         waist_follower = waist_follower_from_args(
                             args, actual_waist_yaw, time.monotonic(),
+                            turn_origin=r1_waist_yaw_reference,
                         )
                     r1_waist_to_root = np.array([
                         [math.cos(actual_waist_yaw), -math.sin(actual_waist_yaw), 0.0],
@@ -1860,6 +1944,7 @@ if __name__ == '__main__':
 
             # solve ik using motor data and wrist pose, then use ik results to control arms.
             time_ik_start = time.time()
+            waist_turn_key = take_waist_turn_request()
             waist_yaw_actual = arm_ctrl.get_current_waist_yaw() if args.waist_follow else None
             waist_yaw_target = None
             if r1_independent_hands:
@@ -1951,10 +2036,14 @@ if __name__ == '__main__':
                 if args.waist_follow:
                     waist_yaw_actual = arm_ctrl.get_current_waist_yaw()
                     if not r1_independent_hands or all(hand_present):
+                        if waist_turn_key is not None:
+                            start_waist_turn(waist_follower, waist_turn_key, args)
+                            waist_turn_key = None
                         head_q_target, waist_yaw_target = waist_follower.update(
                             tele_data.head_pose, r1_head_pose_reference,
                             waist_yaw_actual, time.monotonic(),
                         )
+                        log_waist_turn_events(waist_follower)
                         head_q_target = head_q_target + r1_head_q_offset
                     # torso mode feeds the anchored target straight to the solver: the IK
                     # model has the waist locked at r1_waist_yaw_reference, so the solved
@@ -1985,6 +2074,11 @@ if __name__ == '__main__':
                         current_lr_arm_dq,
                     )
             time_ik_end = time.time()
+            if waist_turn_key is not None:
+                logger_mp.warning(
+                    "[R1 WAIST TURN] %s ignored: turns run only while following with both hands tracked%s.",
+                    waist_turn_key, "" if args.waist_follow else " and waist following on",
+                )
             logger_mp.debug(f"ik:\t{round(time_ik_end - time_ik_start, 6)}")
             if STOP:
                 break
@@ -2077,7 +2171,8 @@ if __name__ == '__main__':
                     f"waist_actual={math.degrees(waist_yaw_actual):.1f} deg "
                     f"waist_target={math.degrees(waist_yaw_target if waist_yaw_target is not None else waist_yaw_actual):.1f} deg "
                     f"head_yaw={math.degrees(head_q_target[1]):.1f} deg "
-                    f"following={waist_follower.following and not tracking_hold_active}"
+                    f"following={waist_follower.following and not tracking_hold_active} "
+                    f"turn={waist_turn_label(waist_follower)}"
                 )
             if (
                 arm_diagnostic_file is not None

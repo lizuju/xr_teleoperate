@@ -79,12 +79,19 @@ class R1HeadWaistIntegrationTest(unittest.TestCase):
             node for node in self.tree.body if isinstance(node, ast.FunctionDef)
             and node.name in (
                 "r1_workspace_saturation", "rotation_error_rad", "waist_follower_from_args",
+                "start_waist_turn", "log_waist_turn_events", "waist_turn_label",
             )
         ]
+        self.turn_logger = Mock()
         workspace_ns = {
             "np": np, "math": math, "R1HeadWaistFollower": R1HeadWaistFollower,
+            "logger_mp": self.turn_logger,
         }
         execute(workspace_nodes, workspace_ns)
+        self.turn_helpers = {
+            name: workspace_ns[name]
+            for name in ("start_waist_turn", "log_waist_turn_events", "waist_turn_label")
+        }
         self.waist_follower_from_args = workspace_ns["waist_follower_from_args"]
         self.workspace_saturation = workspace_ns["r1_workspace_saturation"]
         self.left = pose(0.6, [0.4, 0.2, 0.8])
@@ -107,8 +114,9 @@ class R1HeadWaistIntegrationTest(unittest.TestCase):
         }
         controller.get_reference_q.return_value = np.zeros(14)
         controller.get_target_shaper_snapshot.return_value = None
-        follower = Mock(total_yaw=0.7, following=True)
+        follower = Mock(total_yaw=0.7, following=True, turning=False)
         follower.update.return_value = (np.array([0.2, 0.27]), 1.2)
+        follower.pop_turn_events.return_value = []
         ik = Mock()
         ik.solve_ik.return_value = (np.zeros(14), np.zeros(14))
         ik.last_raw_q = np.full(14, 0.01)
@@ -159,6 +167,9 @@ class R1HeadWaistIntegrationTest(unittest.TestCase):
             # Built by the production helper, so the resume path exercises the real
             # engagement and slew settings instead of a hand-rolled follower.
             "waist_follower_from_args": self.waist_follower_from_args,
+            # No arrow key pressed unless a test says so.
+            "take_waist_turn_request": Mock(return_value=None),
+            **self.turn_helpers,
             "relative_head_pitch_yaw": Mock(return_value=np.zeros(2)),
             "wrist_in_reference_head_yaw_frame": lambda wrist, *_: wrist.copy(),
             "anchored_wrist_target": lambda wrist, *_: wrist.copy(),

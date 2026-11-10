@@ -105,6 +105,8 @@ class SideIndependenceTest(unittest.TestCase):
             "is_present_motion_data": Mock(return_value=True),
             "logger_mp": Mock(), "arm_ctrl": controller, "arm_ik": ik,
             "waist_follower": follower, "linker_o6_loop": None,
+            "take_waist_turn_request": lambda: None,
+            "log_waist_turn_events": lambda follower: None,
             "run_motion": True, "capture_mode": "following",
             "relative_head_pitch_yaw": Mock(return_value=np.zeros(2)),
             "wrist_in_reference_head_yaw_frame": lambda w, *_: w.copy(),

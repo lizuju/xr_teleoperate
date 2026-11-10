@@ -46,6 +46,9 @@
 #                       旧值追一个 45 度的转身要 2.2 s，体感就是机器人拖在你后面。
 #   WAIST_FOLLOW_ACCEL_DEG  腰目标的加速度上限，默认 90 度/秒²（旧值写死 28.6）。
 #                       40 度/秒 配 90 度/秒² → 0.44 s 到全速。
+#   WAIST_TURN_SPEED_DEG  方向键一键转身（← 左转、→ 右转，到下一个 90 度档位：正前 / ±90 度）的最大角速度，默认 30 度/秒。
+#                       比跟随慢，因为转身时手里可能端着杯子。转身时遥操员面朝前别动。
+#   WAIST_TURN_ACCEL_DEG  一键转身的加速度和刹车，默认 60 度/秒²；30 度/秒配 60 度/秒² 转 90 度约 3.5 s。
 #   WAIST_FOLLOW_COMPENSATION  腰部转动时手腕目标保持在哪个坐标系，默认 torso。
 #                       torso = 手臂相对躯干的姿态完全按你命令的来，腰一转整条手臂跟着身体一起转，
 #                               关节一动不动 —— 对应真人「腰转、手跟着身体走」的关系。
@@ -159,6 +162,8 @@ exec "$python" -u teleop_hand_and_arm.py \
   --waist-follow-speed-deg "${WAIST_FOLLOW_SPEED_DEG:-40}" \
   --waist-follow-accel-deg "${WAIST_FOLLOW_ACCEL_DEG:-90}" \
   --waist-follow-compensation "${WAIST_FOLLOW_COMPENSATION:-torso}" \
+  --waist-turn-speed-deg "${WAIST_TURN_SPEED_DEG:-30}" \
+  --waist-turn-accel-deg "${WAIST_TURN_ACCEL_DEG:-60}" \
   --wrist-display "${WRIST_DISPLAY:-off}" \
   --arm-translation-scale "${ARM_TRANSLATION_SCALE:-0.87}" \
   --arm-limit-softness "${ARM_LIMIT_SOFTNESS:-0.1}" \

@@ -23,6 +23,9 @@ class R1A7WaistControllerTest(unittest.TestCase):
         )
         controller = self.controller
         controller.ctrl_lock = threading.Lock()
+        # __init__ creates these since the Dex1-1 lowcmd wiring (2026-11-09); no gripper here.
+        controller.gripper_lock = threading.Lock()
+        controller.gripper_slots = {}
         controller.q_target = np.zeros(14)
         controller.tauff_target = np.zeros(14)
         controller.head_q_target = np.zeros(2)
