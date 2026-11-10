@@ -60,6 +60,8 @@
 #   R1_RIGHT_EE         右手腕装的是什么：linker_o6（默认）或 dex1（宇树 Dex1-1 夹爪，PC2 上跑 dex1_1_service）。
 #                       不设时读 ~/.config/xr_teleoperate/right_ee 这个文件（一行，linker_o6 或 dex1），
 #                       所以换手以后改一次文件即可，启动命令不用变。预检会按它检查右手的反馈话题。
+#   R1_DEX1_TRANSPORT   Dex1-1 的接法：lowcmd（默认，内走线；宇树 App 灵巧手类型设为 Dex1-1，主控把它当 rt/lowcmd 的一个关节）
+#                       或 service（外接 485 转 USB 板，PC2 上跑 dex1_1_service）。R1_DEX1_SLOT 是内走线的关节位，默认 33。
 #                       标定结果会写进每个 episode 的 info.camera_calibration，供后面数采/训练使用。
 #
 # 例：
@@ -123,6 +125,8 @@ exec "$python" -u teleop_hand_and_arm.py \
   --arm R1_A7 \
   --ee linker_o6 \
   --right-ee "$R1_RIGHT_EE" \
+  --dex1-transport "${R1_DEX1_TRANSPORT:-lowcmd}" \
+  --dex1-slot "${R1_DEX1_SLOT:-33}" \
   --linker-o6-method vector \
   --linker-o6-urdf-root "${dev_root}/linkerhand-urdf/O6" \
   --waist-follow \

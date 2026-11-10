@@ -66,6 +66,8 @@ exec "${dev_root}/.venv-xr/bin/python" -u teleop_hand_and_arm.py \
   --arm R1_A7 \
   --ee linker_o6 \
   --right-ee "$right_ee" \
+  --dex1-transport "${R1_DEX1_TRANSPORT:-lowcmd}" \
+  --dex1-slot "${R1_DEX1_SLOT:-33}" \
   --linker-o6-method vector \
   --linker-o6-urdf-root "${dev_root}/linkerhand-urdf/O6" \
   --waist-follow \

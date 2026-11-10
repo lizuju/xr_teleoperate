@@ -52,6 +52,8 @@ class RightWristLauncherTest(unittest.TestCase):
         index = teleop.index("--right-ee")
         self.assertEqual(teleop[index + 1], "dex1")
         self.assertEqual(teleop[teleop.index("--ee") + 1], "linker_o6")
+        self.assertEqual(teleop[teleop.index("--dex1-transport") + 1], "lowcmd")
+        self.assertEqual(teleop[teleop.index("--dex1-slot") + 1], "33")
 
     def test_default_is_two_linker_o6_hands(self):
         status, calls, _ = self.launch()
@@ -63,6 +65,12 @@ class RightWristLauncherTest(unittest.TestCase):
         status, calls, _ = self.launch(right_ee_file="dex1", environment={"R1_RIGHT_EE": "linker_o6"})
         self.assertEqual(status, 0)
         self.assertEqual(calls[0][0], "R1_RIGHT_EE=linker_o6")
+
+    def test_external_board_wiring_is_passed_through(self):
+        status, calls, _ = self.launch(right_ee_file="dex1", environment={"R1_DEX1_TRANSPORT": "service"})
+        self.assertEqual(status, 0)
+        teleop = calls[1]
+        self.assertEqual(teleop[teleop.index("--dex1-transport") + 1], "service")
 
     def test_check_only_runs_preflight_with_the_selection(self):
         status, calls, _ = self.launch(right_ee_file="dex1", arguments=["--check-only"])

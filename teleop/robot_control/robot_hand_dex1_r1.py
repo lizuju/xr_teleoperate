@@ -42,6 +42,11 @@ DEFAULT_PINCH_OPEN_M = 0.10
 DEFAULT_PINCH_SMOOTHING_S = 0.02
 THUMB_TIP = 4
 INDEX_TIP = 9
+# rt/lowcmd slots of internally wired Dex1-1 grippers once the Unitree app hand type is
+# Dex1-1 (the G1 uses the same pair). On the R1 slot 31 reads motorstate 0x80000000 when
+# the left wrist carries a Linker O6 instead.
+INTERNAL_LEFT_SLOT = 31
+INTERNAL_RIGHT_SLOT = 33
 logger = logging.getLogger(__name__)
 
 
@@ -115,6 +120,15 @@ class Dex1GripperController:
 
     def __init__(self, side="right", kp=DEFAULT_KP, kd=DEFAULT_KD, grip_delta=DEFAULT_GRIP_DELTA,
                  closed_q=CLOSED_Q, open_q=OPEN_Q):
+        self._init_common(side, kp, kd, grip_delta, closed_q, open_q)
+        self.cmd_topic = f"rt/dex1/{side}/cmd"
+        self.state_topic = f"rt/dex1/{side}/state"
+        self.publisher = ChannelPublisher(self.cmd_topic, MotorCmds_)
+        self.publisher.Init()
+        self.subscriber = ChannelSubscriber(self.state_topic, MotorStates_)
+        self.subscriber.Init(self._on_state, 1)
+
+    def _init_common(self, side, kp, kd, grip_delta, closed_q, open_q):
         if side not in ("left", "right"):
             raise ValueError("side must be left or right")
         for name, value in (("kp", kp), ("kd", kd), ("grip_delta", grip_delta)):
@@ -125,11 +139,6 @@ class Dex1GripperController:
         self.side = side
         self.kp, self.kd, self.grip_delta = float(kp), float(kd), float(grip_delta)
         self.closed_q, self.open_q = float(closed_q), float(open_q)
-        self.cmd_topic = f"rt/dex1/{side}/cmd"
-        self.state_topic = f"rt/dex1/{side}/state"
-        self.publisher = ChannelPublisher(self.cmd_topic, MotorCmds_)
-        self.publisher.Init()
-
         self.state_lock = threading.Lock()
         self.state = None
         self.state_aux = None
@@ -148,22 +157,24 @@ class Dex1GripperController:
         self.ready = False
         self.active = False
         self.closed = False
-        self.subscriber = ChannelSubscriber(self.state_topic, MotorStates_)
-        self.subscriber.Init(self._on_state, 1)
+
+    @staticmethod
+    def _checked_q(q):
+        q = float(q)
+        if not math.isfinite(q):
+            raise RuntimeError("Dex1 state must be finite")
+        if not STATE_RANGE[0] <= q <= STATE_RANGE[1]:
+            raise RuntimeError(
+                f"Dex1 state q={q:.3f} rad is outside {STATE_RANGE}; calibrate the gripper with the jaws closed"
+            )
+        return q
 
     @staticmethod
     def _state_value(message):
         states = getattr(message, "states", None)
         if not states:
             raise RuntimeError("Dex1 state must contain one motor")
-        q = float(states[0].q)
-        if not math.isfinite(q):
-            raise RuntimeError("Dex1 state must be finite")
-        if not STATE_RANGE[0] <= q <= STATE_RANGE[1]:
-            raise RuntimeError(
-                f"Dex1 state q={q:.3f} rad is outside {STATE_RANGE}; calibrate the gripper "
-                "(dex1_1_gripper_server -c with the jaws closed)"
-            )
+        q = Dex1GripperController._checked_q(states[0].q)
 
         def number(attribute):
             try:
@@ -227,7 +238,7 @@ class Dex1GripperController:
                 raise RuntimeError("Dex1 state is not ready")
             return self.state, self.state_time, self.state_count
 
-    def _publish(self, q, request_sequence=None, following=False):
+    def _send(self, q):
         message = MotorCmds_()
         message.cmds = [unitree_go_msg_dds__MotorCmd_()]
         command = message.cmds[0]
@@ -238,6 +249,20 @@ class Dex1GripperController:
         command.kd = self.kd
         if self.publisher.Write(message, timeout=COMMAND_TIMEOUT) is not True:
             raise RuntimeError(f"Failed to publish {self.side} Dex1 command")
+
+    def _close(self):
+        error = None
+        for endpoint in (self.publisher, self.subscriber):
+            try:
+                endpoint.Close()
+            except Exception as close_error:
+                if error is None:
+                    error = close_error
+        if error is not None:
+            raise error
+
+    def _publish(self, q, request_sequence=None, following=False):
+        self._send(q)
         with self.state_lock:
             self.published_sequence += 1
             self.published_command = {
@@ -361,14 +386,98 @@ class Dex1GripperController:
                 except Exception as write_error:
                     error = write_error
         finally:
-            for endpoint in (self.publisher, self.subscriber):
-                try:
-                    endpoint.Close()
-                except Exception as close_error:
-                    if error is None:
-                        error = close_error
+            try:
+                self._close()
+            except Exception as close_error:
+                if error is None:
+                    error = close_error
         if error is not None:
             raise error
+
+
+class Dex1LowCmdGripper(Dex1GripperController):
+    """An internally wired Dex1-1 that the robot's main controller drives as a lowcmd slot.
+
+    With the hand type set to Dex1-1 in the Unitree app the gripper joins the joint bus:
+    its feedback arrives in rt/lowstate and its command goes out in the same rt/lowcmd
+    the R1_A7 arm controller writes, so this class reads and writes through that
+    controller rather than its own DDS endpoints. Angle, gains and the force limit are the
+    same as on the serial service: 0 rad closed, about 5.4 rad open, kp 5, kd 0.05.
+    """
+
+    def __init__(self, arm_controller, slot=INTERNAL_RIGHT_SLOT, side="right", kp=DEFAULT_KP, kd=DEFAULT_KD,
+                 grip_delta=DEFAULT_GRIP_DELTA, closed_q=CLOSED_Q, open_q=OPEN_Q):
+        self._init_common(side, kp, kd, grip_delta, closed_q, open_q)
+        self.arm = arm_controller
+        self.slot = int(slot)
+        self.state_topic = f"rt/lowstate motor {self.slot}"
+        # Before activation, so the arm's activation hold never locks the jaw at arm gains.
+        arm_controller.configure_gripper_slot(self.slot, self.kp, self.kd)
+
+    def _read(self):
+        feedback = self.arm.get_gripper_feedback(self.slot)
+        if feedback is None:
+            return None
+        if feedback["motorstate"] != 0 or feedback["vol"] <= 0.0:
+            raise RuntimeError(
+                f"Dex1 lowcmd slot {self.slot} reports motorstate 0x{feedback['motorstate'] & 0xFFFFFFFF:08x} "
+                f"at {feedback['vol']:.1f} V; set the hand type to Dex1-1 in the Unitree app, "
+                "restart the robot and check the gripper power"
+            )
+        q = self._checked_q(feedback["q"])
+        aux = {"qvel": [feedback["dq"]] if math.isfinite(feedback["dq"]) else [],
+               "torque": [feedback["tau"]] if math.isfinite(feedback["tau"]) else [],
+               "temperature": [], "errors": []}
+        with self.state_lock:
+            if feedback["sequence"] != self.state_count:
+                self.recording_history.append({"q": [q], "monotonic_ns": feedback["monotonic_ns"],
+                                               "sequence": feedback["sequence"], **aux})
+            self.state = q
+            self.state_aux = aux
+            self.state_time = feedback["monotonic_ns"] / 1e9
+            self.state_count = feedback["sequence"]
+            self.state_error = None
+        return feedback
+
+    def _wait_for_state(self, timeout, require_new=False):
+        if not math.isfinite(timeout) or timeout <= 0.0:
+            raise ValueError("timeout must be positive")
+        with self.state_lock:
+            floor = self.state_count
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            feedback = self._read()
+            if feedback is not None and (not require_new or feedback["sequence"] > floor):
+                return
+            time.sleep(0.01)
+        raise TimeoutError(
+            f"Timed out waiting for Dex1-1 feedback in {self.state_topic}; set the hand type to "
+            "Dex1-1 in the Unitree app and restart the robot"
+        )
+
+    def _snapshot(self):
+        if self._read() is None:
+            raise RuntimeError("Dex1 state is not ready")
+        with self.state_lock:
+            return self.state, self.state_time, self.state_count
+
+    def _send(self, q):
+        self.arm.set_gripper_target(self.slot, q)
+
+    def _close(self):
+        # Back to following the measured angle: no squeeze, damping only, until the arm stops.
+        self.arm.set_gripper_target(self.slot, None)
+
+    def get_recording_snapshot(self):
+        self._read()
+        return super().get_recording_snapshot()
+
+    def get_recording_state_at(self, target_ns, end_ns):
+        feedback = self.arm.get_gripper_feedback_at(self.slot, target_ns, end_ns)
+        if feedback is None:
+            return None
+        return {"q": [feedback["q"]], "monotonic_ns": feedback["monotonic_ns"], "sequence": feedback["sequence"],
+                "qvel": [feedback["dq"]], "torque": [feedback["tau"]], "temperature": [], "errors": []}
 
 
 class O6Dex1Retargeter:
