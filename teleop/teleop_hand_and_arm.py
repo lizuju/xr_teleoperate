@@ -214,6 +214,7 @@ def waist_follower_from_args(args, waist_actual, now, turn_origin=None):
         turn_origin=turn_origin,
         turn_velocity=math.radians(getattr(args, "waist_turn_speed_deg", 30.0)),
         turn_acceleration=math.radians(getattr(args, "waist_turn_accel_deg", 60.0)),
+        head_follow=getattr(args, "waist_head_follow", "on") == "on",
     )
 
 
@@ -533,6 +534,9 @@ if __name__ == '__main__':
                         'headset cannot really see it -- the other hand on its line of sight, a tracked pose jumping faster than a hand moves (3 m/s or '
                         '1000 deg/s), or the two wrists within 5 cm -- until it has been clearly visible for 0.25 s. Its arm and gripper or O6 hold '
                         'meanwhile instead of following the pose ARKit guesses. Normal motion passes unchanged.')
+    parser.add_argument('--waist-head-follow', choices=['on', 'off'], default='on', help='R1_A7 with --waist-follow: "on" lets a sustained operator '
+                        'head or body turn drive the waist (the --waist-follow-threshold/dwell/speed/accel settings). "off" leaves the waist to the '
+                        'left/right arrow-key turns only; the robot head still follows the operator head within its own range.')
     parser.add_argument('--waist-turn-speed-deg', type=float, default=30.0, help='R1_A7 with --waist-follow: peak speed of the left/right arrow-key '
                         'turns, which move the waist to the next stop 90 deg away (stops at the activation heading and +/-90 deg). Gentler than following '
                         'because the operator may be carrying something. Must be positive.')
@@ -1569,17 +1573,24 @@ if __name__ == '__main__':
                     waist_follower = waist_follower_from_args(
                         args, r1_waist_yaw_reference, time.monotonic(),
                     )
-                    logger_mp.info(
-                        "R1_A7 head/waist following enabled: %.4g deg residual for %.4g s to engage, "
-                        "release at %.4g deg, %.4g deg/s with a %.4g deg/s^2 ramp, "
-                        "compensation=%s, URDF waist range +/-2.618 rad.",
-                        math.degrees(waist_follower.engage_threshold),
-                        waist_follower.engage_duration,
-                        math.degrees(waist_follower.release_threshold),
-                        math.degrees(waist_follower.max_velocity),
-                        math.degrees(waist_follower.max_acceleration),
-                        getattr(args, "waist_follow_compensation", "torso"),
-                    )
+                    if not waist_follower.head_follow:
+                        logger_mp.info(
+                            "R1_A7 waist: head-driven turning off; the waist moves only on the arrow keys, "
+                            "and the robot head follows your head within its range. compensation=%s.",
+                            getattr(args, "waist_follow_compensation", "torso"),
+                        )
+                    else:
+                        logger_mp.info(
+                            "R1_A7 head/waist following enabled: %.4g deg residual for %.4g s to engage, "
+                            "release at %.4g deg, %.4g deg/s with a %.4g deg/s^2 ramp, "
+                            "compensation=%s, URDF waist range +/-2.618 rad.",
+                            math.degrees(waist_follower.engage_threshold),
+                            waist_follower.engage_duration,
+                            math.degrees(waist_follower.release_threshold),
+                            math.degrees(waist_follower.max_velocity),
+                            math.degrees(waist_follower.max_acceleration),
+                            getattr(args, "waist_follow_compensation", "torso"),
+                        )
                     logger_mp.info(
                         "[R1 WAIST TURN] [left]/[right] arrow turns the waist to the next stop on that side "
                         "(start heading or +/-90 deg) at up to %.0f deg/s; keep facing forward while it turns.",

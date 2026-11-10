@@ -180,6 +180,24 @@ class WaistTurnFollowerTest(unittest.TestCase):
         self.assertIsNone(follower.next_turn_stop(-1))
         self.assertAlmostEqual(follower.next_turn_stop(1), 0.0)
 
+    def test_head_follow_off_never_turns_the_waist_from_the_head(self):
+        follower = R1HeadWaistFollower(0.0, 0.0, head_follow=False)
+        robot = Robot(follower)
+        robot.run(5.0, head_yaw=math.radians(60.0))
+        self.assertEqual(follower.waist_target, 0.0)
+        self.assertFalse(follower.following)
+        # The robot head alone follows the operator's head.
+        self.assertAlmostEqual(robot.heads[-1], math.radians(60.0))
+
+    def test_head_follow_off_keeps_arrow_key_turns(self):
+        follower = R1HeadWaistFollower(0.0, 0.0, head_follow=False)
+        robot = Robot(follower)
+        self.assertAlmostEqual(follower.command_turn(-1), -QUARTER)
+        robot.run_until_idle()
+        robot.run(5.0, head_yaw=math.radians(45.0))
+        self.assertEqual(follower.waist_target, -QUARTER)
+        self.assertAlmostEqual(robot.heads[-1], math.radians(45.0))
+
     def test_invalid_inputs(self):
         follower = R1HeadWaistFollower(0.0, 0.0)
         with self.assertRaises(ValueError):
@@ -226,9 +244,19 @@ class WaistTurnTeleopTest(unittest.TestCase):
         self.assertAlmostEqual(follower.turn_velocity, math.radians(20.0))
         self.assertAlmostEqual(follower.turn_acceleration, math.radians(40.0))
         self.assertEqual(follower.turn_origin, 0.0)
+        self.assertTrue(follower.head_follow)
         old = self.ns["waist_follower_from_args"](SimpleNamespace(tracking_timeout=0.25), 0.2, 0.0)
         self.assertAlmostEqual(old.turn_velocity, math.radians(30.0))
         self.assertEqual(old.turn_origin, 0.2)
+        keys_only = self.ns["waist_follower_from_args"](
+            SimpleNamespace(tracking_timeout=0.25, waist_head_follow="off"), 0.0, 0.0)
+        self.assertFalse(keys_only.head_follow)
+
+    def test_launchers_default_to_arrow_key_turns_only(self):
+        for name in ("run_r1_a7_vector.sh", "run_r1_a7_capture.sh"):
+            text = (ROOT / "teleop" / name).read_text(encoding="utf-8")
+            self.assertIn('--waist-head-follow "${WAIST_HEAD_FOLLOW:-off}"', text)
+            self.assertIn("--waist-follow \\\n", text)
 
     def test_start_turn_logs_goal_and_refuses_world_compensation(self):
         follower = R1HeadWaistFollower(0.0, 0.0)

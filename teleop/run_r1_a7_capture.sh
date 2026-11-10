@@ -91,6 +91,7 @@ exec "${dev_root}/.venv-xr/bin/python" -u teleop_hand_and_arm.py \
   --waist-follow-speed-deg "${WAIST_FOLLOW_SPEED_DEG:-40}" \
   --waist-follow-accel-deg "${WAIST_FOLLOW_ACCEL_DEG:-90}" \
   --waist-follow-compensation "${WAIST_FOLLOW_COMPENSATION:-torso}" \
+  --waist-head-follow "${WAIST_HEAD_FOLLOW:-off}" \
   --waist-turn-speed-deg "${WAIST_TURN_SPEED_DEG:-30}" \
   --hand-occlusion-guard "${HAND_OCCLUSION_GUARD:-on}" \
   --waist-turn-accel-deg "${WAIST_TURN_ACCEL_DEG:-60}" \
