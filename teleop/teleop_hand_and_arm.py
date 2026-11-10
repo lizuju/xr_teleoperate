@@ -431,6 +431,15 @@ if __name__ == '__main__':
     parser.add_argument('--linker-o6-method', choices=['vector', 'position', 'dexpilot'], default='vector', help='dex-retargeting optimizer for Linker O6')
     parser.add_argument('--linker-o6-frequency', type=float, default=90.0, help='Linker O6 hand loop rate; separate from --frequency because tracking arrives near 90 Hz')
     parser.add_argument('--linker-o6-live-state', type=str, default=None, help='Atomic JSON target snapshot for isolated Linker O6 simulation')
+    parser.add_argument('--right-ee', choices=['linker_o6', 'dex1'], default='linker_o6', help='R1_A7 right wrist device. dex1 is a Unitree Dex1-1 gripper '
+                        '(dex1_1_service on PC2) that follows the right thumb-index distance; the left wrist stays a Linker O6.')
+    parser.add_argument('--dex1-pinch-closed-m', type=float, default=0.025, help='Right thumb-index distance in metres that fully closes the Dex1-1. '
+                        'Vision Pro joints sit inside the finger pads, so touching fingertips read about 0.015-0.025.')
+    parser.add_argument('--dex1-pinch-open-m', type=float, default=0.10, help='Right thumb-index distance in metres that fully opens the Dex1-1 (9 cm jaws).')
+    parser.add_argument('--dex1-kp', type=float, default=5.0, help='Dex1-1 position gain at the output shaft (vendor default 5.0)')
+    parser.add_argument('--dex1-kd', type=float, default=0.05, help='Dex1-1 damping gain (vendor default 0.05)')
+    parser.add_argument('--dex1-grip-delta', type=float, default=0.18, help='How far in rad the Dex1-1 command may lead its measured position. '
+                        'Against an object this lead is the squeeze: kp * 0.18 = 0.9 N*m at the vendor values.')
     parser.add_argument('--arm-translation-scale', type=float, default=0.87, help='R1_A7 Cartesian translation scale for the hand displacement, measured from the '
                         'activation anchor. Rotations are never scaled. The robot arm is shorter than the operator arm, so a proportional mapping is the ratio of the '
                         'two: the R1_A7 shoulder-to-wrist chain is ~0.65 m against ~0.75 m for an adult arm, giving 0.87 (default). 1.0 asks the arm to reach 15%% '
@@ -517,6 +526,19 @@ if __name__ == '__main__':
     if args.ee == "linker_o6" and not args.dry_run:
         if args.arm != "R1_A7" or args.input_mode != "hand" or args.sim or args.motion:
             parser.error("Real Linker O6 control requires --arm R1_A7 --input-mode hand without --sim or --motion.")
+    if args.right_ee == "dex1":
+        if args.ee != "linker_o6" or args.arm != "R1_A7" or args.dry_run or args.hand_only or args.sim:
+            parser.error("--right-ee dex1 needs real R1_A7 control with --ee linker_o6 (left Linker O6, right Dex1-1).")
+        if args.record:
+            parser.error("Recording with the Dex1-1 on the right wrist is not supported yet; run without --record.")
+        if args.hand_torque_hud != "off":
+            parser.error("--hand-torque-hud reads two O6 hands; use --hand-torque-hud off with --right-ee dex1.")
+        if not (math.isfinite(args.dex1_pinch_closed_m) and math.isfinite(args.dex1_pinch_open_m)
+                and 0.0 <= args.dex1_pinch_closed_m < args.dex1_pinch_open_m):
+            parser.error("--dex1-pinch-closed-m and --dex1-pinch-open-m need 0 <= closed < open.")
+        for name in ("dex1_kp", "dex1_kd", "dex1_grip_delta"):
+            if not (math.isfinite(getattr(args, name)) and getattr(args, name) >= 0.0):
+                parser.error(f"--{name.replace('_', '-')} must be finite and non-negative.")
     if not (math.isfinite(args.tracking_timeout) and args.tracking_timeout > 0.0):
         parser.error("--tracking-timeout must be positive.")
     if not (math.isfinite(args.frequency) and args.frequency > 0.0):
@@ -755,13 +777,29 @@ if __name__ == '__main__':
             )
             return left_frame, right_frame
 
-        if args.ee == "linker_o6":
+        if args.ee == "linker_o6" and args.right_ee == "dex1":
+            from teleop.robot_control.linker_o6_retargeting import LinkerO6HandRetargeter
+            from teleop.robot_control.robot_hand_dex1_r1 import Dex1PinchRetargeter, O6Dex1Retargeter
+
+            linker_o6_retargeter = O6Dex1Retargeter(
+                LinkerO6HandRetargeter(Path(args.linker_o6_urdf_root) / "left" / "linkerhand_o6_left.urdf",
+                                       "left", args.linker_o6_method),
+                Dex1PinchRetargeter(args.dex1_pinch_closed_m, args.dex1_pinch_open_m),
+                gripper_side="right",
+            )
+            mapping_name = linker_o6_retargeter.mapping_name
+            logger_mp.info(
+                f"[DEX1] right wrist: Dex1-1 follows thumb-index distance {args.dex1_pinch_closed_m:.3f} m (closed) "
+                f"to {args.dex1_pinch_open_m:.3f} m (open); kp={args.dex1_kp} kd={args.dex1_kd} grip_delta={args.dex1_grip_delta} rad"
+            )
+        elif args.ee == "linker_o6":
             from teleop.robot_control.linker_o6_retargeting import DualLinkerO6Retargeter
 
             linker_o6_retargeter = DualLinkerO6Retargeter(
                 args.linker_o6_urdf_root, method=args.linker_o6_method
             )
             mapping_name = linker_o6_retargeter.mapping_name
+        if args.ee == "linker_o6":
             logger_mp.info(f"Linker O6 dex-retargeting: method={linker_o6_retargeter.method} mapping={mapping_name}")
 
         if args.dry_run:
@@ -1074,9 +1112,11 @@ if __name__ == '__main__':
             hand_ctrl = Brainco_Controller_ctrl(left_gripper_trigger_in, left_gripper_squeeze_in, right_gripper_trigger_in, right_gripper_squeeze_in,
                                                 dual_hand_data_lock, dual_hand_state_array, dual_hand_action_array, simulation_mode=args.sim, xr_motion_data_ready_in=xr_motion_data_ready)
         elif args.ee == "linker_o6":
+            # Left O6 (6 axes) + right O6 (6) or right Dex1-1 (1).
+            hand_sample_size = 6 + (1 if args.right_ee == "dex1" else 6)
             dual_hand_data_lock = Lock()
-            dual_hand_state_array = Array('d', 12, lock=False)
-            dual_hand_action_array = Array('d', 12, lock=False)
+            dual_hand_state_array = Array('d', hand_sample_size, lock=False)
+            dual_hand_action_array = Array('d', hand_sample_size, lock=False)
         else:
             pass
         
@@ -1235,7 +1275,15 @@ if __name__ == '__main__':
                 if not r1_activation_prepared:
                     if args.ee == "linker_o6":
                         from teleop.robot_control.robot_hand_linker_o6 import LinkerO6Controller
-                        hand_ctrl = LinkerO6Controller()
+                        if args.right_ee == "dex1":
+                            from teleop.robot_control.robot_hand_dex1_r1 import Dex1GripperController, O6Dex1Hands
+                            hand_ctrl = O6Dex1Hands(
+                                LinkerO6Controller(sides=("left",)),
+                                Dex1GripperController("right", kp=args.dex1_kp, kd=args.dex1_kd,
+                                                      grip_delta=args.dex1_grip_delta),
+                            )
+                        else:
+                            hand_ctrl = LinkerO6Controller()
                         hand_ctrl.wait_until_ready(timeout=3.0)
                         if STOP:
                             continue

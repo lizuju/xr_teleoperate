@@ -29,6 +29,15 @@ task_goal="$2"
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 dev_root="$(cd -- "${script_dir}/../.." && pwd)"
+right_ee_file="${HOME}/.config/xr_teleoperate/right_ee"
+right_ee="${R1_RIGHT_EE:-}"
+if [[ -z "$right_ee" && -r "$right_ee_file" ]]; then
+  right_ee="$(tr -d '[:space:]' < "$right_ee_file")"
+fi
+if [[ "${right_ee:-linker_o6}" == "dex1" ]]; then
+  echo "录制暂不支持右手 Dex1-1 夹爪（R1_RIGHT_EE=dex1）；遥操请用 run_r1_a7_vector.sh 或 run_r1_a7_visionpro.sh。" >&2
+  exit 2
+fi
 R1_PREFLIGHT_REQUIRE_CAMERA_CLOCK=1 bash "${script_dir}/run_r1_a7_vector.sh" --check-only
 check_only=false
 if [[ "${3:-}" == "--check-only" ]]; then
