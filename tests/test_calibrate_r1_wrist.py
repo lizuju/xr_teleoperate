@@ -312,7 +312,7 @@ class CaptureLoopTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 parse_capture_args([])
         left = parse_capture_args(["--side", "left"])
-        self.assertEqual(left.host, "192.168.110.20")
+        self.assertEqual(left.host, "192.168.5.10")
         self.assertEqual(left.port, 55556)
         self.assertEqual(left.topic, "left_wrist_camera")
         self.assertEqual(tuple(left.pattern), (9, 6))

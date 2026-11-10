@@ -316,7 +316,7 @@ class CaptureLoopTests(unittest.TestCase):
 
     def test_capture_cli_defaults_match_the_field_card(self):
         args = parse_capture_args([])
-        self.assertEqual(args.host, "192.168.110.20")
+        self.assertEqual(args.host, "192.168.5.10")
         self.assertEqual(args.port, 55555)
         self.assertEqual(tuple(args.pattern), (9, 6))
         self.assertAlmostEqual(args.square, 0.030)
