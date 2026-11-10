@@ -64,6 +64,11 @@ class Dex1PinchRetargeter:
         self.closed_m, self.open_m = float(closed_m), float(open_m)
         self.closed_q, self.open_q = float(closed_q), float(open_q)
         self.smoothing_s = float(smoothing_s)
+        # Read by recording metadata like a Linker O6 retargeter; no URDF is bundled.
+        self.hardware_joint_order = ("dex1_1_gripper",)
+        self.hardware_lower = np.array([self.closed_q])
+        self.hardware_upper = np.array([self.open_q])
+        self.urdf_path = None
         self._value = None
         self._time = None
 
@@ -167,7 +172,12 @@ class Dex1GripperController:
             except (TypeError, ValueError):
                 return None
 
-        return q, {"qvel": number("dq"), "torque": number("tau_est")}
+        def channel(attribute):
+            value = number(attribute)
+            return [] if value is None or not math.isfinite(value) else [value]
+
+        # Lists like the O6 channels; an absent reading stays empty, never zero.
+        return q, {"qvel": channel("dq"), "torque": channel("tau_est"), "temperature": [], "errors": []}
 
     def _on_state(self, message):
         try:
@@ -217,7 +227,7 @@ class Dex1GripperController:
                 raise RuntimeError("Dex1 state is not ready")
             return self.state, self.state_time, self.state_count
 
-    def _publish(self, q, request_sequence=None):
+    def _publish(self, q, request_sequence=None, following=False):
         message = MotorCmds_()
         message.cmds = [unitree_go_msg_dds__MotorCmd_()]
         command = message.cmds[0]
@@ -231,7 +241,8 @@ class Dex1GripperController:
         with self.state_lock:
             self.published_sequence += 1
             self.published_command = {
-                "q": [float(q)], "kp": self.kp, "kd": self.kd,
+                # mode mirrors the O6 meaning: 1 while following fresh tracking, 0 while holding.
+                "q": [float(q)], "mode": 1 if following else 0, "kp": self.kp, "kd": self.kd,
                 "monotonic_ns": int(time.monotonic() * 1e9),
                 "sequence": self.published_sequence,
                 "request_sequence": request_sequence,
@@ -266,7 +277,9 @@ class Dex1GripperController:
         self.action_time = time.monotonic()
         self.active = True
 
-    def update(self, target, tracking_fresh=True):
+    def update(self, target, tracking_fresh=True, request_sequence=None):
+        """Drive towards ``target``. ``request_sequence`` ties this publication to a paired
+        hand request (the O6 side's) so recordings can match both wrists to one request."""
         if not self.active:
             raise RuntimeError("Dex1 controller is not active")
         values = np.asarray(target, dtype=float).reshape(-1)
@@ -290,9 +303,10 @@ class Dex1GripperController:
             self.requested_target = self.desired
             self.requested_monotonic_ns = int(now * 1e9)
             self.requested_sequence += 1
-            request_sequence = self.requested_sequence
+            if request_sequence is None:
+                request_sequence = self.requested_sequence
         command = self._limited(state)
-        self._publish(command, request_sequence)
+        self._publish(command, request_sequence, following=bool(tracking_fresh))
         self.command_q = command
         self.action_time = now
 
@@ -314,13 +328,17 @@ class Dex1GripperController:
                 "state": {
                     "q": [self.state], "monotonic_ns": int(self.state_time * 1e9),
                     "sequence": self.state_count,
-                    "qvel": aux.get("qvel"), "torque": aux.get("torque"),
+                    "qvel": list(aux.get("qvel") or []), "torque": list(aux.get("torque") or []),
+                    "temperature": [], "errors": [],
                 },
                 "requested": None if self.requested_target is None else {
                     "q": [self.requested_target], "monotonic_ns": self.requested_monotonic_ns,
                     "sequence": self.requested_sequence,
                 },
-                "published": None if self.published_command is None else dict(self.published_command),
+                "published": None if self.published_command is None else {
+                    key: value[:] if isinstance(value, list) else value
+                    for key, value in self.published_command.items()
+                },
             }
 
     def get_recording_state_at(self, target_ns, end_ns):
@@ -363,6 +381,8 @@ class O6Dex1Retargeter:
         self.left = gripper_retargeter if gripper_side == "left" else o6_retargeter
         self.right = gripper_retargeter if gripper_side == "right" else o6_retargeter
         self.method = o6_retargeter.method
+        self.end_effectors = {"left": "dex1_1" if gripper_side == "left" else "linker_o6",
+                              "right": "dex1_1" if gripper_side == "right" else "linker_o6"}
         self.mapping_name = f"linker_o6_dex_{self.method}_v1+dex1_pinch_v1_{gripper_side}"
 
     def retarget(self, left_hand_points, right_hand_points):
@@ -411,8 +431,11 @@ class O6Dex1Hands:
             self.o6.update(*o6_targets, tracking_fresh=tuple(o6_fresh))
         except Exception as o6_error:
             error = o6_error
+        with self.o6.state_lock:
+            request_sequence = self.o6.requested_sequence
         try:
-            self.gripper.update(targets[self._gripper_index], tracking_fresh[self._gripper_index])
+            self.gripper.update(targets[self._gripper_index], tracking_fresh[self._gripper_index],
+                                request_sequence=request_sequence)
         except Exception as gripper_error:
             if error is None:
                 error = gripper_error

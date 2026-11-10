@@ -398,6 +398,28 @@ def resolve_camera_calibration(path, root=None):
     return default, load_camera_calibration(default)
 
 
+def without_cameras(calibration, names, reason):
+    """Copy of a loaded calibration with some cameras dropped, for example after a camera swap.
+
+    Their intrinsics, stereo pairs and hand-eye entries go, and the episode block carries a
+    warning naming the reason. ``source`` and ``sha256`` still identify the original file.
+    """
+    if calibration is None:
+        return None
+    names = set(names)
+    result = dict(calibration)
+    result["cameras"] = {name: entry for name, entry in calibration.get("cameras", {}).items()
+                         if name not in names}
+    result["stereo"] = {name: entry for name, entry in calibration.get("stereo", {}).items()
+                        if entry["left"] not in names and entry["right"] not in names}
+    result["hand_eye"] = {name: entry for name, entry in calibration.get("hand_eye", {}).items()
+                          if entry["camera"] not in names}
+    result["exclusion_warnings"] = list(calibration.get("exclusion_warnings", [])) + [
+        f"{name}: excluded from {calibration.get('source')}: {reason}"
+        for name in sorted(names) if name in calibration.get("cameras", {})]
+    return result
+
+
 def expected_cameras(camera_config):
     """Camera names a run should have calibration for."""
     names = list(COLOR_KEYS[key] for key in HEAD_COLOR_KEYS)
@@ -467,4 +489,5 @@ def camera_calibration_metadata(calibration, cameras, actual_image_sizes=None):
     for name, entry in block["hand_eye"].items():
         if entry["camera"] not in block["cameras"]:
             block["warnings"].append(f"hand_eye.{name}: {entry['camera']} has no intrinsics in this run.")
+    block["warnings"].extend(calibration.get("exclusion_warnings", []))
     return block

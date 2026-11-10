@@ -15,6 +15,17 @@ from teleop.utils.frame_sync import CameraSynchronizer, feedback_target_ns
 #: An action older than this is rejected for training anyway (request_age_ms), so
 #: pairing to it would only trade a fresh image for an old one.
 OBSERVATION_CUTOFF_MAX_AGE_NS = 100_000_000
+#: What each recorded end-effector vector means, per device.
+END_EFFECTOR_UNITS = {
+    "linker_o6": {"qpos": "normalized_vendor_axis_0_to_1 (see hand_qpos)", "qvel": "normalized_0_to_1",
+                  "torque": "normalized_0_to_1 (see hand_torque)"},
+    "dex1_1": {"qpos": ("rad, Dex1-1 output shaft angle from dex1_1_service: 0 is the calibrated "
+                        "tightly closed jaw, about 5.4 is fully open (90 mm)"),
+               "qvel": "rad/s at the output shaft",
+               "torque": "N*m estimated at the output shaft (tau_est), not a contact force",
+               "action": ("requested jaw target before the force limit; the command sent leads the "
+                          "measured angle by at most grip_delta, which is what squeezes an object")},
+}
 HEAD_IMAGE_TIMEOUT_S = 0.5
 
 
@@ -68,16 +79,21 @@ def capture_metadata(args, camera_config, retargeter, calibration=None, recordin
     if getattr(args, "tracking_source", "webxr") == "visionpro":
         code_paths += [root / "teleop/utils/visionpro_source.py", root / "tools/visionpro_bridge.py",
                        root / "tools/visionpro_protocol/handtracking.proto"]
-    models = {
-        "arm": root / "assets/r1/r1_a7.urdf",
-        "left_hand": retargeter.left.urdf_path,
-        "right_hand": retargeter.right.urdf_path,
-    }
+    # Per-side devices: two Linker O6 hands, or an O6 next to a Dex1-1 gripper.
+    end_effectors = dict(getattr(retargeter, "end_effectors", None) or {"left": "linker_o6", "right": "linker_o6"})
+    hands = {"left": retargeter.left, "right": retargeter.right}
+    models = {"arm": root / "assets/r1/r1_a7.urdf"}
+    for side, hand in hands.items():
+        if getattr(hand, "urdf_path", None) is not None:
+            models[f"{side}_hand"] = hand.urdf_path
     names = [joint.name for joint in R1_A7_JointArmIndex]
     height, width = camera_config["head_camera"]["image_shape"]
     images = color_image_specs(camera_config)
     return {
-        "robot": "R1_A7", "end_effector": "linker_o6",
+        "robot": "R1_A7",
+        "end_effector": ("linker_o6" if set(end_effectors.values()) == {"linker_o6"}
+                         else f"{end_effectors['left']}_left+{end_effectors['right']}_right"),
+        "end_effectors": end_effectors,
         "tf": None if recording_tf is None else recording_tf.metadata,
         "retargeting_method": retargeter.method,
         "retargeting_mapping": retargeter.mapping_name,
@@ -151,11 +167,13 @@ def capture_metadata(args, camera_config, retargeter, calibration=None, recordin
                   "hand_temperature": "raw device register value",
                   "hand_errors": ("per-joint O6 fault code; all zeros means no fault was "
                                   "reported. PC2 only fills reserve[0] once hand_dds_service "
-                                  "forwards hand_state.errors")},
+                                  "forwards hand_state.errors"),
+                  # The hand_* entries above describe a Linker O6. This names the unit per side.
+                  "end_effectors": {side: END_EFFECTOR_UNITS[device] for side, device in end_effectors.items()}},
         "hand_axis_normalization": {
             side: {"lower_rad": hand.hardware_lower.tolist(), "upper_rad": hand.hardware_upper.tolist(),
                    "formula": "q_normalized = (q_rad - lower_rad) / (upper_rad - lower_rad)"}
-            for side, hand in (("left", retargeter.left), ("right", retargeter.right))
+            for side, hand in hands.items() if end_effectors[side] == "linker_o6"
         },
         "action_semantics": {
             "actions": "requested position targets before publisher limiting or hand smoothing",
