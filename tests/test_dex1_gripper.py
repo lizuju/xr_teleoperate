@@ -174,6 +174,13 @@ class Dex1GripperTest(unittest.TestCase):
         for distance, expected in ((0.01, 0.0), (0.02, 0.0), (0.06, 2.7), (0.10, 5.4), (0.30, 5.4)):
             self.assertAlmostEqual(retargeter.retarget(hand_points(distance))[0], expected, places=6)
 
+    def test_cup_minimum_remaps_the_whole_pinch_range(self):
+        retargeter = self.dex1.Dex1PinchRetargeter(0.02, 0.10, smoothing_s=0.0, closed_q=2.0)
+        for distance, expected in ((0.0, 2.0), (0.02, 2.0), (0.06, 3.7), (0.10, 5.4), (0.30, 5.4)):
+            with self.subTest(distance=distance):
+                self.assertAlmostEqual(retargeter.retarget(hand_points(distance))[0], expected)
+        np.testing.assert_allclose(retargeter.hardware_lower, [2.0])
+
     def test_pinch_smoothing_moves_part_of_the_way(self):
         retargeter = self.dex1.Dex1PinchRetargeter(0.02, 0.10, smoothing_s=0.02)
         self.assertAlmostEqual(retargeter.retarget(hand_points(0.02), now=10.0)[0], 0.0)
@@ -235,6 +242,48 @@ class Dex1GripperTest(unittest.TestCase):
         gripper.update([9.0])
         np.testing.assert_allclose(gripper.get_action(), [5.4])
         self.assertAlmostEqual(self.last_q(), 5.4)
+
+    def test_cup_minimum_survives_repeated_pinch_and_tracking_hold(self):
+        gripper = self.ready_gripper(q=2.3, closed_q=2.0)
+        measured = 2.3
+        for _ in range(8):
+            FakeSubscriber.deliver("rt/dex1/right/state", gripper_state(measured))
+            gripper.update([-10.0])
+            measured = self.last_q()
+            self.assertGreaterEqual(measured, 2.0)
+            np.testing.assert_allclose(gripper.get_action(), [2.0])
+        self.assertAlmostEqual(measured, 2.0)
+        for fresh in (False, True, False, True):
+            FakeSubscriber.deliver("rt/dex1/right/state", gripper_state(2.05))
+            gripper.update(gripper.get_action() if fresh else [5.4], tracking_fresh=fresh)
+            self.assertAlmostEqual(self.last_q(), 2.0)
+            self.assertEqual(gripper.get_recording_snapshot()["requested"]["q"], [2.0])
+
+    def test_activation_below_cup_minimum_holds_then_opens_gradually(self):
+        gripper = self.ready_gripper(q=0.5, closed_q=2.0)
+        self.assertAlmostEqual(self.last_q(), 0.5)
+        np.testing.assert_allclose(gripper.get_action(), [2.0])
+        measured = 0.5
+        for _ in range(12):
+            FakeSubscriber.deliver("rt/dex1/right/state", gripper_state(measured))
+            gripper.update([0.0])
+            command = self.last_q()
+            self.assertGreaterEqual(command, measured)
+            self.assertLessEqual(command - measured, self.dex1.DEFAULT_GRIP_DELTA + 1e-9)
+            self.assertLessEqual(command, 2.0)
+            measured = command
+        self.assertAlmostEqual(measured, 2.0)
+
+    def test_cup_minimum_keeps_the_full_opening_available(self):
+        gripper = self.ready_gripper(q=2.0, closed_q=2.0)
+        measured = 2.0
+        for _ in range(22):
+            FakeSubscriber.deliver("rt/dex1/right/state", gripper_state(measured))
+            gripper.update([10.0])
+            measured = self.last_q()
+            self.assertLessEqual(measured, 5.4)
+        np.testing.assert_allclose(gripper.get_action(), [5.4])
+        self.assertAlmostEqual(measured, 5.4)
 
     def test_stale_feedback_raises_and_publishes_nothing(self):
         gripper = self.ready_gripper(q=1.0)

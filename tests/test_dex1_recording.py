@@ -53,7 +53,7 @@ def to_mixed(manifest, rows):
 
 class MixedMetadataTest(unittest.TestCase):
     def test_metadata_names_each_wrist_device(self):
-        retargeter = O6Dex1Retargeter(o6_hand(), Dex1PinchRetargeter(), gripper_side="right")
+        retargeter = O6Dex1Retargeter(o6_hand(), Dex1PinchRetargeter(closed_q=2.0), gripper_side="right")
         camera_config = {"head_camera": {"binocular": True, "image_shape": [448, 1088], "fps": 30, "enable_zmq": True},
                          "left_wrist_camera": {"enable_zmq": True, "image_shape": [480, 640], "fps": 30},
                          "right_wrist_camera": {"enable_zmq": True, "image_shape": [480, 640], "fps": 30}}
@@ -61,6 +61,7 @@ class MixedMetadataTest(unittest.TestCase):
         metadata = capture_metadata(args, camera_config, retargeter)
         self.assertEqual(metadata["end_effector"], MIXED_NAME)
         self.assertEqual(metadata["end_effectors"], MIXED)
+        self.assertEqual(metadata["gripper_position_limits"], {"right": {"min_q_rad": 2.0, "max_q_rad": 5.4}})
         self.assertEqual(metadata["joint_names"]["right_ee"], ["dex1_1_gripper"])
         self.assertEqual(len(metadata["joint_names"]["left_ee"]), 6)
         self.assertEqual(set(metadata["models"]), {"arm", "left_hand"})
@@ -76,6 +77,7 @@ class MixedMetadataTest(unittest.TestCase):
         camera_config = {"head_camera": {"binocular": True, "image_shape": [448, 1088], "fps": 30, "enable_zmq": True}}
         metadata = capture_metadata(SimpleNamespace(frequency=40.0), camera_config, retargeter)
         self.assertEqual(metadata["end_effector"], "linker_o6")
+        self.assertEqual(metadata["gripper_position_limits"], {})
         self.assertEqual(training_groups(metadata), {"left_arm": 7, "right_arm": 7, "left_ee": 6,
                                                      "right_ee": 6, "body": 3})
 

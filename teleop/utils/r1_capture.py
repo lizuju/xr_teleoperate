@@ -94,6 +94,10 @@ def capture_metadata(args, camera_config, retargeter, calibration=None, recordin
         "end_effector": ("linker_o6" if set(end_effectors.values()) == {"linker_o6"}
                          else f"{end_effectors['left']}_left+{end_effectors['right']}_right"),
         "end_effectors": end_effectors,
+        "gripper_position_limits": {
+            side: {"min_q_rad": hand.closed_q, "max_q_rad": hand.open_q}
+            for side, hand in hands.items() if end_effectors[side] == "dex1_1"
+        },
         "tf": None if recording_tf is None else recording_tf.metadata,
         "retargeting_method": retargeter.method,
         "retargeting_mapping": retargeter.mapping_name,

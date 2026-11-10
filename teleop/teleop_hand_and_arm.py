@@ -440,6 +440,8 @@ if __name__ == '__main__':
                         'internal wiring, Unitree app hand type set to Dex1-1, driven as an rt/lowcmd slot by the main controller. '
                         'service: external 485-to-USB board with dex1_1_service on PC2 (rt/dex1/right/*).')
     parser.add_argument('--dex1-slot', type=int, default=33, help='rt/lowcmd slot of the internally wired right Dex1-1 (G1 and R1 use 33)')
+    parser.add_argument('--dex1-min-q', type=float, default=0.0, help='Minimum right Dex1-1 target angle in rad, 0 <= q < 5.4. '
+                        'Closing the fingers stops at this calibrated opening instead of fully closing; this is a position limit, not a force setting.')
     parser.add_argument('--dex1-kp', type=float, default=5.0, help='Dex1-1 position gain at the output shaft (vendor default 5.0)')
     parser.add_argument('--dex1-kd', type=float, default=0.05, help='Dex1-1 damping gain (vendor default 0.05)')
     parser.add_argument('--dex1-grip-delta', type=float, default=0.18, help='How far in rad the Dex1-1 command may lead its measured position. '
@@ -544,6 +546,8 @@ if __name__ == '__main__':
         if not (math.isfinite(args.dex1_pinch_closed_m) and math.isfinite(args.dex1_pinch_open_m)
                 and 0.0 <= args.dex1_pinch_closed_m < args.dex1_pinch_open_m):
             parser.error("--dex1-pinch-closed-m and --dex1-pinch-open-m need 0 <= closed < open.")
+        if not (math.isfinite(args.dex1_min_q) and 0.0 <= args.dex1_min_q < 5.4):
+            parser.error("--dex1-min-q must be finite and satisfy 0 <= q < 5.4 rad.")
         if args.dex1_transport == "lowcmd" and not 31 <= args.dex1_slot <= 34:
             parser.error("--dex1-slot must be one of the spare lowcmd slots 31-34.")
         for name in ("dex1_kp", "dex1_kd", "dex1_grip_delta"):
@@ -808,13 +812,13 @@ if __name__ == '__main__':
             linker_o6_retargeter = O6Dex1Retargeter(
                 LinkerO6HandRetargeter(Path(args.linker_o6_urdf_root) / "left" / "linkerhand_o6_left.urdf",
                                        "left", args.linker_o6_method),
-                Dex1PinchRetargeter(args.dex1_pinch_closed_m, args.dex1_pinch_open_m),
+                Dex1PinchRetargeter(args.dex1_pinch_closed_m, args.dex1_pinch_open_m, closed_q=args.dex1_min_q),
                 gripper_side="right",
             )
             mapping_name = linker_o6_retargeter.mapping_name
             logger_mp.info(
                 f"[DEX1] right wrist: Dex1-1 follows thumb-index distance {args.dex1_pinch_closed_m:.3f} m (closed) "
-                f"to {args.dex1_pinch_open_m:.3f} m (open); kp={args.dex1_kp} kd={args.dex1_kd} grip_delta={args.dex1_grip_delta} rad; "
+                f"to {args.dex1_pinch_open_m:.3f} m (open); minimum target={args.dex1_min_q:.4f} rad; kp={args.dex1_kp} kd={args.dex1_kd} grip_delta={args.dex1_grip_delta} rad; "
                 + (f"internal wiring, rt/lowcmd slot {args.dex1_slot}" if args.dex1_transport == "lowcmd"
                    else "485-to-USB board, dex1_1_service on PC2")
             )
@@ -1308,10 +1312,10 @@ if __name__ == '__main__':
                                 # Configures the arm's lowcmd slot before arm_ctrl.activate() below.
                                 gripper = Dex1LowCmdGripper(arm_ctrl, slot=args.dex1_slot, side="right",
                                                             kp=args.dex1_kp, kd=args.dex1_kd,
-                                                            grip_delta=args.dex1_grip_delta)
+                                                            grip_delta=args.dex1_grip_delta, closed_q=args.dex1_min_q)
                             else:
                                 gripper = Dex1GripperController("right", kp=args.dex1_kp, kd=args.dex1_kd,
-                                                                grip_delta=args.dex1_grip_delta)
+                                                                grip_delta=args.dex1_grip_delta, closed_q=args.dex1_min_q)
                             hand_ctrl = O6Dex1Hands(LinkerO6Controller(sides=("left",)), gripper)
                         else:
                             hand_ctrl = LinkerO6Controller()
