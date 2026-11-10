@@ -60,6 +60,13 @@
 #   R1_RIGHT_EE         右手腕装的是什么：linker_o6（默认）或 dex1（宇树 Dex1-1 夹爪，PC2 上跑 dex1_1_service）。
 #                       不设时读 ~/.config/xr_teleoperate/right_ee 这个文件（一行，linker_o6 或 dex1），
 #                       所以换手以后改一次文件即可，启动命令不用变。预检会按它检查右手的反馈话题。
+#   WRIST_STABILIZER    默认 on：手指在动时对手腕目标做轻量平滑，时间常数 40 ms。
+#                       不再设置小动作死区，细微位移和转动每帧都会响应。
+#                       WRIST_STABILIZER_POSITION_MM（默认 3 mm）和 WRIST_STABILIZER_ROTATION_DEG（默认 3 度）
+#                       限制的是滤波落后量，不是保持不动的范围；设为 0 则该分量直通。
+#                       指尖速度低于 0.08 m/s 后保持 0.1 s，再用 0.1 s 退出平滑。
+#                       可减轻快速抖动，无法消除与主动转腕同频的缓慢追踪偏移。
+#                       关掉：WRIST_STABILIZER=off
 #   R1_DEX1_TRANSPORT   Dex1-1 的接法：lowcmd（默认，内走线；宇树 App 灵巧手类型设为 Dex1-1，主控把它当 rt/lowcmd 的一个关节）
 #                       或 service（外接 485 转 USB 板，PC2 上跑 dex1_1_service）。R1_DEX1_SLOT 是内走线的关节位，默认 33。
 #                       标定结果会写进每个 episode 的 info.camera_calibration，供后面数采/训练使用。
@@ -127,6 +134,9 @@ exec "$python" -u teleop_hand_and_arm.py \
   --right-ee "$R1_RIGHT_EE" \
   --dex1-transport "${R1_DEX1_TRANSPORT:-lowcmd}" \
   --dex1-slot "${R1_DEX1_SLOT:-33}" \
+  --wrist-stabilizer "${WRIST_STABILIZER:-on}" \
+  --wrist-stabilizer-position-mm "${WRIST_STABILIZER_POSITION_MM:-3}" \
+  --wrist-stabilizer-rotation-deg "${WRIST_STABILIZER_ROTATION_DEG:-3}" \
   --linker-o6-method vector \
   --linker-o6-urdf-root "${dev_root}/linkerhand-urdf/O6" \
   --waist-follow \

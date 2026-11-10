@@ -12,6 +12,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from teleop.robot_control.r1_wrist_stabilizer import WristStabilizer
 from teleop.robot_control.r1_hand_tracking import R1WristHold, hand_tracking_freshness, hand_tracking_present
 from teleop.robot_control.r1_wrist_workspace import R1WristWorkspace
 
@@ -50,6 +51,7 @@ class SideIndependenceTest(unittest.TestCase):
             right_wrist_pose=pose(0.0, [0.35, -0.22, 0.78]),
             motion_data_ready=True, motion_data_timestamp=99.0,
             left_hand_timestamp=1.0, right_hand_timestamp=0.0,
+            left_hand_pos=np.zeros((25, 3)), right_hand_pos=np.zeros((25, 3)),
         )
         controller = Mock()
         controller.get_current_waist_yaw.return_value = 0.0
@@ -68,6 +70,9 @@ class SideIndependenceTest(unittest.TestCase):
         ns = {
             "np": np, "math": math, "STOP": False, "completed": False,
             "visionpro_source": None,
+            # The stabilizer sits between the anchored target and the hold logic: a present
+            # hand passes through it, a lost hand resets it.
+            "wrist_stabilizers": (WristStabilizer(), WristStabilizer()), "loop_monotonic": 1.0,
             "R1_PAUSE": None, "r1_frozen_generation": -1, "r1_head_q_offset": np.zeros(2),
             "args": SimpleNamespace(
                 waist_follow=False, ee=None, input_mode="hand", motion=False,
@@ -129,6 +134,9 @@ class SideIndependenceTest(unittest.TestCase):
                                    err_msg="fresh left hand must keep following")
         np.testing.assert_allclose(right_target[:3, 3], [0.35, -0.22, 0.78], atol=1e-12,
                                    err_msg="stale right hand must hold its reference")
+        left_stabilizer, right_stabilizer = ns["wrist_stabilizers"]
+        self.assertEqual(left_stabilizer._time, 1.0, "present hand goes through the stabilizer")
+        self.assertIsNone(right_stabilizer._time, "lost hand resets the stabilizer")
         # The IK must still be solving (one live side is enough to publish)
         ik.solve_ik.assert_called()
         print("\n  左目标 == 新鲜样本:", np.allclose(left_target[:3, 3], sample.left_wrist_pose[:3, 3]))

@@ -484,6 +484,12 @@ if __name__ == '__main__':
     parser.add_argument('--arm-dq-limit', type=float, default=6.0, help='R1_A7: clamp on the feed-forward velocity in rad/s (safety net, not a tracking limit).')
     parser.add_argument('--arm-dq-filter', type=float, default=0.5, help='R1_A7: low-pass factor for the feed-forward velocity derivative, 1.0 = unfiltered.')
     parser.add_argument('--arm-target-velocity-limit', type=float, default=6.0, help='R1_A7: shape the IK joint target to this speed (rad/s) before dq feed-forward is taken from it. Fast XR/IK bursts otherwise become a step the servo chases. 0 disables. 6 matches --arm-dq-limit and the ~5 rad/s the arm delivered with feed-forward on 2026-09-16; this is not the revoked 3.0 position clip.')
+    parser.add_argument('--wrist-stabilizer', choices=['on', 'off'], default='on', help='R1_A7: lightly smooth wrist targets during finger motion with a 40 ms time constant. '
+                        'Small movements keep responding; the limits below cap smoothing lag rather than freezing the pose. '
+                        'After a short hold/release, settled fingers give exact passthrough.')
+    parser.add_argument('--wrist-stabilizer-position-mm', type=float, default=3.0, help='R1_A7: maximum wrist smoothing position offset in millimetres; 0 passes position through')
+    parser.add_argument('--wrist-stabilizer-rotation-deg', type=float, default=3.0, help='R1_A7: maximum wrist smoothing orientation offset in degrees; 0 passes orientation through')
+    parser.add_argument('--wrist-stabilizer-finger-speed', type=float, default=0.08, help='R1_A7: fingertip speed in the wrist frame (m/s) that counts as the fingers moving')
     parser.add_argument('--arm-target-accel-limit', type=float, default=40.0, help='R1_A7: how fast the shaped reference may change speed, in rad/s^2. 40 reaches 6 rad/s in 0.15 s. 0 means no acceleration limit. This is the term that removes fast-motion jerk; the velocity ceiling only stretches catch-up after a stale sample.')
     parser.add_argument('--wrist-display', type=str, choices=['auto', 'both', 'left', 'right', 'off'], default='auto', help='Vision Pro wrist camera panels: auto/both show both sides, left/right show one, off disables them. Panels and recording both read the wrist JPEG over ZMQ; wrist WebRTC on PC2 is unused.')
     parser.add_argument('--hand-torque-hud', choices=['on', 'off'], default='off', help='Draw Linker O6 joint-torque digits on the Vision Pro head view. Default off: the reading is motor current, not contact force, and is not used to decide a grasp or written into recordings. on shows left eye = left hand, right eye = right hand, and prints [XR TORQUE] in the terminal.')
@@ -577,6 +583,11 @@ if __name__ == '__main__':
         parser.error("--workspace-rotation-tolerance-rad must be finite and non-negative.")
     if not (math.isfinite(args.arm_limit_softness) and args.arm_limit_softness >= 0.0):
         parser.error("--arm-limit-softness must be finite and non-negative.")
+    for name in ("wrist_stabilizer_position_mm", "wrist_stabilizer_rotation_deg"):
+        if not (math.isfinite(getattr(args, name)) and getattr(args, name) >= 0.0):
+            parser.error(f"--{name.replace('_', '-')} must be finite and non-negative.")
+    if not (math.isfinite(args.wrist_stabilizer_finger_speed) and args.wrist_stabilizer_finger_speed > 0.0):
+        parser.error("--wrist-stabilizer-finger-speed must be positive.")
     if not (math.isfinite(args.arm_posture_weight) and args.arm_posture_weight >= 0.0):
         parser.error("--arm-posture-weight must be finite and non-negative.")
 
@@ -600,6 +611,7 @@ if __name__ == '__main__':
     arm_ik = None
     hand_ctrl = None
     linker_o6_loop = None
+    wrist_stabilizers = None
     motion_switcher = None
     r1_vision_left_reference = None
     r1_vision_right_reference = None
@@ -1536,6 +1548,17 @@ if __name__ == '__main__':
             wrist_holds = (R1WristHold(r1_robot_left_reference), R1WristHold(r1_robot_right_reference))
             wrist_workspaces = (R1WristWorkspace(r1_robot_left_reference), R1WristWorkspace(r1_robot_right_reference))
             held_head_q_target = arm_ctrl.get_current_head_q().copy()
+            if args.wrist_stabilizer == "on":
+                from teleop.robot_control.r1_wrist_stabilizer import WristStabilizer
+                wrist_stabilizers = tuple(
+                    WristStabilizer(position_m=args.wrist_stabilizer_position_mm / 1000.0,
+                                    rotation_rad=math.radians(args.wrist_stabilizer_rotation_deg),
+                                    finger_speed=args.wrist_stabilizer_finger_speed)
+                    for _ in range(2))
+                logger_mp.info(
+                    "[R1 WRIST STABILIZER] on: 40 ms smoothing above fingertip speed %.2f m/s, "
+                    "maximum offset %.1f mm / %.1f deg; no dead zone", args.wrist_stabilizer_finger_speed,
+                    args.wrist_stabilizer_position_mm, args.wrist_stabilizer_rotation_deg)
 
         if args.ee == "linker_o6":
             from teleop.robot_control.linker_o6_control_loop import LinkerO6ControlLoop
@@ -1715,6 +1738,8 @@ if __name__ == '__main__':
                     r1_head_q_offset = np.array(held["head_q"])
                     held_head_q_target = r1_head_q_offset.copy()
                     wrist_holds = (R1WristHold(r1_robot_left_reference), R1WristHold(r1_robot_right_reference))
+                    for stabilizer in wrist_stabilizers or ():
+                        stabilizer.reset()
                     wrist_workspaces = (R1WristWorkspace(r1_robot_left_reference), R1WristWorkspace(r1_robot_right_reference))
                     arm_ik.reset_smoothing(reference_q=held_q)
                     last_fresh_tele_data = tele_data
@@ -1730,11 +1755,13 @@ if __name__ == '__main__':
                     hold.resume_streak = hold.resume_streak + 1 if present else 0
                     hand_present.append(present and (hold.tracking or hold.resume_streak >= 2))
                 hand_present = tuple(hand_present)
-                for side, hold, present in zip(("left", "right"), wrist_holds, hand_present):
+                for index, (side, hold, present) in enumerate(zip(("left", "right"), wrist_holds, hand_present)):
                     if present != hold.tracking and capture_mode != "paused":
                         logger_mp.info(f"[R1 HAND TRACKING] {side}: {'resumed; position follows fixed reference via IK filter' if present else 'lost; holding target'}")
                     if not present:
                         hold.hold()
+                        if wrist_stabilizers is not None:
+                            wrist_stabilizers[index].reset()
                 for workspace, present in zip(wrist_workspaces, hand_present):
                     if not present:
                         workspace.hold()
@@ -1882,6 +1909,16 @@ if __name__ == '__main__':
                         r1_waist_to_root,
                         args.arm_translation_scale,
                     )
+                if r1_independent_hands and wrist_stabilizers is not None:
+                    # Before the workspace and hold logic, so those see the target the arm will get.
+                    stabilized_targets = []
+                    for stabilizer, wrist_target, hand_points, present in zip(
+                            wrist_stabilizers, (left_wrist_target, right_wrist_target),
+                            (tele_data.left_hand_pos, tele_data.right_hand_pos), hand_present):
+                        if present:
+                            wrist_target = stabilizer.update(wrist_target, hand_points, loop_monotonic)
+                        stabilized_targets.append(wrist_target)
+                    left_wrist_target, right_wrist_target = stabilized_targets
                 if r1_independent_hands:
                     raw_wrist_targets = (left_wrist_target.copy(), right_wrist_target.copy())
                     workspace_tracking = tuple(
@@ -2123,6 +2160,9 @@ if __name__ == '__main__':
                     "head_pose": tele_data.head_pose.tolist(),
                     "vision_left_processed_dynamic_heading": tele_data.left_wrist_pose.tolist(),
                     "vision_right_processed_dynamic_heading": tele_data.right_wrist_pose.tolist(),
+                    "wrist_stabilizer": None if wrist_stabilizers is None else {
+                        "gate": [float(stabilizer.gate) for stabilizer in wrist_stabilizers],
+                        "finger_speed": [float(stabilizer.last_finger_speed) for stabilizer in wrist_stabilizers]},
                     "vision_left_fixed_heading": left_wrist_pose.tolist(),
                     "vision_right_fixed_heading": right_wrist_pose.tolist(),
                     "left_target": left_wrist_target.tolist(),
@@ -2379,6 +2419,9 @@ if __name__ == '__main__':
                     loop_jitter["worst_at_s"] if loop_jitter["worst_at_s"] is not None else -1.0,
                     loop_jitter["iterations"],
                 )
+                if wrist_stabilizers is not None:
+                    logger_mp.info("[R1 WRIST STABILIZER] left: %s; right: %s",
+                                   wrist_stabilizers[0].summary(), wrist_stabilizers[1].summary())
         except Exception as e:
             logger_mp.warning(f"Failed to write session summary: {e}")
         try:

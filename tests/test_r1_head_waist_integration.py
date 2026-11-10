@@ -9,6 +9,7 @@ from unittest.mock import Mock, patch
 
 import numpy as np
 from teleop.robot_control.r1_wrist_workspace import R1WristWorkspace
+from teleop.robot_control.r1_wrist_stabilizer import WristStabilizer, rotation_from_vector
 from scipy.spatial.transform import Rotation
 
 try:
@@ -122,6 +123,7 @@ class R1HeadWaistIntegrationTest(unittest.TestCase):
         return {
             "np": np, "math": math, "STOP": False, "completed": False,
             "visionpro_source": None,
+            "wrist_stabilizers": None, "loop_monotonic": 1.0,
             "R1WristWorkspace": R1WristWorkspace,
             "R1_PAUSE": None, "r1_frozen_generation": -1, "r1_head_q_offset": np.zeros(2),
             "args": SimpleNamespace(
@@ -246,6 +248,98 @@ class R1HeadWaistIntegrationTest(unittest.TestCase):
         sample.left_hand_pos = np.ones((25, 3))
         sample.right_hand_pos = np.ones((25, 3))
         return ns, sample
+
+    def test_fast_finger_wobble_is_smoothed_before_reaching_ik(self):
+        ns, sample = self.independent_context()
+        ns["wrist_stabilizers"] = (WristStabilizer(), WristStabilizer())
+        now = [1.0]
+        ns["time"].monotonic = lambda: now[0]
+        distances = []
+        for frame in range(80):
+            now[0] = 1.0 + frame * 0.025
+            ns["loop_monotonic"] = now[0]
+            sample.left_hand_timestamp = sample.right_hand_timestamp = now[0]
+            points = np.zeros((25, 3))
+            points[[4, 9, 14, 19, 24], 0] = 0.015 * math.sin(frame * 0.9)
+            sample.left_hand_pos = sample.right_hand_pos = points
+            for side, reference in (("left", self.left), ("right", self.right)):
+                target = reference.copy()
+                if frame >= 20:
+                    target[0, 3] += 0.001 * math.sin(frame * 2 * math.pi * 8 * 0.025)
+                setattr(sample, side + "_wrist_pose", target)
+            execute(self.control_nodes, ns, loop=True)
+            distances.append([np.linalg.norm(observed[:3, 3] -
+                              compensate_wrist_for_waist(reference, 0.43, 0.17)[:3, 3])
+                              for observed, reference in zip(ns["arm_ik"].solve_ik.call_args.args[:2],
+                                                             (self.left, self.right))])
+        for peak in np.max(distances[40:], axis=0):
+            self.assertGreater(peak, 0.0001)
+            self.assertLess(peak, 0.00055)
+
+    def test_tiny_motion_reaches_ik_while_fingers_are_moving(self):
+        ns, sample = self.independent_context()
+        ns["wrist_stabilizers"] = (WristStabilizer(), WristStabilizer())
+        now = [1.0]
+        ns["time"].monotonic = lambda: now[0]
+        for frame in range(40):
+            now[0] = 1.0 + frame * 0.025
+            ns["loop_monotonic"] = now[0]
+            sample.left_hand_timestamp = sample.right_hand_timestamp = now[0]
+            points = np.zeros((25, 3))
+            points[[4, 9, 14, 19, 24], 0] = 0.015 * math.sin(frame * 0.9)
+            sample.left_hand_pos = sample.right_hand_pos = points
+            for side, reference in (("left", self.left), ("right", self.right)):
+                target = reference.copy()
+                if frame >= 20:
+                    target[0, 3] += 0.0002
+                    target[:3, :3] = rotation_from_vector(np.array([0.0, 0.0, math.radians(0.2)])) @ target[:3, :3]
+                setattr(sample, side + "_wrist_pose", target)
+            execute(self.control_nodes, ns, loop=True)
+            if frame in (20, 39):
+                for observed, reference, target in zip(ns["arm_ik"].solve_ik.call_args.args[:2],
+                                                       (self.left, self.right),
+                                                       (sample.left_wrist_pose, sample.right_wrist_pose)):
+                    origin = compensate_wrist_for_waist(reference, 0.43, 0.17)
+                    self.assertGreater(np.linalg.norm(observed[:3, 3] - origin[:3, 3]), 0.00008)
+                    if frame == 39:
+                        np.testing.assert_allclose(observed, compensate_wrist_for_waist(target, 0.43, 0.17), atol=1e-7)
+        self.assertTrue(all(s.gate > 0.0 for s in ns["wrist_stabilizers"]))
+
+    def test_still_fingers_keep_small_intended_wrist_motion(self):
+        ns, sample = self.independent_context()
+        ns["wrist_stabilizers"] = (WristStabilizer(), WristStabilizer())
+        now = [1.0]
+        ns["time"].monotonic = lambda: now[0]
+        for frame in range(8):
+            now[0] = 1.0 + frame * 0.025
+            ns["loop_monotonic"] = now[0]
+            sample.left_hand_timestamp = sample.right_hand_timestamp = now[0]
+            sample.left_hand_pos = sample.right_hand_pos = np.zeros((25, 3))
+            for side, reference in (("left", self.left), ("right", self.right)):
+                target = reference.copy()
+                target[0, 3] += frame * 0.001
+                setattr(sample, side + "_wrist_pose", target)
+            execute(self.control_nodes, ns, loop=True)
+            for observed, target in zip(ns["arm_ik"].solve_ik.call_args.args[:2],
+                                        (sample.left_wrist_pose, sample.right_wrist_pose)):
+                expected = compensate_wrist_for_waist(target, 0.43, 0.17)
+                np.testing.assert_allclose(observed, expected, atol=1e-12)
+
+    def test_both_hand_loss_resets_active_stabilizers_without_solving_ik(self):
+        ns, sample = self.independent_context()
+        ns["wrist_stabilizers"] = (WristStabilizer(), WristStabilizer())
+        for stabilizer in ns["wrist_stabilizers"]:
+            for frame in range(10):
+                points = np.zeros((25, 3))
+                points[[4, 9, 14, 19, 24], 0] = 0.01 * frame
+                stabilizer.update(self.left, points, 0.75 + frame * 0.025)
+            self.assertGreater(stabilizer.gate, 0.0)
+        sample.left_hand_timestamp = sample.right_hand_timestamp = 0.0
+        execute(self.control_nodes, ns, loop=True)
+        ns["arm_ik"].solve_ik.assert_not_called()
+        for stabilizer in ns["wrist_stabilizers"]:
+            self.assertEqual(stabilizer.gate, 0.0)
+            self.assertIsNone(stabilizer._time)
 
     def test_independent_mode_is_enabled_for_r1_hand_simulation_and_real_control(self):
         names = {"r1_a7_deferred_real", "r1_a7_anchored", "r1_independent_hands"}
