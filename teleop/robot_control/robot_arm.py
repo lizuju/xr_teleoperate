@@ -2107,6 +2107,11 @@ class R1_A7_ArmController:
         self.simulation_mode = simulation_mode
         self.deferred_activation = deferred_activation
         self.defer_publisher_start = False
+        # Internally wired grippers (Unitree Dex1-1 set as the hand type in the Unitree app)
+        # are lowcmd slots of their own. slot -> {"kp", "kd", "q"}; q None follows the
+        # measured angle, so until a target arrives only damping acts on the jaw.
+        self.gripper_lock = threading.Lock()
+        self.gripper_slots = {}
         self.kp_high = 200.0
         self.kd_high = 3.0
         self.kp_low = 50.0
@@ -2378,6 +2383,11 @@ class R1_A7_ArmController:
             # the subscription and timed out ArmController startup.
             # getattr keeps that thread alive on SDK builds without the field.
             lowstate.motor_state[id].tau = getattr(msg.motor_state[id], "tau_est", 0.0)
+        for slot in list(getattr(self, "gripper_slots", {})):
+            # A slot with no device reports motorstate 0x80000000 and zero voltage.
+            source = msg.motor_state[slot]
+            lowstate.motor_state[slot].motorstate = int(getattr(source, "motorstate", 0))
+            lowstate.motor_state[slot].vol = float(getattr(source, "vol", 0.0))
         lowstate.tick = int(msg.tick)
         lowstate.imu = {
             name: [float(value) for value in getattr(msg.imu_state, name)]
@@ -2690,6 +2700,7 @@ class R1_A7_ArmController:
         return lowstate
 
     def _write_command(self, target_updated_at=None, cancel_requested=None, request_sequence=None):
+        self._apply_gripper_commands()
         self.msg.crc = self.crc.Crc(self.msg)
         self._check_activation_cancelled(cancel_requested)
         self._get_fresh_lowstate()
@@ -2714,6 +2725,80 @@ class R1_A7_ArmController:
                     key: value[:] if isinstance(value, list) else value
                     for key, value in self.published_command.items()
                 }
+
+    # --- Internally wired grippers -------------------------------------------------
+
+    def configure_gripper_slot(self, slot, kp, kd):
+        """Drive lowcmd ``slot`` with gripper gains instead of the activation hold.
+
+        Call before activate(). Every lowcmd write, the activation hold included, then
+        carries mode 1 with these gains on the slot, and the measured angle as the
+        target until set_gripper_target() gives one.
+        """
+        slot = int(slot)
+        protected = {member.value for member in R1_A7_JointArmIndex}
+        protected |= {member.value for member in R1_A7_JointHeadIndex}
+        protected.add(R1_A7_JointIndex.kWaistYaw.value)
+        if slot in protected or not 0 <= slot < R1_A7_Num_Motors:
+            raise ValueError(f"lowcmd slot {slot} cannot drive a gripper")
+        for name, value in (("kp", kp), ("kd", kd)):
+            if not (np.isfinite(float(value)) and float(value) >= 0.0):
+                raise ValueError(f"gripper {name} must be finite and non-negative")
+        with self.gripper_lock:
+            self.gripper_slots[slot] = {"kp": float(kp), "kd": float(kd), "q": None}
+
+    def set_gripper_target(self, slot, q):
+        """Target angle for a configured gripper slot; None follows the measured angle."""
+        if q is not None and not np.isfinite(float(q)):
+            raise ValueError("gripper target must be finite")
+        with self.gripper_lock:
+            if slot not in self.gripper_slots:
+                raise KeyError(f"lowcmd slot {slot} is not a configured gripper")
+            self.gripper_slots[slot]["q"] = None if q is None else float(q)
+
+    def _apply_gripper_commands(self):
+        with self.gripper_lock:
+            slots = {slot: dict(entry) for slot, entry in self.gripper_slots.items()}
+        if not slots:
+            return
+        lowstate = self.lowstate_buffer.GetData()
+        for slot, entry in slots.items():
+            target = entry["q"]
+            if target is None:
+                measured = None if lowstate is None else lowstate.motor_state[slot].q
+                target = self.msg.motor_cmd[slot].q if measured is None else measured
+            command = self.msg.motor_cmd[slot]
+            command.mode = 1
+            command.q = float(target)
+            command.dq = 0.0
+            command.tau = 0.0
+            command.kp = entry["kp"]
+            command.kd = entry["kd"]
+
+    @staticmethod
+    def _gripper_feedback(lowstate, slot):
+        motor = lowstate.motor_state[slot]
+        return {"q": float(motor.q), "dq": float(motor.dq), "tau": float(motor.tau),
+                "motorstate": int(getattr(motor, "motorstate", 0)),
+                "vol": float(getattr(motor, "vol", 0.0)),
+                "monotonic_ns": int(lowstate.monotonic_timestamp * 1e9),
+                "sequence": lowstate.sequence}
+
+    def get_gripper_feedback(self, slot):
+        """Latest accepted lowstate reading of a gripper slot, or None before the first."""
+        lowstate = self.lowstate_buffer.GetData()
+        if lowstate is None or lowstate.monotonic_timestamp is None or lowstate.motor_state[slot].q is None:
+            return None
+        return self._gripper_feedback(lowstate, slot)
+
+    def get_gripper_feedback_at(self, slot, target_ns, end_ns):
+        """Reading nearest target_ns among those received by end_ns, like the arm samples."""
+        with self.recording_lock:
+            nearest = min((entry for entry in self.recording_history
+                           if int(entry.monotonic_timestamp * 1e9) <= end_ns),
+                          key=lambda entry: abs(int(entry.monotonic_timestamp * 1e9) - target_ns),
+                          default=None)
+        return None if nearest is None else self._gripper_feedback(nearest, slot)
 
     @staticmethod
     def _recording_state(lowstate):

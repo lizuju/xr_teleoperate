@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 import urllib.request
+from types import SimpleNamespace
 
 
 def check_runtime_version(root=None):
@@ -129,6 +130,33 @@ def right_ee_from_environment():
     if value not in RIGHT_EE_CHOICES:
         raise ValueError(f"{RIGHT_EE_ENV} must be one of {', '.join(RIGHT_EE_CHOICES)}, not {value!r}")
     return value
+
+
+DEX1_TRANSPORT_ENV = "R1_DEX1_TRANSPORT"
+DEX1_SLOT_ENV = "R1_DEX1_SLOT"
+
+
+def dex1_wiring_from_environment():
+    """(transport, lowcmd slot) of the right Dex1-1; internal wiring on slot 33 by default."""
+    transport = os.environ.get(DEX1_TRANSPORT_ENV, "lowcmd") or "lowcmd"
+    if transport not in ("lowcmd", "service"):
+        raise ValueError(f"{DEX1_TRANSPORT_ENV} must be lowcmd or service, not {transport!r}")
+    slot = int(os.environ.get(DEX1_SLOT_ENV, "33") or "33")
+    if not 31 <= slot <= 34:
+        raise ValueError(f"{DEX1_SLOT_ENV} must be a spare lowcmd slot 31-34, not {slot}")
+    return transport, slot
+
+
+def validate_gripper_slot(message, slot):
+    """An internally wired Dex1-1 inside rt/lowstate: present, fault-free and calibrated."""
+    if len(message.motor_state) <= slot:
+        raise ValueError(f"lowstate has no motor slot {slot}")
+    motor = message.motor_state[slot]
+    state = int(getattr(motor, "motorstate", 0))
+    if state != 0 or not motor.vol > 0.0:
+        raise ValueError(f"Dex1-1 slot {slot}: motorstate 0x{state & 0xFFFFFFFF:08x} at {motor.vol:.1f} V; "
+                         "set the hand type to Dex1-1 in the Unitree app and restart the robot")
+    validate_gripper_state(SimpleNamespace(states=[motor]))
 
 
 def validate_gripper_state(message):
@@ -359,7 +387,7 @@ def check_camera_clock(request):
         print(f"[WARN] {problem}. Teleoperation itself still works", flush=True)
 
 
-def check_streams(right_ee="linker_o6"):
+def check_streams(right_ee="linker_o6", dex1_transport="lowcmd", dex1_slot=33):
     import zmq
     from unitree_sdk2py.core.channel import ChannelFactoryInitialize, ChannelSubscriber
     from unitree_sdk2py.idl.unitree_go.msg.dds_ import MotorStates_
@@ -391,7 +419,8 @@ def check_streams(right_ee="linker_o6"):
         windows = {
             "rt/lowstate (robot feedback on eno1)": StreamWindow(0.25),
             "rt/linker/left/state (left O6 bridge)": StreamWindow(0.25),
-            ("rt/dex1/right/state (right Dex1-1 gripper)" if right_ee == "dex1"
+            (("rt/dex1/right/state (right Dex1-1 gripper)" if dex1_transport == "service"
+              else f"rt/lowstate motor {dex1_slot} (right Dex1-1, internal wiring)") if right_ee == "dex1"
              else "rt/linker/right/state (right O6 bridge)"): StreamWindow(0.25),
             STEREO_JPEG_LABEL: StreamWindow(0.5),
         }
@@ -411,6 +440,8 @@ def check_streams(right_ee="linker_o6"):
                 try:
                     if name.startswith("rt/dex1/"):
                         validate_gripper_state(message)
+                    elif name.startswith("rt/lowstate motor"):
+                        validate_gripper_slot(message, dex1_slot)
                     else:
                         validate_state(message, hand)
                     if not hand and crc.Crc(message) != int(message.crc):
@@ -424,7 +455,8 @@ def check_streams(right_ee="linker_o6"):
 
         ChannelFactoryInitialize(0, "eno1")
         for index, name in enumerate(list(windows)[:3]):
-            subscriber = ChannelSubscriber(name.split()[0], LowState_ if index == 0 else MotorStates_)
+            lowstate = index == 0 or name.startswith("rt/lowstate motor")
+            subscriber = ChannelSubscriber(name.split()[0], LowState_ if lowstate else MotorStates_)
             subscribers.append(subscriber)
             subscriber.Init(callback(name, index != 0), 1)
         socket_feeds = []
@@ -488,9 +520,12 @@ def main():
         # second element, and this one does not. So a dead 60001 upstream is a warning
         # while the ZMQ feed is healthy, and a hard failure only when it is not.
         right_ee = right_ee_from_environment()
+        dex1_transport, dex1_slot = dex1_wiring_from_environment()
         if right_ee == "dex1":
-            print("[CHECK] right wrist: Dex1-1 gripper (R1_RIGHT_EE=dex1); left wrist: Linker O6", flush=True)
-        healthy = check_streams(right_ee)
+            wiring = (f"internal wiring, lowcmd slot {dex1_slot}" if dex1_transport == "lowcmd"
+                      else "485-to-USB board, dex1_1_service")
+            print(f"[CHECK] right wrist: Dex1-1 gripper ({wiring}); left wrist: Linker O6", flush=True)
+        healthy = check_streams(right_ee, dex1_transport, dex1_slot)
         try:
             https_probe(context, 60001, "head stereo")
             print("[OK] verified WebRTC HTTPS for the head stereo plane", flush=True)

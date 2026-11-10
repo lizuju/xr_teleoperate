@@ -436,6 +436,10 @@ if __name__ == '__main__':
     parser.add_argument('--dex1-pinch-closed-m', type=float, default=0.025, help='Right thumb-index distance in metres that fully closes the Dex1-1. '
                         'Vision Pro joints sit inside the finger pads, so touching fingertips read about 0.015-0.025.')
     parser.add_argument('--dex1-pinch-open-m', type=float, default=0.10, help='Right thumb-index distance in metres that fully opens the Dex1-1 (9 cm jaws).')
+    parser.add_argument('--dex1-transport', choices=['lowcmd', 'service'], default='lowcmd', help='How the Dex1-1 is wired. lowcmd: '
+                        'internal wiring, Unitree app hand type set to Dex1-1, driven as an rt/lowcmd slot by the main controller. '
+                        'service: external 485-to-USB board with dex1_1_service on PC2 (rt/dex1/right/*).')
+    parser.add_argument('--dex1-slot', type=int, default=33, help='rt/lowcmd slot of the internally wired right Dex1-1 (G1 and R1 use 33)')
     parser.add_argument('--dex1-kp', type=float, default=5.0, help='Dex1-1 position gain at the output shaft (vendor default 5.0)')
     parser.add_argument('--dex1-kd', type=float, default=0.05, help='Dex1-1 damping gain (vendor default 0.05)')
     parser.add_argument('--dex1-grip-delta', type=float, default=0.18, help='How far in rad the Dex1-1 command may lead its measured position. '
@@ -534,6 +538,8 @@ if __name__ == '__main__':
         if not (math.isfinite(args.dex1_pinch_closed_m) and math.isfinite(args.dex1_pinch_open_m)
                 and 0.0 <= args.dex1_pinch_closed_m < args.dex1_pinch_open_m):
             parser.error("--dex1-pinch-closed-m and --dex1-pinch-open-m need 0 <= closed < open.")
+        if args.dex1_transport == "lowcmd" and not 31 <= args.dex1_slot <= 34:
+            parser.error("--dex1-slot must be one of the spare lowcmd slots 31-34.")
         for name in ("dex1_kp", "dex1_kd", "dex1_grip_delta"):
             if not (math.isfinite(getattr(args, name)) and getattr(args, name) >= 0.0):
                 parser.error(f"--{name.replace('_', '-')} must be finite and non-negative.")
@@ -796,7 +802,9 @@ if __name__ == '__main__':
             mapping_name = linker_o6_retargeter.mapping_name
             logger_mp.info(
                 f"[DEX1] right wrist: Dex1-1 follows thumb-index distance {args.dex1_pinch_closed_m:.3f} m (closed) "
-                f"to {args.dex1_pinch_open_m:.3f} m (open); kp={args.dex1_kp} kd={args.dex1_kd} grip_delta={args.dex1_grip_delta} rad"
+                f"to {args.dex1_pinch_open_m:.3f} m (open); kp={args.dex1_kp} kd={args.dex1_kd} grip_delta={args.dex1_grip_delta} rad; "
+                + (f"internal wiring, rt/lowcmd slot {args.dex1_slot}" if args.dex1_transport == "lowcmd"
+                   else "485-to-USB board, dex1_1_service on PC2")
             )
         elif args.ee == "linker_o6":
             from teleop.robot_control.linker_o6_retargeting import DualLinkerO6Retargeter
@@ -1282,12 +1290,17 @@ if __name__ == '__main__':
                     if args.ee == "linker_o6":
                         from teleop.robot_control.robot_hand_linker_o6 import LinkerO6Controller
                         if args.right_ee == "dex1":
-                            from teleop.robot_control.robot_hand_dex1_r1 import Dex1GripperController, O6Dex1Hands
-                            hand_ctrl = O6Dex1Hands(
-                                LinkerO6Controller(sides=("left",)),
-                                Dex1GripperController("right", kp=args.dex1_kp, kd=args.dex1_kd,
-                                                      grip_delta=args.dex1_grip_delta),
-                            )
+                            from teleop.robot_control.robot_hand_dex1_r1 import (
+                                Dex1GripperController, Dex1LowCmdGripper, O6Dex1Hands)
+                            if args.dex1_transport == "lowcmd":
+                                # Configures the arm's lowcmd slot before arm_ctrl.activate() below.
+                                gripper = Dex1LowCmdGripper(arm_ctrl, slot=args.dex1_slot, side="right",
+                                                            kp=args.dex1_kp, kd=args.dex1_kd,
+                                                            grip_delta=args.dex1_grip_delta)
+                            else:
+                                gripper = Dex1GripperController("right", kp=args.dex1_kp, kd=args.dex1_kd,
+                                                                grip_delta=args.dex1_grip_delta)
+                            hand_ctrl = O6Dex1Hands(LinkerO6Controller(sides=("left",)), gripper)
                         else:
                             hand_ctrl = LinkerO6Controller()
                         hand_ctrl.wait_until_ready(timeout=3.0)
