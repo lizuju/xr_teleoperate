@@ -264,6 +264,29 @@ class Dex1GripperTest(unittest.TestCase):
         self.assertTrue(self.publisher("rt/dex1/right/cmd").closed)
         self.assertTrue(all(sub.closed for sub in FakeSubscriber.instances if sub.topic.startswith("rt/dex1/")))
 
+    def test_publications_mark_following_and_holding(self):
+        gripper = self.ready_gripper(q=1.0)
+        published = self.dex1.Dex1GripperController.get_recording_snapshot
+        self.assertEqual(published(gripper)["published"]["mode"], 0)
+        gripper.update([2.0], tracking_fresh=True)
+        self.assertEqual(published(gripper)["published"]["mode"], 1)
+        gripper.update([2.0], tracking_fresh=False)
+        self.assertEqual(published(gripper)["published"]["mode"], 0)
+
+    def test_recording_state_uses_list_channels(self):
+        gripper = self.ready_gripper(q=1.0)
+        state = gripper.get_recording_snapshot()["state"]
+        self.assertEqual(state["q"], [1.0])
+        self.assertEqual(state["qvel"], [0.0])
+        self.assertEqual(state["torque"], [0.1])
+        self.assertEqual((state["temperature"], state["errors"]), ([], []))
+
+    def test_retargeter_exposes_recording_attributes(self):
+        retargeter = self.dex1.Dex1PinchRetargeter()
+        self.assertEqual(retargeter.hardware_joint_order, ("dex1_1_gripper",))
+        np.testing.assert_allclose(retargeter.hardware_upper, [5.4])
+        self.assertIsNone(retargeter.urdf_path)
+
     # One-sided Linker O6
 
     def test_sides_must_be_a_subset(self):
@@ -324,6 +347,10 @@ class Dex1GripperTest(unittest.TestCase):
         self.assertEqual(np.concatenate(hands.get_action()).shape, (7,))
         self.assertAlmostEqual(self.last_q(), 1.1)
         snapshot = hands.get_recording_snapshot()
+        right = snapshot["published"]["right"]
+        self.assertEqual(right["request_sequence"], snapshot["requested"]["sequence"])
+        self.assertEqual(right["mode"], 1)
+        self.assertGreaterEqual(right["monotonic_ns"], snapshot["requested"]["monotonic_ns"])
         self.assertEqual(snapshot["devices"], {"left": "linker_o6", "right": "dex1_1"})
         self.assertEqual(snapshot["requested"]["right_q"], [1.1])
         hands.stop()

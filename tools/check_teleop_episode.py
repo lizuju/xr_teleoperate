@@ -57,6 +57,35 @@ def episode_file(directory, relative):
 
 
 TRAINING_GROUPS = {"left_arm": 7, "right_arm": 7, "left_ee": 6, "right_ee": 6, "body": 3}
+# Axes per end effector. A Linker O6 records six normalised axes; a Unitree Dex1-1
+# gripper records one shaft angle in radians.
+END_EFFECTOR_DIMS = {"linker_o6": 6, "dex1_1": 1}
+
+
+def end_effectors(info):
+    """Per-side end effectors of an R1_A7 recording, or None when unsupported.
+
+    Recordings from before per-side devices carry only end_effector="linker_o6"
+    and mean two O6 hands.
+    """
+    if not isinstance(info, dict) or info.get("robot") != "R1_A7":
+        return None
+    sides = info.get("end_effectors")
+    if sides is None:
+        return {"left": "linker_o6", "right": "linker_o6"} if info.get("end_effector") == "linker_o6" else None
+    if (not isinstance(sides, dict) or set(sides) != {"left", "right"}
+            or any(sides[side] not in END_EFFECTOR_DIMS for side in ("left", "right"))):
+        return None
+    return {"left": sides["left"], "right": sides["right"]}
+
+
+def training_groups(info=None):
+    """Joint group sizes for one recording; the two-O6 layout when info is absent or unsupported."""
+    sides = end_effectors(info) if info is not None else None
+    if sides is None:
+        return dict(TRAINING_GROUPS)
+    return {"left_arm": 7, "right_arm": 7, "left_ee": END_EFFECTOR_DIMS[sides["left"]],
+            "right_ee": END_EFFECTOR_DIMS[sides["right"]], "body": 3}
 TRAINING_CAMERAS = {"color_0": "head_left", "color_1": "head_right",
                     "color_2": "left_wrist", "color_3": "right_wrist"}
 TRAINING_TIME_LIMITS = {"observation_skew_ms": 25.0, "observation_age_ms": 150.0,
@@ -178,8 +207,9 @@ def training_timing(sample):
 
 def training_frame_rejections(frame, info):
     """Vision/joint BC policy. IMU validity and IMU packet gaps are not inputs."""
-    if info.get("robot") != "R1_A7" or info.get("end_effector") != "linker_o6":
+    if end_effectors(info) is None:
         return ["unsupported_robot"]
+    groups = training_groups(info)
     sample = frame.get("sample") or {}
     reasons = []
     if sample.get("mode") != "following":
@@ -296,14 +326,14 @@ def training_frame_rejections(frame, info):
                or inputs[side]["received_monotonic_ns"] > request for side in ("left", "right")):
             reasons.append("hand_input_stale")
     observation = training_observation(frame)
-    for group, size in TRAINING_GROUPS.items():
+    for group, size in groups.items():
         values = observation[group]
         if (not isinstance(values, list) or len(values) != size
                 or any(type(v) not in (int, float) or not math.isfinite(v) for v in values)):
             reasons.append("invalid_aligned_states")
             break
     for field in ("states", "actions"):
-        for group, size in TRAINING_GROUPS.items():
+        for group, size in groups.items():
             values = ((frame.get(field) or {}).get(group) or {}).get("qpos")
             if (not isinstance(values, list) or len(values) != size
                     or any(type(v) not in (int, float) or not math.isfinite(v) for v in values)):
@@ -311,7 +341,7 @@ def training_frame_rejections(frame, info):
                 break
     if "action_alignment" in sample:
         for group, values in training_action(frame).items():
-            if (not isinstance(values, list) or len(values) != TRAINING_GROUPS[group]
+            if (not isinstance(values, list) or len(values) != groups[group]
                     or any(type(v) not in (int, float) or not math.isfinite(v) for v in values)):
                 reasons.append("invalid_aligned_actions")
                 break
@@ -406,7 +436,8 @@ def validate_episode(path, min_segment_frames=DEFAULT_MIN_SEGMENT_FRAMES):
     if not isinstance(info, dict):
         error("manifest.info: expected an object")
         info = {}
-    require_r1_commands = info.get("robot") == "R1_A7" and info.get("end_effector") == "linker_o6"
+    require_r1_commands = end_effectors(info) is not None
+    hand_dims = {side: END_EFFECTOR_DIMS[device] for side, device in (end_effectors(info) or {}).items()}
     image = info.get("image", {})
     image = image if isinstance(image, dict) else {}
     size = (image.get("width"), image.get("height"))
@@ -683,7 +714,8 @@ def validate_episode(path, min_segment_frames=DEFAULT_MIN_SEGMENT_FRAMES):
                                 error(f"{location}.hands.requested: expected an object or null")
                             else:
                                 for side in ("left", "right"):
-                                    command_vector(requested.get(side + "_q"), 6, f"{location}.hands.requested.{side}_q")
+                                    command_vector(requested.get(side + "_q"), hand_dims.get(side, 6),
+                                                   f"{location}.hands.requested.{side}_q")
                         published = hands_aligned.get("published")
                         if not isinstance(published, dict):
                             error(f"{location}.hands.published: expected per-side snapshots")
@@ -693,7 +725,8 @@ def validate_episode(path, min_segment_frames=DEFAULT_MIN_SEGMENT_FRAMES):
                                     if not isinstance(command, dict):
                                         error(f"{location}.hands.published.{side}: expected an object or null")
                                     else:
-                                        command_vector(command.get("q"), 6, f"{location}.hands.published.{side}.q")
+                                        command_vector(command.get("q"), hand_dims.get(side, 6),
+                                                       f"{location}.hands.published.{side}.q")
             if isinstance(commands, dict):
                 for controller, stages in commands.items():
                     if not isinstance(stages, dict):
@@ -716,7 +749,7 @@ def validate_episode(path, min_segment_frames=DEFAULT_MIN_SEGMENT_FRAMES):
                                 error(f"{label}.sample.commands.hands.requested: expected an object or null")
                             else:
                                 for side in ("left", "right"):
-                                    command_vector(requested.get(f"{side}_q"), 6,
+                                    command_vector(requested.get(f"{side}_q"), hand_dims.get(side, 6),
                                                    f"{label}.sample.commands.hands.requested.{side}_q")
                         published = stages.get("published", {})
                         if not isinstance(published, dict):
@@ -727,7 +760,7 @@ def validate_episode(path, min_segment_frames=DEFAULT_MIN_SEGMENT_FRAMES):
                                     if not isinstance(command, dict):
                                         error(f"{label}.sample.commands.hands.published.{side}: expected an object or null")
                                     else:
-                                        command_vector(command.get("q"), 6,
+                                        command_vector(command.get("q"), hand_dims.get(side, 6),
                                                        f"{label}.sample.commands.hands.published.{side}.q")
             for name in ("timestamp_ns", "monotonic_ns"):
                 value = sample.get(name)

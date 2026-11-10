@@ -17,6 +17,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from check_teleop_episode import (DEFAULT_MIN_SEGMENT_FRAMES, TRAINING_CAMERAS, TRAINING_GROUPS,
+                                  end_effectors, training_groups,
                                  TRAINING_TIME_LIMITS, episode_file, training_frame_rejections, training_observation,
                                  training_action, training_commands, training_hand_inputs, training_timing, validate_episode)
 from teleop.utils.act_runtime import IMAGE_HW, prepare_training_image
@@ -84,22 +85,28 @@ def export_dataset(source, output, min_frames=DEFAULT_MIN_SEGMENT_FRAMES, val_so
                 entry["excluded_reason"] = "not_success"
                 continue
             info = manifest["info"]
-            if info.get("robot") != "R1_A7" or info.get("end_effector") != "linker_o6":
+            if end_effectors(info) is None:
                 entry["excluded_reason"] = "unsupported_robot"
                 continue
             frequency = info.get("frequency")
             if not isinstance(frequency, (int, float)) or frequency <= 0:
                 raise ValueError(f"{directory}: missing nominal frequency")
             names = info.get("joint_names") or {}
-            if any(len(names.get(group, [])) != size for group, size in TRAINING_GROUPS.items()):
-                raise ValueError(f"{directory}: expected joint group sizes 7/7/6/6/3")
-            joint_names = [f"{group}/{name}" for group in TRAINING_GROUPS for name in names[group]]
+            groups = training_groups(info)
+            sides = end_effectors(info)
+            if any(len(names.get(group, [])) != size for group, size in groups.items()):
+                raise ValueError(f"{directory}: expected joint group sizes "
+                                 + "/".join(str(size) for size in groups.values()))
+            joint_names = [f"{group}/{name}" for group in groups for name in names[group]]
             signature = (frequency, tuple(joint_names))
             if canonical_signature is None:
                 canonical_signature = signature
+                ee_units = {"linker_o6": "normalized_0_to_1", "dex1_1": "rad"}
                 dataset.update(fps=frequency, joint_names=joint_names, task=source.parent.name if (source / "episode.json").is_file() else source.name,
-                               units=["normalized_0_to_1" if "ee" in group else "rad"
-                                      for group, size in TRAINING_GROUPS.items() for _ in range(size)])
+                               state_dim=sum(groups.values()), action_dim=sum(groups.values()),
+                               joint_groups=groups, end_effectors=sides,
+                               units=[ee_units[sides[group.split("_")[0]]] if group.endswith("_ee") else "rad"
+                                      for group, size in groups.items() for _ in range(size)])
             elif signature != canonical_signature:
                 raise ValueError("Mixed frequency or joint order; export these recordings separately")
             entry["timing_basis"] = report["training_no_imu"]["timing_basis"]
@@ -130,10 +137,10 @@ def export_dataset(source, output, min_frames=DEFAULT_MIN_SEGMENT_FRAMES, val_so
                 filename = f"episode_{episode_id}.hdf5"
                 temporary = output / ("." + filename + ".tmp")
                 observations = [training_observation(r) for r in anchors]
-                qpos = np.array([sum((o[g] for g in TRAINING_GROUPS), [])
+                qpos = np.array([sum((o[g] for g in groups), [])
                                  for o in observations], dtype=np.float32)
                 aligned_actions = [training_action(r) for r in selected]
-                actions = np.array([sum((action[g] for g in TRAINING_GROUPS), [])
+                actions = np.array([sum((action[g] for g in groups), [])
                                     for action in aligned_actions], dtype=np.float32)
                 if not np.isfinite(qpos).all() or not np.isfinite(actions).all():
                     raise ValueError(f"{directory}: joint values cannot be represented as finite float32")
@@ -259,7 +266,8 @@ def export_dataset(source, output, min_frames=DEFAULT_MIN_SEGMENT_FRAMES, val_so
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Export successful R1/O6 demonstrations to ACT HDF5; no robot connection, no IMU inputs.")
+    parser = argparse.ArgumentParser(description="Export successful R1 demonstrations (two Linker O6, or a left O6 with a right Dex1-1) "
+                                                 "to ACT HDF5; no robot connection, no IMU inputs.")
     parser.add_argument("source", type=Path, help="One task directory or one episode directory")
     parser.add_argument("--output", type=Path, required=True, help="A new directory outside the recordings")
     parser.add_argument("--min-frames", type=int, default=DEFAULT_MIN_SEGMENT_FRAMES,

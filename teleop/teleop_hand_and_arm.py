@@ -529,8 +529,6 @@ if __name__ == '__main__':
     if args.right_ee == "dex1":
         if args.ee != "linker_o6" or args.arm != "R1_A7" or args.dry_run or args.hand_only or args.sim:
             parser.error("--right-ee dex1 needs real R1_A7 control with --ee linker_o6 (left Linker O6, right Dex1-1).")
-        if args.record:
-            parser.error("Recording with the Dex1-1 on the right wrist is not supported yet; run without --record.")
         if args.hand_torque_hud != "off":
             parser.error("--hand-torque-hud reads two O6 hands; use --hand-torque-hud off with --right-ee dex1.")
         if not (math.isfinite(args.dex1_pinch_closed_m) and math.isfinite(args.dex1_pinch_open_m)
@@ -539,6 +537,14 @@ if __name__ == '__main__':
         for name in ("dex1_kp", "dex1_kd", "dex1_grip_delta"):
             if not (math.isfinite(getattr(args, name)) and getattr(args, name) >= 0.0):
                 parser.error(f"--{name.replace('_', '-')} must be finite and non-negative.")
+    if args.right_ee == "dex1" and camera_calibration is not None:
+        # The calibrated right_wrist intrinsics and hand-eye belong to the right O6 palm
+        # camera; the gripper camera that replaced it has none yet.
+        from teleop.utils.camera_calibration import without_cameras
+        camera_calibration = without_cameras(
+            camera_calibration, ["right_wrist"],
+            "the right O6 palm camera was replaced by the Dex1-1 gripper camera; recalibrate before using its geometry")
+        logger_mp.warning("[CAMERA CALIBRATION] right_wrist excluded: Dex1-1 gripper camera is uncalibrated")
     if not (math.isfinite(args.tracking_timeout) and args.tracking_timeout > 0.0):
         parser.error("--tracking-timeout must be positive.")
     if not (math.isfinite(args.frequency) and args.frequency > 0.0):
