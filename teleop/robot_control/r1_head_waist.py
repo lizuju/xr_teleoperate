@@ -73,8 +73,12 @@ class R1HeadWaistFollower:
         turn_origin=None,
         turn_velocity=DEFAULT_TURN_VELOCITY,
         turn_acceleration=DEFAULT_TURN_ACCELERATION,
+        head_follow=True,
     ):
         self.waist_reference = float(waist_reference)
+        #: False leaves the waist to key-commanded turns: an operator head or body turn
+        #: never engages following, and the robot head alone follows their head yaw.
+        self.head_follow = bool(head_follow)
         self.turn_origin = self.waist_reference if turn_origin is None else float(turn_origin)
         self.turn_velocity = float(turn_velocity)
         self.turn_acceleration = float(turn_acceleration)
@@ -267,7 +271,7 @@ class R1HeadWaistFollower:
                     self.following = False
                     self._trigger_since = None
                     self._trigger_sign = 0.0
-            elif heading_is_valid and abs(residual) > self.engage_threshold:
+            elif self.head_follow and heading_is_valid and abs(residual) > self.engage_threshold:
                 trigger_sign = math.copysign(1.0, residual)
                 if self._trigger_since is None or trigger_sign != self._trigger_sign:
                     self._trigger_since = now
