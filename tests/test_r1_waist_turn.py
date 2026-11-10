@@ -198,6 +198,20 @@ class WaistTurnFollowerTest(unittest.TestCase):
         self.assertEqual(follower.waist_target, -QUARTER)
         self.assertAlmostEqual(robot.heads[-1], math.radians(45.0))
 
+    def test_head_target_follows_without_moving_the_waist(self):
+        follower = R1HeadWaistFollower(0.0, 0.0, head_follow=False)
+        robot = Robot(follower)
+        follower.command_turn(-1)
+        robot.run_until_idle()
+        state = (follower.waist_target, follower.total_yaw, follower.heading_offset, follower._last_time)
+        head = follower.head_target(head_pose(math.radians(30.0)), np.eye(4), robot.waist)
+        self.assertAlmostEqual(head[1], math.radians(30.0), places=6)
+        self.assertEqual(state, (follower.waist_target, follower.total_yaw, follower.heading_offset, follower._last_time))
+        # Same answer update() gives for the same pose once it is steady.
+        robot.run(0.5, head_yaw=math.radians(30.0))
+        np.testing.assert_allclose(follower.head_target(head_pose(math.radians(30.0)), np.eye(4), robot.waist),
+                                   [0.0, robot.heads[-1]], atol=1e-9)
+
     def test_invalid_inputs(self):
         follower = R1HeadWaistFollower(0.0, 0.0)
         with self.assertRaises(ValueError):

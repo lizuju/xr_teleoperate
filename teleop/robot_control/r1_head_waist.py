@@ -315,6 +315,22 @@ class R1HeadWaistFollower:
                 self.waist_target, -2.618, 2.618,
             ))
 
+        return self._head_target(relative_rotation, waist_actual), self.waist_target
+
+    def head_target(self, current_head_pose, reference_head_pose, waist_actual):
+        """Head pitch/yaw for the operator's current head, without moving the waist.
+
+        For holds where the waist must stay put (a hand is lost) but the robot head can
+        still follow the operator: no time step, no waist or turn progress, no state change.
+        """
+        current = _finite_pose(current_head_pose, "current_head_pose")
+        reference = _finite_pose(reference_head_pose, "reference_head_pose")
+        waist_actual = float(waist_actual)
+        if not math.isfinite(waist_actual):
+            raise ValueError("waist_actual must be finite")
+        return self._head_target(reference[:3, :3].T @ current[:3, :3], waist_actual)
+
+    def _head_target(self, relative_rotation, waist_actual):
         # Pitch precedes yaw in the R1 head chain: Ry(pitch) @ Rz(yaw).
         local_rotation = _yaw_rotation(
             self.waist_reference + self.heading_offset - waist_actual
@@ -328,7 +344,6 @@ class R1HeadWaistFollower:
             yaw = math.atan2(forward[1], -horizontal)
         residual = self.total_yaw + self.heading_offset - (waist_actual - self.waist_reference)
         yaw += 2.0 * math.pi * round((residual - yaw) / (2.0 * math.pi))
-        head_target = np.clip(
+        return np.clip(
             [pitch, yaw], [-0.62832, -2.0071], [0.62832, 2.0071],
         )
-        return head_target, self.waist_target

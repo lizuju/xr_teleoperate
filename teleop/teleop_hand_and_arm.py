@@ -2047,8 +2047,9 @@ if __name__ == '__main__':
                             wrist_holds, wrist_workspaces, raw_wrist_targets, hand_present,
                         )
                     )
-                    if not all(hand_present):
-                        head_q_target = held_head_q_target.copy()
+                    # A lost hand holds its own arm, and the waist below, but the head keeps
+                    # following the operator: freezing it made the headset view look stuck
+                    # every time a hand dropped or was hidden by the other one.
                 left_ik_target = left_wrist_target
                 right_ik_target = right_wrist_target
                 waist_yaw_actual = None
@@ -2065,6 +2066,10 @@ if __name__ == '__main__':
                         )
                         log_waist_turn_events(waist_follower)
                         head_q_target = head_q_target + r1_head_q_offset
+                    else:
+                        head_q_target = waist_follower.head_target(
+                            tele_data.head_pose, r1_head_pose_reference, waist_yaw_actual,
+                        ) + r1_head_q_offset
                     # torso mode feeds the anchored target straight to the solver: the IK
                     # model has the waist locked at r1_waist_yaw_reference, so the solved
                     # joints describe the arm relative to the torso, which is exactly the

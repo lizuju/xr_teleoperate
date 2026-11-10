@@ -116,6 +116,8 @@ class R1HeadWaistIntegrationTest(unittest.TestCase):
         controller.get_target_shaper_snapshot.return_value = None
         follower = Mock(total_yaw=0.7, following=True, turning=False)
         follower.update.return_value = (np.array([0.2, 0.27]), 1.2)
+        # Head-only target while a hand is held; distinct from update() and the held head.
+        follower.head_target.return_value = np.array([0.15, 0.25])
         follower.pop_turn_events.return_value = []
         ik = Mock()
         ik.solve_ik.return_value = (np.zeros(14), np.zeros(14))
@@ -400,7 +402,12 @@ class R1HeadWaistIntegrationTest(unittest.TestCase):
                 ns["waist_follower"].update.assert_not_called()
                 sent = ns["arm_ctrl"].ctrl_dual_arm_and_head.call_args
                 self.assertIsNone(sent.kwargs["waist_yaw_target"])
-                np.testing.assert_allclose(sent.args[2], [0.1, 0.2])
+                # The waist holds, but the head keeps following the operator's head.
+                ns["waist_follower"].head_target.assert_called_once_with(
+                    ns["tv_wrapper"].get_tele_data.return_value.head_pose,
+                    ns["r1_head_pose_reference"], 0.43,
+                )
+                np.testing.assert_allclose(sent.args[2], [0.15, 0.25])
 
     def test_both_hands_lost_holds_without_solving_or_publishing(self):
         ns, _ = self.independent_context(0.0, 0.0)
@@ -673,7 +680,8 @@ class R1HeadWaistIntegrationTest(unittest.TestCase):
             and any(assigns(child, "current_body_state") for child in node.body)
         )
         execute([body_record], ns)
-        np.testing.assert_allclose(ns["current_body_action"], [0.43, 0.1, 0.2])
+        # Waist held at its measured angle; the head follows the operator during the hold.
+        np.testing.assert_allclose(ns["current_body_action"], [0.43, 0.15, 0.25])
 
     def test_diagnostics_convert_fixed_ik_fk_back_to_root_frame(self):
         ns = self.context()
