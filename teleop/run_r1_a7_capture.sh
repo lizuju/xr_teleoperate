@@ -80,6 +80,7 @@ exec "${dev_root}/.venv-xr/bin/python" -u teleop_hand_and_arm.py \
   --right-ee "$right_ee" \
   --dex1-transport "${R1_DEX1_TRANSPORT:-lowcmd}" \
   --dex1-slot "${R1_DEX1_SLOT:-33}" \
+  --dex1-grip-delta "${R1_DEX1_GRIP_DELTA:-0.5}" \
   --dex1-min-q "$dex1_min_q" \
   --wrist-stabilizer "${WRIST_STABILIZER:-on}" \
   --wrist-stabilizer-position-mm "${WRIST_STABILIZER_POSITION_MM:-3}" \

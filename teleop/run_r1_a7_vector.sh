@@ -77,6 +77,8 @@
 #                       指尖速度低于 0.08 m/s 后保持 0.1 s，再用 0.1 s 退出平滑。
 #                       可减轻快速抖动，无法消除与主动转腕同频的缓慢追踪偏移。
 #                       关掉：WRIST_STABILIZER=off
+#   R1_DEX1_GRIP_DELTA  夹爪命令最多领先实测角度多少（rad），默认 0.5（约 2.5 N·m 驱动力矩，开合更快）。
+#                       原来是 0.18（约 0.9 N·m）。设了最小开口时，夹杯子的力由最小开口决定，不随这个值变大。
 #   R1_DEX1_TRANSPORT   Dex1-1 的接法：lowcmd（默认，内走线；宇树 App 灵巧手类型设为 Dex1-1，主控把它当 rt/lowcmd 的一个关节）
 #                       或 service（外接 485 转 USB 板，PC2 上跑 dex1_1_service）。R1_DEX1_SLOT 是内走线的关节位，默认 33。
 #                       标定结果会写进每个 episode 的 info.camera_calibration，供后面数采/训练使用。
@@ -155,6 +157,7 @@ exec "$python" -u teleop_hand_and_arm.py \
   --right-ee "$R1_RIGHT_EE" \
   --dex1-transport "${R1_DEX1_TRANSPORT:-lowcmd}" \
   --dex1-slot "${R1_DEX1_SLOT:-33}" \
+  --dex1-grip-delta "${R1_DEX1_GRIP_DELTA:-0.5}" \
   --dex1-min-q "$dex1_min_q" \
   --wrist-stabilizer "${WRIST_STABILIZER:-on}" \
   --wrist-stabilizer-position-mm "${WRIST_STABILIZER_POSITION_MM:-3}" \
