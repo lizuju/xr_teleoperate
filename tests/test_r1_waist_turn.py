@@ -270,6 +270,7 @@ class WaistTurnTeleopTest(unittest.TestCase):
         for name in ("run_r1_a7_vector.sh", "run_r1_a7_capture.sh"):
             text = (ROOT / "teleop" / name).read_text(encoding="utf-8")
             self.assertIn('--waist-head-follow "${WAIST_HEAD_FOLLOW:-off}"', text)
+            self.assertIn('--dex1-grip-delta "${R1_DEX1_GRIP_DELTA:-0.5}"', text)
             self.assertIn("--waist-follow \\\n", text)
 
     def test_start_turn_logs_goal_and_refuses_world_compensation(self):
