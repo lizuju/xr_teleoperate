@@ -164,7 +164,7 @@ class TrainingExportTests(unittest.TestCase):
             "early_arm_publication": ("arm_request_unmatched", lambda a: a["arm"]["published"].update(monotonic_ns=9_997_000_000)),
             "wrong_anchor": ("actions_unaligned", lambda a: a.update(anchor_monotonic_ns=9_998_000_000)),
             "late_arm_request": ("actions_unaligned", lambda a: a["arm"]["requested"].update(monotonic_ns=9_999_500_000)),
-            "stale_source_input": ("hand_input_stale", lambda a: a["hand_target_inputs"]["left"].update(received_monotonic_ns=9_899_000_000)),
+            "stale_source_input": ("hand_input_stale", lambda a: a["hand_target_inputs"]["left"].update(received_monotonic_ns=9_800_000_000)),
             "input_after_request": ("hand_input_stale", lambda a: a["hand_target_inputs"]["left"].update(received_monotonic_ns=9_999_500_000)),
             "missing_source_inputs": ("hand_input_stale", lambda a: a.pop("hand_target_inputs")),
             "tracking_invalid": ("actions_unaligned", lambda a: a["tracking_fresh"].update(left=False)),
@@ -266,9 +266,13 @@ class TrainingExportTests(unittest.TestCase):
         row["sample"]["hand_target_inputs"] = {
             side: {"received_monotonic_ns": 9_990_000_000} for side in ("left", "right")}
         self.assertEqual(training_frame_rejections(row, manifest["info"]), [])
+        # The limit is 150 ms: exactly 150 ms passes, 160 ms is stale.
         row["sample"]["hand_target_inputs"]["left"]["received_monotonic_ns"] = 9_850_000_000
-        self.assertIn("hand_input_stale", training_frame_rejections(row, manifest["info"]))
         self.assertEqual(training_timing(row["sample"])["left_hand_input_age_ms"], 150.0)
+        self.assertNotIn("hand_input_stale", training_frame_rejections(row, manifest["info"]))
+        row["sample"]["hand_target_inputs"]["left"]["received_monotonic_ns"] = 9_840_000_000
+        self.assertIn("hand_input_stale", training_frame_rejections(row, manifest["info"]))
+        self.assertEqual(training_timing(row["sample"])["left_hand_input_age_ms"], 160.0)
 
     def test_export_tensor_semantics_rgb_no_imu_and_no_action_shift(self):
         directory, manifest, rows = self.episode()
