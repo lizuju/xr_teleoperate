@@ -88,9 +88,13 @@ def training_groups(info=None):
             "right_ee": END_EFFECTOR_DIMS[sides["right"]], "body": 3}
 TRAINING_CAMERAS = {"color_0": "head_left", "color_1": "head_right",
                     "color_2": "left_wrist", "color_3": "right_wrist"}
+# hand_input_age_ms was 100 until 2026-11-11. On the first Dex1 ice-cream recordings
+# the unlocked hands' input age had a P95 of 106-125 ms over the headset Wi-Fi, and the
+# scattered rejections left only about 27% of each successful episode in segments of at
+# least 40 frames. 150 ms roughly doubled that; 200 ms added almost nothing more.
 TRAINING_TIME_LIMITS = {"observation_skew_ms": 25.0, "observation_age_ms": 150.0,
                         "request_age_ms": 100.0, "request_skew_ms": 25.0,
-                        "hand_input_age_ms": 100.0}
+                        "hand_input_age_ms": 150.0}
 # Rejections that only disqualify a row as an observation. Its action is still a
 # real accepted target, so earlier rows may keep it inside their action chunk.
 TRAINING_OBSERVATION_REASONS = frozenset((
