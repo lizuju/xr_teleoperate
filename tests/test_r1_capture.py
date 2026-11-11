@@ -122,13 +122,14 @@ class CaptureTests(unittest.TestCase):
         self.assertEqual(locked["sample"]["hand_locks"], {"left": False, "right": True})
         self.assertNotIn("hand_locks", self.capture.frame(self.xr, self.image, "following")["sample"])
 
-    def test_a_gripper_waiting_for_pickup_is_recorded_as_locked(self):
+    def test_a_gripper_waiting_for_pickup_is_recorded_apart_from_the_arm_lock(self):
         original = self.capture.hand_loop.get_recording_sample
         def waiting():
             return {**original(), "held": {"left": False, "right": True}}
         with mock.patch.object(self.capture.hand_loop, "get_recording_sample", side_effect=waiting):
             frame = self.capture.frame(self.xr, self.image, "following", hand_locks={"left": False, "right": False})
-        self.assertEqual(frame["sample"]["hand_locks"], {"left": False, "right": True})
+        self.assertEqual(frame["sample"]["hand_locks"], {"left": False, "right": False})
+        self.assertEqual(frame["sample"]["hand_input_held"], {"left": False, "right": True})
 
     def test_feedback_requested_and_published_are_distinct(self):
         frame = self.capture.frame(self.xr, self.image, "following")

@@ -301,12 +301,12 @@ class R1Capture:
         hand_sample = self.hand_loop.get_recording_sample()
         hand = hand_sample["hand"]
         hand_inputs = hand_sample["target_inputs"]
-        # The hand loop also holds a gripper after unlock until the pinch picks it up;
-        # count that as locked too, since its input is just as old on purpose.
+        # The hand loop also holds a gripper after unlock until the pinch picks it up.
+        # Only its finger input is old on purpose then: the arm already follows again,
+        # so this is recorded apart from hand_locks and exempts only the input age.
         held = hand_sample.get("held") or {}
-        if hand_locks is not None or any(held.values()):
-            hand_locks = {side: bool((hand_locks or {}).get(side) or held.get(side))
-                          for side in ("left", "right")}
+        hand_input_held = ({side: bool(held.get(side)) for side in ("left", "right")}
+                           if hand_locks is not None or any(held.values()) else None)
         hand_anchor_ns = int(hand["requested"]["monotonic_ns"] or 0)
         aligned_arm = self.arm.get_recording_command_at(hand_anchor_ns, self.action_not_before_ns)
         now = time.monotonic_ns()
@@ -479,6 +479,7 @@ class R1Capture:
                 # checker does not count its own tracking lapses against the frame.
                 **({"hand_locks": {side: bool(hand_locks.get(side)) for side in ("left", "right")}}
                    if hand_locks is not None else {}),
+                **({"hand_input_held": hand_input_held} if hand_input_held is not None else {}),
                 "camera_alignment": self.sync.alignment(pairing),
                 "imu": {"monotonic_ns": state["monotonic_ns"], "sequence": state["sequence"],
                         "tick": state["tick"], **state["imu"]},

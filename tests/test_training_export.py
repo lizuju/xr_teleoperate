@@ -252,6 +252,12 @@ class TrainingExportTests(unittest.TestCase):
         self.assertNotIn("hand_input_stale", training_frame_rejections(row, manifest["info"]))
         row["sample"]["hand_locks"] = {"left": True, "right": False}
         self.assertIn("hand_input_stale", training_frame_rejections(row, manifest["info"]))
+        # A gripper waiting for pickup: its old input is fine, its stale tracking is not.
+        row["sample"]["hand_locks"] = {"left": False, "right": False}
+        row["sample"]["hand_input_held"] = {"left": False, "right": True}
+        self.assertNotIn("hand_input_stale", training_frame_rejections(row, manifest["info"]))
+        row["sample"]["sources"]["right_hand_tracking"]["fresh"] = False
+        self.assertIn("tracking_stale", training_frame_rejections(row, manifest["info"]))
 
     def test_legacy_rows_use_the_recorded_hand_request_as_the_decision(self):
         _, manifest, rows = self.episode(count=1)
