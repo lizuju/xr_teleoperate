@@ -237,6 +237,9 @@ def training_frame_rejections(frame, info):
     # A hand the operator locked ([ or ]) is commanded to hold, so its own tracking may
     # lapse without making the frame's action stale.
     hand_locks = sample.get("hand_locks") if isinstance(sample.get("hand_locks"), dict) else {}
+    # A gripper waiting for pickup after an unlock keeps an old finger input on purpose,
+    # but its arm follows again, so it is exempt from the input-age check only.
+    hand_input_held = sample.get("hand_input_held") if isinstance(sample.get("hand_input_held"), dict) else {}
     for names, limit_ms, reason in (
         (("xr", "left_hand_tracking", "right_hand_tracking"), TRAINING_TIME_LIMITS["tracking_age_ms"], "tracking_stale"),
         (("robot", "left_hand_feedback", "right_hand_feedback"), 250, "feedback_stale"),
@@ -333,7 +336,7 @@ def training_frame_rejections(frame, info):
         # A locked hand keeps the input that produced its held target, so its input age
         # grows on purpose; only an unlocked hand must have a recent input.
         if type(request) is not int or any(
-                hand_locks.get(side) is not True and (
+                hand_locks.get(side) is not True and hand_input_held.get(side) is not True and (
                     timing[side + "_hand_input_age_ms"] is None
                     or timing[side + "_hand_input_age_ms"] > TRAINING_TIME_LIMITS["hand_input_age_ms"]
                     or type((inputs.get(side) or {}).get("received_monotonic_ns")) is not int
