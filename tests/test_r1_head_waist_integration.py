@@ -9,6 +9,7 @@ from unittest.mock import Mock, patch
 
 import numpy as np
 from teleop.robot_control.r1_wrist_workspace import R1WristWorkspace
+from teleop.robot_control.r1_hand_lock import R1HandLocks
 from teleop.robot_control.r1_wrist_stabilizer import WristStabilizer, rotation_from_vector
 from scipy.spatial.transform import Rotation
 
@@ -171,6 +172,9 @@ class R1HeadWaistIntegrationTest(unittest.TestCase):
             "waist_follower_from_args": self.waist_follower_from_args,
             # No arrow key pressed unless a test says so.
             "take_waist_turn_request": Mock(return_value=None),
+            # No hand locked unless a test says so.
+            "HAND_LOCKS": R1HandLocks(), "hand_locked_previous": (False, False),
+            "hand_lock_reanchor": [False, False],
             **self.turn_helpers,
             "relative_head_pitch_yaw": Mock(return_value=np.zeros(2)),
             "wrist_in_reference_head_yaw_frame": lambda wrist, *_: wrist.copy(),

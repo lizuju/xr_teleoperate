@@ -228,12 +228,17 @@ def training_frame_rejections(frame, info):
                      for side in ("left", "right"))):
             reasons.append("actions_unaligned")
     sources = sample.get("sources") or {}
+    # A hand the operator locked ([ or ]) is commanded to hold, so its own tracking may
+    # lapse without making the frame's action stale.
+    hand_locks = sample.get("hand_locks") if isinstance(sample.get("hand_locks"), dict) else {}
     for names, limit_ms, reason in (
         (("xr", "left_hand_tracking", "right_hand_tracking"), 100, "tracking_stale"),
         (("robot", "left_hand_feedback", "right_hand_feedback"), 250, "feedback_stale"),
         (("image", "left_wrist_image", "right_wrist_image"), 500, "image_stale"),
     ):
         for name in names:
+            if name.endswith("_hand_tracking") and hand_locks.get(name[:-len("_hand_tracking")]) is True:
+                continue
             entry = sources.get(name) or {}
             stamp = entry.get("received_monotonic_ns")
             if (entry.get("fresh") is not True or type(stamp) is not int
@@ -943,8 +948,10 @@ def validate_episode(path, min_segment_frames=DEFAULT_MIN_SEGMENT_FRAMES):
                                   "sample.camera_alignment")
             elif color_specs and any(key in color_specs for key in ("color_2", "color_3")):
                 error(f"{label}.sample.camera_alignment: missing for a multi-camera sample")
+            hand_locks = sample.get("hand_locks") if isinstance(sample.get("hand_locks"), dict) else {}
             report["tracking_invalid_frames"] += any(
-                not isinstance(source_data.get(name), dict) or source_data[name].get("fresh") is not True
+                (not isinstance(source_data.get(name), dict) or source_data[name].get("fresh") is not True)
+                and not (name.endswith("_hand_tracking") and hand_locks.get(name[:-len("_hand_tracking")]) is True)
                 for name in tracking)
             commands_active = True
             if require_r1_commands:
