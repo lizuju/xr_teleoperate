@@ -78,9 +78,15 @@ class _Side:
 
 
 class HandTrustGuard:
-    def __init__(self, block_radius=0.03, clear_radius=0.04, occluded_fraction=0.5,
-                 clear_fraction=0.2, max_speed=3.0, max_angular_speed=math.radians(1000.0),
-                 min_wrist_gap=0.05, dwell=0.25, max_sample_gap=0.2):
+    # Occlusion defaults were loosened on 2026-11-11 at the operator's request, because
+    # holds during two-hand work felt too frequent. A hand is held when at least 4 of its
+    # 6 target points (wrist, four knuckles, palm centre) have the other hand within 2 cm
+    # of their sight line (was 3 of 6 within 3 cm), and it follows again once at most 2
+    # are within 3 cm for 0.15 s (was at most 1 within 4 cm for 0.25 s). A hand that
+    # fully covers the other still triggers; partial overlaps at the edge no longer do.
+    def __init__(self, block_radius=0.02, clear_radius=0.03, occluded_fraction=0.65,
+                 clear_fraction=0.35, max_speed=3.0, max_angular_speed=math.radians(1000.0),
+                 min_wrist_gap=0.05, dwell=0.15, max_sample_gap=0.2):
         values = (block_radius, clear_radius, occluded_fraction, clear_fraction, max_speed,
                   max_angular_speed, min_wrist_gap, dwell, max_sample_gap)
         if not all(math.isfinite(value) and value > 0.0 for value in values):
