@@ -301,6 +301,12 @@ class R1Capture:
         hand_sample = self.hand_loop.get_recording_sample()
         hand = hand_sample["hand"]
         hand_inputs = hand_sample["target_inputs"]
+        # The hand loop also holds a gripper after unlock until the pinch picks it up;
+        # count that as locked too, since its input is just as old on purpose.
+        held = hand_sample.get("held") or {}
+        if hand_locks is not None or any(held.values()):
+            hand_locks = {side: bool((hand_locks or {}).get(side) or held.get(side))
+                          for side in ("left", "right")}
         hand_anchor_ns = int(hand["requested"]["monotonic_ns"] or 0)
         aligned_arm = self.arm.get_recording_command_at(hand_anchor_ns, self.action_not_before_ns)
         now = time.monotonic_ns()

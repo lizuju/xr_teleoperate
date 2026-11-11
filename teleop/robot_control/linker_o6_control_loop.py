@@ -149,6 +149,9 @@ class LinkerO6ControlLoop:
                 "hand": snapshot, "target_inputs": deepcopy(self.target_inputs),
                 "tracking_fresh": dict(zip(("left", "right"), self.command_fresh)),
                 "paused": self.was_paused,
+                # Held on purpose: locked, or a gripper still waiting for pickup after unlock.
+                "held": {side: bool(self.locked[index] or self.pickup[index] is not None)
+                         for index, side in enumerate(SIDES)},
             }
 
     def get_recording_sample(self):

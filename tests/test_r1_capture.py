@@ -6,6 +6,7 @@ from unittest.mock import patch
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 import numpy as np
 
@@ -120,6 +121,14 @@ class CaptureTests(unittest.TestCase):
         locked = self.capture.frame(self.xr, self.image, "following", hand_locks={"left": False, "right": True})
         self.assertEqual(locked["sample"]["hand_locks"], {"left": False, "right": True})
         self.assertNotIn("hand_locks", self.capture.frame(self.xr, self.image, "following")["sample"])
+
+    def test_a_gripper_waiting_for_pickup_is_recorded_as_locked(self):
+        original = self.capture.hand_loop.get_recording_sample
+        def waiting():
+            return {**original(), "held": {"left": False, "right": True}}
+        with mock.patch.object(self.capture.hand_loop, "get_recording_sample", side_effect=waiting):
+            frame = self.capture.frame(self.xr, self.image, "following", hand_locks={"left": False, "right": False})
+        self.assertEqual(frame["sample"]["hand_locks"], {"left": False, "right": True})
 
     def test_feedback_requested_and_published_are_distinct(self):
         frame = self.capture.frame(self.xr, self.image, "following")
