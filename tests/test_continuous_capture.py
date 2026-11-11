@@ -12,6 +12,7 @@ from unittest.mock import Mock, patch
 import numpy as np
 
 from teleop.robot_control.r1_pause import R1PauseState
+from teleop.robot_control.r1_hand_lock import HAND_LOCK_KEYS, R1HandLocks
 from teleop.utils.episode_writer import EpisodeWriter
 
 
@@ -53,6 +54,7 @@ class ContinuousCaptureTest(unittest.TestCase):
             "args": SimpleNamespace(record=True, sim=False, record_max_tracking_age_ms=100.0),
             "tv_wrapper": object(), "tracking_diagnostics": Mock(return_value={}),
             "recording_blocked_by_tracking": Mock(return_value=None),
+            "HAND_LOCK_KEYS": HAND_LOCK_KEYS, "HAND_LOCKS": R1HandLocks(),
         }
         exec(self.key_code, self.ns)
 

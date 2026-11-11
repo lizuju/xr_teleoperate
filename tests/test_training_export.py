@@ -202,6 +202,18 @@ class TrainingExportTests(unittest.TestCase):
         exactly_at_decision["sample"]["aligned_states"]["robot"]["monotonic_ns"] = decision
         self.assertNotIn("observation_after_decision", training_frame_rejections(exactly_at_decision, manifest["info"]))
 
+    def test_a_locked_hand_out_of_view_does_not_make_the_frame_stale(self):
+        _, manifest, rows = self.episode(count=1)
+        self.add_action_alignment(rows)
+        row = copy.deepcopy(rows[0])
+        self.assertEqual(training_frame_rejections(row, manifest["info"]), [])
+        row["sample"]["sources"]["right_hand_tracking"]["fresh"] = False
+        self.assertIn("tracking_stale", training_frame_rejections(row, manifest["info"]))
+        row["sample"]["hand_locks"] = {"left": False, "right": True}
+        self.assertNotIn("tracking_stale", training_frame_rejections(row, manifest["info"]))
+        row["sample"]["hand_locks"] = {"left": True, "right": False}
+        self.assertIn("tracking_stale", training_frame_rejections(row, manifest["info"]))
+
     def test_legacy_rows_use_the_recorded_hand_request_as_the_decision(self):
         _, manifest, rows = self.episode(count=1)
         row = rows[0]

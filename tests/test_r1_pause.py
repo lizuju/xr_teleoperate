@@ -7,6 +7,7 @@ from unittest.mock import Mock
 import numpy as np
 
 from teleop.robot_control.r1_pause import R1PauseState
+from teleop.robot_control.r1_hand_lock import HAND_LOCK_KEYS, R1HandLocks
 from teleop.robot_control.r1_hand_tracking import R1WristHold
 from teleop.robot_control.r1_head_waist import R1HeadWaistFollower
 import test_r1_head_waist_integration as integration_fixture
@@ -383,6 +384,7 @@ class R1PauseKeysTest(unittest.TestCase):
             "RECORD_RUNNING": True, "RECORD_TOGGLE": False, "RECORD_OUTCOME": "unspecified",
             "DRY_RUN_MODE": False, "ARM_REQUEST_GENERATION": 1,
             "R1_A7_DEFERRED_REAL_MODE": True, "logger_mp": Mock(),
+            "HAND_LOCK_KEYS": HAND_LOCK_KEYS, "HAND_LOCKS": R1HandLocks(),
         }
         execute([on_press], self.ns)
 

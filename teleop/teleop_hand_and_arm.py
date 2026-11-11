@@ -25,6 +25,7 @@ from teleop.robot_control.r1_hand_tracking import (
     R1WristHold, hand_tracking_freshness, hand_tracking_present,
 )
 from teleop.robot_control.r1_wrist_workspace import R1WristWorkspace
+from teleop.robot_control.r1_hand_lock import HAND_LOCK_KEYS, R1HandLocks
 from sshkeyboard import listen_keyboard, stop_listening
 
 def publish_reset_category(category: int, publisher): # Scene Reset signal
@@ -49,6 +50,12 @@ R1_PAUSE = None
 # the control loop, which alone touches the waist follower.
 WAIST_TURN_LOCK = threading.Lock()
 WAIST_TURN_REQUEST = None
+# Operator locks: [ holds the left arm and its O6, ] the right arm and its hand; press
+# again to release. Read by the control loop and the hand loop.
+HAND_LOCKS = R1HandLocks()
+# After an unlock the Dex1-1 keeps its grip until the live pinch target is this close
+# to the held one (rad) or crosses it, so a relaxed hand does not drop the cup.
+DEX1_UNLOCK_PICKUP_RAD = 0.1
 #  -------        ---------                -----------                -----------            ---------
 #   state          [Ready]      ==>        [Recording]     ==>         [AutoSave]     -->     [Ready]
 #  -------        ---------      |         -----------      |         -----------      |     ---------
@@ -98,6 +105,10 @@ def on_press(key):
         with WAIST_TURN_LOCK:
             WAIST_TURN_REQUEST = key
         logger_mp.info(f"[R1 WAIST TURN] {key} turn requested.")
+    elif key in HAND_LOCK_KEYS:
+        side = HAND_LOCK_KEYS[key]
+        locked = HAND_LOCKS.toggle(side)
+        logger_mp.info(f"[R1 HAND LOCK] {side} arm and hand: {'lock' if locked else 'unlock'} requested.")
     else:
         logger_mp.warning(f"[on_press] {key} was pressed, but no action is defined for this key.")
 
@@ -1634,6 +1645,8 @@ if __name__ == '__main__':
         right_wrist_img = None
         last_fresh_tele_data = reference_tele_data if r1_a7_anchored else None
         tracking_hold_active = False
+        hand_locked_previous = (False, False)
+        hand_lock_reanchor = [False, False]
         r1_head_q_offset = np.zeros(2)
         r1_frozen_generation = -1
         if r1_independent_hands and args.ee in (None, "linker_o6"):
@@ -1641,6 +1654,8 @@ if __name__ == '__main__':
             R1_PAUSE = R1PauseState()
             logger_mp.info("[R1 CONTROL] [p] pauses and holds; [r] realigns and resumes; when recording is enabled, [s] also starts the next episode after resume; [q] exits.")
         if r1_independent_hands:
+            logger_mp.info("[R1 HAND LOCK] [ locks/unlocks the left arm and O6, ] the right arm and its hand; "
+                           "the locked side holds its pose while everything else keeps following.")
             wrist_holds = (R1WristHold(r1_robot_left_reference), R1WristHold(r1_robot_right_reference))
             wrist_workspaces = (R1WristWorkspace(r1_robot_left_reference), R1WristWorkspace(r1_robot_right_reference))
             held_head_q_target = arm_ctrl.get_current_head_q().copy()
@@ -1670,6 +1685,11 @@ if __name__ == '__main__':
                 args.linker_o6_frequency, args.tracking_timeout, lambda: STOP, save_hand_sample,
                 should_pause=lambda: (R1_PAUSE is not None and R1_PAUSE.paused)
                 or (visionpro_source is not None and visionpro_source.needs_realign),
+                is_locked=(lambda index: HAND_LOCKS.snapshot()[index]) if r1_independent_hands
+                else (lambda index: False),
+                pickup_tolerance=(None, DEX1_UNLOCK_PICKUP_RAD
+                                  if getattr(args, "right_ee", "linker_o6") == "dex1" else None),
+                log=logger_mp.info,
             )
             linker_o6_loop.start()
 
@@ -1858,9 +1878,22 @@ if __name__ == '__main__':
                 for index, (side, hold, present) in enumerate(zip(("left", "right"), wrist_holds, raw_hand_present)):
                     hold.resume_streak = hold.resume_streak + 1 if present else 0
                     hand_present.append(present and (hold.tracking or hold.resume_streak >= 2))
-                hand_present = tuple(hand_present)
+                # An operator lock ([ left, ] right) holds that arm and its hand like a lost
+                # hand, but it is a command, not a fault: it does not hold the waist, count as a
+                # tracking hold or mark recorded frames as not following.
+                hand_locked = HAND_LOCKS.snapshot()
+                hand_lost = tuple(not present and not locked for present, locked in zip(hand_present, hand_locked))
+                hand_present = tuple(present and not locked for present, locked in zip(hand_present, hand_locked))
                 for index, (side, hold, present) in enumerate(zip(("left", "right"), wrist_holds, hand_present)):
-                    if present != hold.tracking and capture_mode != "paused":
+                    if hand_locked[index] != hand_locked_previous[index]:
+                        if hand_locked[index]:
+                            hand_lock_reanchor[index] = True
+                        logger_mp.info(
+                            "[R1 HAND LOCK] %s: %s", side,
+                            "locked; this arm and its hand hold their pose" if hand_locked[index]
+                            else "unlocked; this arm follows your hand again, starting from the held pose",
+                        )
+                    elif present != hold.tracking and capture_mode != "paused" and not hand_locked[index]:
                         guard_reason = None
                         if not present and visionpro_source is not None:
                             guard_reason = getattr(visionpro_source, "get_hand_guard_reason", lambda _side: None)(side)
@@ -1870,18 +1903,19 @@ if __name__ == '__main__':
                         hold.hold()
                         if wrist_stabilizers is not None:
                             wrist_stabilizers[index].reset()
+                hand_locked_previous = hand_locked
                 for workspace, present in zip(wrist_workspaces, hand_present):
                     if not present:
                         workspace.hold()
                 if args.waist_follow:
-                    if not all(hand_present):
+                    if any(hand_lost):
                         arm_ctrl.hold_waist()
                     elif tracking_hold_active:
                         waist_follower.reset(arm_ctrl.get_current_waist_yaw(), time.monotonic())
-                tracking_hold_active = not all(hand_present)
+                tracking_hold_active = any(hand_lost)
                 if tracking_hold_active and capture_mode != "paused":
                     capture_mode = "tracking_hold"
-                if not any(hand_present):
+                if not any(hand_present) and any(hand_lost):
                     run_motion = False
             elif r1_a7_anchored:
                 if is_present_motion_data(tele_data):
@@ -2004,6 +2038,25 @@ if __name__ == '__main__':
                             r1_head_yaw_reference,
                             r1_head_pose_reference[:3, 3],
                         )
+                    if r1_independent_hands and any(hand_lock_reanchor):
+                        # The first followed frame after an unlock re-anchors that side at its
+                        # held pose, so the arm carries on from where it was locked instead of
+                        # jumping to wherever the operator's hand drifted meanwhile.
+                        for index, side in enumerate(("left", "right")):
+                            if hand_lock_reanchor[index] and hand_present[index]:
+                                held = wrist_holds[index].target.copy()
+                                if index == 0:
+                                    r1_vision_left_reference = left_wrist_pose.copy()
+                                    r1_robot_left_reference = held
+                                else:
+                                    r1_vision_right_reference = right_wrist_pose.copy()
+                                    r1_robot_right_reference = held
+                                wrist_workspaces = tuple(
+                                    R1WristWorkspace(held) if slot == index else workspace
+                                    for slot, workspace in enumerate(wrist_workspaces)
+                                )
+                                hand_lock_reanchor[index] = False
+                                logger_mp.info("[R1 HAND LOCK] %s arm re-anchored at its held pose.", side)
                     left_wrist_target = anchored_wrist_target(
                         left_wrist_pose,
                         r1_vision_left_reference,
@@ -2056,7 +2109,7 @@ if __name__ == '__main__':
                 waist_yaw_target = None
                 if args.waist_follow:
                     waist_yaw_actual = arm_ctrl.get_current_waist_yaw()
-                    if not r1_independent_hands or all(hand_present):
+                    if not r1_independent_hands or not any(hand_lost):
                         if waist_turn_key is not None:
                             start_waist_turn(waist_follower, waist_turn_key, args)
                             waist_turn_key = None
@@ -2101,7 +2154,7 @@ if __name__ == '__main__':
             time_ik_end = time.time()
             if waist_turn_key is not None:
                 logger_mp.warning(
-                    "[R1 WAIST TURN] %s ignored: turns run only while following with both hands tracked%s.",
+                    "[R1 WAIST TURN] %s ignored: turns run only while following with no hand lost (a locked hand is fine)%s.",
                     waist_turn_key, "" if args.waist_follow else " and waist following on",
                 )
             logger_mp.debug(f"ik:\t{round(time_ik_end - time_ik_start, 6)}")
@@ -2332,7 +2385,9 @@ if __name__ == '__main__':
                 if RECORD_RUNNING:
                     recorder.add_item(**r1_capture.frame(
                         tele_data, head_img, capture_mode,
-                        {"left": left_wrist_img, "right": right_wrist_img}))
+                        {"left": left_wrist_img, "right": right_wrist_img},
+                        hand_locks=dict(zip(("left", "right"), HAND_LOCKS.snapshot()))
+                        if r1_independent_hands else None))
             elif args.record:
                 # dex hand or gripper
                 if args.ee == "dex3" and args.input_mode == "hand":

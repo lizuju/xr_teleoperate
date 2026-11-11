@@ -116,6 +116,11 @@ class CaptureTests(unittest.TestCase):
                               "points": np.ones((25, 3)).tolist()} for side in ("left", "right")}
         self.capture = R1Capture(self.arm, self.hand, loop, 0.25, (16, 32))
 
+    def test_hand_locks_are_recorded_only_when_given(self):
+        locked = self.capture.frame(self.xr, self.image, "following", hand_locks={"left": False, "right": True})
+        self.assertEqual(locked["sample"]["hand_locks"], {"left": False, "right": True})
+        self.assertNotIn("hand_locks", self.capture.frame(self.xr, self.image, "following")["sample"])
+
     def test_feedback_requested_and_published_are_distinct(self):
         frame = self.capture.frame(self.xr, self.image, "following")
         self.assertEqual(frame["states"]["left_arm"]["qpos"], [0.1] * 7)

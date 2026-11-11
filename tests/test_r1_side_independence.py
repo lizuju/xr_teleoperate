@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from teleop.robot_control.r1_wrist_stabilizer import WristStabilizer
 from teleop.robot_control.r1_hand_tracking import R1WristHold, hand_tracking_freshness, hand_tracking_present
 from teleop.robot_control.r1_wrist_workspace import R1WristWorkspace
+from teleop.robot_control.r1_hand_lock import R1HandLocks
 
 MAIN = Path(__file__).resolve().parents[1] / "teleop/teleop_hand_and_arm.py"
 
@@ -106,6 +107,8 @@ class SideIndependenceTest(unittest.TestCase):
             "logger_mp": Mock(), "arm_ctrl": controller, "arm_ik": ik,
             "waist_follower": follower, "linker_o6_loop": None,
             "take_waist_turn_request": lambda: None,
+            "HAND_LOCKS": R1HandLocks(), "hand_locked_previous": (False, False),
+            "hand_lock_reanchor": [False, False],
             "log_waist_turn_events": lambda follower: None,
             "run_motion": True, "capture_mode": "following",
             "relative_head_pitch_yaw": Mock(return_value=np.zeros(2)),
