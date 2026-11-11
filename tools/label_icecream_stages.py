@@ -200,7 +200,9 @@ def main(argv=None):
     for directory in directories:
         try:
             labels.append(label_episode(directory, front))
-        except (OSError, ValueError) as exc:
+        # Parseable but malformed data (a frame that is a list, a missing key) must not
+        # abort the batch either; report it like an unreadable file.
+        except (OSError, ValueError, TypeError, AttributeError, KeyError, IndexError) as exc:
             labels.append({"episode": directory.name, "stage": None, "outcome": None, "status": None,
                            "reason": f"unreadable: {exc}", "warnings": []})
     for label in labels:
