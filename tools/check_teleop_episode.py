@@ -92,9 +92,11 @@ TRAINING_CAMERAS = {"color_0": "head_left", "color_1": "head_right",
 # the unlocked hands' input age had a P95 of 106-125 ms over the headset Wi-Fi, and the
 # scattered rejections left only about 27% of each successful episode in segments of at
 # least 40 frames. 150 ms roughly doubled that; 200 ms added almost nothing more.
+# The XR and hand tracking sources describe the same headset samples, so their age
+# limit moved with it; at 100 ms they still rejected the frames the change targets.
 TRAINING_TIME_LIMITS = {"observation_skew_ms": 25.0, "observation_age_ms": 150.0,
                         "request_age_ms": 100.0, "request_skew_ms": 25.0,
-                        "hand_input_age_ms": 150.0}
+                        "hand_input_age_ms": 150.0, "tracking_age_ms": 150.0}
 # Rejections that only disqualify a row as an observation. Its action is still a
 # real accepted target, so earlier rows may keep it inside their action chunk.
 TRAINING_OBSERVATION_REASONS = frozenset((
@@ -236,7 +238,7 @@ def training_frame_rejections(frame, info):
     # lapse without making the frame's action stale.
     hand_locks = sample.get("hand_locks") if isinstance(sample.get("hand_locks"), dict) else {}
     for names, limit_ms, reason in (
-        (("xr", "left_hand_tracking", "right_hand_tracking"), 100, "tracking_stale"),
+        (("xr", "left_hand_tracking", "right_hand_tracking"), TRAINING_TIME_LIMITS["tracking_age_ms"], "tracking_stale"),
         (("robot", "left_hand_feedback", "right_hand_feedback"), 250, "feedback_stale"),
         (("image", "left_wrist_image", "right_wrist_image"), 500, "image_stale"),
     ):
