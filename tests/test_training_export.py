@@ -228,6 +228,17 @@ class TrainingExportTests(unittest.TestCase):
         self.assertEqual(locked["usable_following_frames"], 3)
         self.assertEqual(locked["tracking_invalid_frames"], 0)
 
+    def test_tracking_sources_share_the_150_ms_hand_input_limit(self):
+        _, manifest, rows = self.episode(count=1)
+        self.add_action_alignment(rows)
+        row = copy.deepcopy(rows[0])
+        now = row["sample"]["monotonic_ns"]
+        source = row["sample"]["sources"]["left_hand_tracking"]
+        source["received_monotonic_ns"] = now - 140_000_000
+        self.assertNotIn("tracking_stale", training_frame_rejections(row, manifest["info"]))
+        source["received_monotonic_ns"] = now - 160_000_000
+        self.assertIn("tracking_stale", training_frame_rejections(row, manifest["info"]))
+
     def test_a_locked_hand_keeps_an_old_input_without_rejecting_the_frame(self):
         _, manifest, rows = self.episode(count=1)
         self.add_action_alignment(rows)
@@ -514,7 +525,7 @@ class TrainingExportTests(unittest.TestCase):
     def test_time_gaps_split_and_stale_tracking_rejected(self):
         directory, manifest, rows = self.episode(count=8)
         rows[3]["sample"]["sources"]["xr"].update(
-            received_monotonic_ns=rows[3]["sample"]["monotonic_ns"]-150_000_000, age_ms=150.0)
+            received_monotonic_ns=rows[3]["sample"]["monotonic_ns"]-200_000_000, age_ms=200.0)
         self.write(directory, manifest, rows)
         report = validate_episode(directory)
         self.assertTrue(report["valid"], report["errors"])
