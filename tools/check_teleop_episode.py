@@ -324,11 +324,15 @@ def training_frame_rejections(frame, info):
     if "action_alignment" in sample or "hand_target_inputs" in sample:
         inputs = training_hand_inputs(sample)
         request = hand_request.get("monotonic_ns")
-        if any(timing[side + "_hand_input_age_ms"] is None
-               or timing[side + "_hand_input_age_ms"] > TRAINING_TIME_LIMITS["hand_input_age_ms"]
-               or type(request) is not int
-               or type((inputs.get(side) or {}).get("received_monotonic_ns")) is not int
-               or inputs[side]["received_monotonic_ns"] > request for side in ("left", "right")):
+        # A locked hand keeps the input that produced its held target, so its input age
+        # grows on purpose; only an unlocked hand must have a recent input.
+        if type(request) is not int or any(
+                hand_locks.get(side) is not True and (
+                    timing[side + "_hand_input_age_ms"] is None
+                    or timing[side + "_hand_input_age_ms"] > TRAINING_TIME_LIMITS["hand_input_age_ms"]
+                    or type((inputs.get(side) or {}).get("received_monotonic_ns")) is not int
+                    or inputs[side]["received_monotonic_ns"] > request)
+                for side in ("left", "right")):
             reasons.append("hand_input_stale")
     observation = training_observation(frame)
     for group, size in groups.items():
@@ -971,9 +975,11 @@ def validate_episode(path, min_segment_frames=DEFAULT_MIN_SEGMENT_FRAMES):
                     for command in (left_published, right_published)
                 )
                 report["command_inactive_frames"] += not commands_active
+            # A locked hand's own tracking may lapse (see training_frame_rejections).
             following = commands_active and mode == "following" and all(
                 isinstance(source_data.get(name), dict) and source_data[name].get("fresh") is True
-                for name in required_sources)
+                for name in required_sources
+                if not (name.endswith("_hand_tracking") and hand_locks.get(name[:-len("_hand_tracking")]) is True))
             tf = sample.get("tf")
             tf_metadata = info.get("tf")
             if tf is not None or tf_metadata is not None:

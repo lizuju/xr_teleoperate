@@ -214,6 +214,34 @@ class TrainingExportTests(unittest.TestCase):
         row["sample"]["hand_locks"] = {"left": True, "right": False}
         self.assertIn("tracking_stale", training_frame_rejections(row, manifest["info"]))
 
+    def test_a_locked_hand_out_of_view_still_counts_as_a_usable_following_frame(self):
+        path, manifest, rows = self.episode(count=3)
+        for row in rows:
+            row["sample"]["sources"]["right_hand_tracking"]["fresh"] = False
+        self.write(path, manifest, rows)
+        stale = validate_episode(path)
+        self.assertEqual(stale["usable_following_frames"], 0)
+        for row in rows:
+            row["sample"]["hand_locks"] = {"left": False, "right": True}
+        self.write(path, manifest, rows)
+        locked = validate_episode(path)
+        self.assertEqual(locked["usable_following_frames"], 3)
+        self.assertEqual(locked["tracking_invalid_frames"], 0)
+
+    def test_a_locked_hand_keeps_an_old_input_without_rejecting_the_frame(self):
+        _, manifest, rows = self.episode(count=1)
+        self.add_action_alignment(rows)
+        row = copy.deepcopy(rows[0])
+        for holder in (row["sample"], row["sample"].get("action_alignment") or {}):
+            inputs = holder.get("hand_target_inputs") or {}
+            if isinstance(inputs.get("right"), dict):
+                inputs["right"]["received_monotonic_ns"] -= 5_000_000_000
+        self.assertIn("hand_input_stale", training_frame_rejections(row, manifest["info"]))
+        row["sample"]["hand_locks"] = {"left": False, "right": True}
+        self.assertNotIn("hand_input_stale", training_frame_rejections(row, manifest["info"]))
+        row["sample"]["hand_locks"] = {"left": True, "right": False}
+        self.assertIn("hand_input_stale", training_frame_rejections(row, manifest["info"]))
+
     def test_legacy_rows_use_the_recorded_hand_request_as_the_decision(self):
         _, manifest, rows = self.episode(count=1)
         row = rows[0]

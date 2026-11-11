@@ -215,15 +215,19 @@ class HandLoopTest(unittest.TestCase):
         left, right, fresh = self.step()
         self.assertEqual((right[0], fresh), (5.0, (True, True)))
         self.assertTrue(self.loop.get_recording_sample()["tracking_fresh"]["right"])
+        self.assertEqual(self.loop.get_recording_sample()["held"], {"left": False, "right": True})
         self.visible[1] = True
         self.locks[1] = False
         self.assertEqual(self.step()[1][0], 5.0)
+        # Still held while it waits for the pinch, so recordings mark it as locked.
+        self.assertTrue(self.loop.get_recording_sample()["held"]["right"])
         self.assertTrue(any("keeps its grip" in line for line in self.log))
         self.right.value = np.array([5.3])
         self.assertEqual(self.step()[1][0], 5.0)
         self.right.value = np.array([5.05])
         self.assertEqual(self.step()[1][0], 5.05)
         self.assertTrue(any("follows your pinch again" in line for line in self.log))
+        self.assertEqual(self.loop.get_recording_sample()["held"], {"left": False, "right": False})
         self.right.value = np.array([5.3])
         self.assertEqual(self.step()[1][0], 5.3)
 
