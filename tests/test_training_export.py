@@ -358,6 +358,17 @@ class TrainingExportTests(unittest.TestCase):
         for i in range(2,5):
             self.assertEqual(dataset["sources"][i]["excluded_reason"], "not_success")
 
+    def test_request_skew_allows_up_to_35_ms(self):
+        _, manifest, rows = self.episode(count=1)
+        row = rows[0]
+        self.assertEqual(training_frame_rejections(row, manifest["info"]), [])
+        hand = row["sample"]["commands"]["hands"]["requested"]["monotonic_ns"]
+        row["sample"]["commands"]["arm"]["requested"]["monotonic_ns"] = hand - 34_000_000
+        self.assertAlmostEqual(training_timing(row["sample"])["request_skew_ms"], 34.0)
+        self.assertNotIn("request_skew", training_frame_rejections(row, manifest["info"]))
+        row["sample"]["commands"]["arm"]["requested"]["monotonic_ns"] = hand - 36_000_000
+        self.assertIn("request_skew", training_frame_rejections(row, manifest["info"]))
+
     def test_alignment_and_command_times_are_checked_from_actual_stamps(self):
         _, manifest, rows = self.episode(count=1)
         original = rows[0]

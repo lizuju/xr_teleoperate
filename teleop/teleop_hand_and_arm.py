@@ -112,6 +112,20 @@ def on_press(key):
     else:
         logger_mp.warning(f"[on_press] {key} was pressed, but no action is defined for this key.")
 
+def next_loop_tick(previous_tick, period, now):
+    """Next start time of the fixed-rate control loop, on an absolute schedule.
+
+    Each tick is one period after the previous one, so the whole iteration counts
+    toward the period and sleep overshoot does not add up (a relative sleep after part
+    of the iteration ran the 40 Hz loop at about 38.8 Hz). A late tick starts at once
+    and the schedule catches up; after a stall of more than one period it restarts at
+    now instead of running a burst of back-to-back iterations.
+    """
+    tick = now if previous_tick is None else previous_tick + period
+    if tick < now - period:
+        tick = now
+    return tick
+
 def take_waist_turn_request():
     """Return the pending arrow-key turn ('left' or 'right') once, or None."""
     global WAIST_TURN_REQUEST
@@ -1645,6 +1659,7 @@ if __name__ == '__main__':
         right_wrist_img = None
         last_fresh_tele_data = reference_tele_data if r1_a7_anchored else None
         tracking_hold_active = False
+        loop_next_tick = time.monotonic()
         hand_locked_previous = (False, False)
         hand_lock_reanchor = [False, False]
         r1_head_q_offset = np.zeros(2)
@@ -2557,9 +2572,8 @@ if __name__ == '__main__':
                     hold_reason = visionpro_source.get_hold_reason() or "tracking_interrupted"
                 native_status.submit(motion_status, recorder, args.record, hold_reason=hold_reason)
 
-            current_time = time.time()
-            time_elapsed = current_time - start_time
-            sleep_time = max(0, (1 / args.frequency) - time_elapsed)
+            loop_next_tick = next_loop_tick(loop_next_tick, 1.0 / args.frequency, time.monotonic())
+            sleep_time = max(0.0, loop_next_tick - time.monotonic())
             time.sleep(sleep_time)
             logger_mp.debug(f"main process sleep: {sleep_time}")
 

@@ -94,8 +94,13 @@ TRAINING_CAMERAS = {"color_0": "head_left", "color_1": "head_right",
 # least 40 frames. 150 ms roughly doubled that; 200 ms added almost nothing more.
 # The XR and hand tracking sources describe the same headset samples, so their age
 # limit moved with it; at 100 ms they still rejected the frames the change targets.
+# request_skew_ms was 25 until 2026-11-11. A frame pairs the 90 Hz hand request with the
+# latest arm request before it, which is almost always the previous 40 Hz arm tick, so
+# the skew runs up to one arm period; 25 ms rejected every slightly long tick and cut
+# 3-7% of frames out of each episode in scattered pieces. 35 ms took the eight
+# successful ice-cream episodes from 8592 to 13259 exportable frames; 40 ms added none.
 TRAINING_TIME_LIMITS = {"observation_skew_ms": 25.0, "observation_age_ms": 150.0,
-                        "request_age_ms": 100.0, "request_skew_ms": 25.0,
+                        "request_age_ms": 100.0, "request_skew_ms": 35.0,
                         "hand_input_age_ms": 150.0, "tracking_age_ms": 150.0}
 # Rejections that only disqualify a row as an observation. Its action is still a
 # real accepted target, so earlier rows may keep it inside their action chunk.
