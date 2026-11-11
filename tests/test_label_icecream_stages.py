@@ -164,6 +164,17 @@ class StageLabelTest(unittest.TestCase):
             self.assertEqual(labels.main([str(self.root)]), 0)
         self.assertIn("unreadable", out.getvalue())
 
+    def test_malformed_but_parseable_episode_is_reported_not_fatal(self):
+        full_session(self.root)
+        odd = self.root / "episode_0010_list_frames"
+        odd.mkdir()
+        (odd / "episode.json").write_text("{}")
+        (odd / "frames.jsonl").write_text("[1, 2, 3]\n")
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(labels.main([str(self.root)]), 0)
+        self.assertIn("episode_0010_list_frames", out.getvalue())
+        self.assertIn("stage 4", out.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()
