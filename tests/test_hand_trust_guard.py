@@ -80,12 +80,12 @@ class GuardTest(unittest.TestCase):
         self.assertFalse(any(blocked))
         self.assertEqual(guard.reason("right"), "occluded")
         self.assertEqual(guard.diagnostics()["right"]["events"]["occluded"], 1)
-        # The left hand moves away: still held for 0.25 s, then trusted again.
+        # The left hand moves away: still held for the dwell, then trusted again.
         clear = self.run_side(guard, "right", [hand(RIGHT)] * 40, start=2.0, other=lambda i: hand(LEFT_APART))
         first = clear.index(True)
         self.assertFalse(any(clear[:first]))
         self.assertTrue(all(clear[first:]))
-        self.assertAlmostEqual(first * DT, 0.25, delta=DT * 1.01)
+        self.assertAlmostEqual(first * DT, guard.dwell, delta=DT * 1.01)
         self.assertIsNone(guard.reason("right"))
 
     def test_the_hand_in_front_keeps_following(self):
@@ -117,6 +117,30 @@ class GuardTest(unittest.TestCase):
         results = self.run_side(guard, "right", [hand(RIGHT)] * 3, other=lambda i: hand(RIGHT + [0.03, 0.0, 0.0]))
         self.assertFalse(any(results))
         self.assertEqual(guard.reason("right"), "merged")
+
+    def test_partial_overlap_is_not_held_and_release_is_quick(self):
+        # Defaults since 2026-11-11: held at 4 of 6 points within 2 cm, released at
+        # 2 of 6 within 3 cm after 0.15 s.
+        guard = HandTrustGuard()
+        self.assertEqual((guard.block_radius, guard.clear_radius, guard.dwell), (0.02, 0.03, 0.15))
+        fractions = [3 / 6, 4 / 6, 3 / 6] + [2 / 6] * 20
+        radii = []
+
+        def fake_blocked_fraction(eye, targets, occluders, radius):
+            radii.append(radius)
+            return fractions[len(radii) - 1]
+
+        with mock.patch("teleop.utils.hand_trust_guard.blocked_fraction", side_effect=fake_blocked_fraction):
+            results = [guard.update("right", i * DT, hand(RIGHT), EYE, hand(LEFT_APART)[:, :3, 3])
+                       for i in range(len(fractions))]
+        self.assertTrue(results[0])   # 3 of 6 blocked: still follows
+        self.assertFalse(results[1])  # 4 of 6: held
+        self.assertFalse(results[2])  # 3 of 6 while held: stays held
+        self.assertEqual(radii[:3], [0.02, 0.02, 0.03])
+        first = results.index(True, 3)
+        self.assertFalse(any(results[3:first]))
+        self.assertAlmostEqual((first - 3) * DT, 0.15, delta=DT * 1.01)
+        self.assertEqual(guard.diagnostics()["right"]["events"]["occluded"], 1)
 
     def test_invalid_settings(self):
         with self.assertRaises(ValueError):
@@ -179,7 +203,7 @@ class SourceGuardTest(unittest.TestCase):
         first = recovered.index(True)
         self.assertFalse(any(recovered[:first]))
         self.assertTrue(all(recovered[first:]))
-        self.assertGreaterEqual(first * DT, 0.24)
+        self.assertGreaterEqual(first * DT, 0.14)  # the 0.15 s dwell
 
     def test_guard_off_passes_the_occluded_hand(self):
         source = visionpro_source.VisionProMotionSource(host=None, python=None, timeout=0.25, hand_guard=False)
