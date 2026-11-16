@@ -26,6 +26,7 @@ from teleop.robot_control.r1_hand_tracking import (
 )
 from teleop.robot_control.r1_wrist_workspace import R1WristWorkspace
 from teleop.robot_control.r1_hand_lock import HAND_LOCK_KEYS, R1HandLocks
+from teleop.utils.gc_tuning import freeze_startup_heap
 from sshkeyboard import listen_keyboard, stop_listening
 
 def publish_reset_category(category: int, publisher): # Scene Reset signal
@@ -1732,6 +1733,9 @@ if __name__ == '__main__':
                 f"tolerance {args.camera_sync_tolerance_ms:.1f} ms"
             )
 
+        # Full garbage collections walked the whole startup heap and paused this loop
+        # ~84 ms about every 5 s while recording (2026-11-16). Freeze that heap first.
+        GC_MONITOR = freeze_startup_heap(logger_mp)
         # main loop. robot start to follow VR user's motion
         while not STOP:
             if r1_a7_anchored:
@@ -2629,6 +2633,12 @@ if __name__ == '__main__':
                                    wrist_stabilizers[0].summary(), wrist_stabilizers[1].summary())
         except Exception as e:
             logger_mp.warning(f"Failed to write session summary: {e}")
+        try:
+            if globals().get("GC_MONITOR") is not None:
+                globals()["GC_MONITOR"].close()
+                logger_mp.info(globals()["GC_MONITOR"].summary())
+        except Exception as e:
+            logger_mp.warning(f"Failed to write the garbage collection summary: {e}")
         try:
             if linker_o6_loop is not None:
                 linker_o6_loop.stop()
