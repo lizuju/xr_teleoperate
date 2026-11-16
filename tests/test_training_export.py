@@ -630,6 +630,58 @@ class TrainingExportTests(unittest.TestCase):
         self.assertEqual(report["training_no_imu"]["sampling_gap_boundaries"], 1)
         self.assertEqual(report["training_no_imu"]["segments"], [{"start_idx":0,"stop_idx":3},{"start_idx":3,"stop_idx":7}])
 
+    @staticmethod
+    def shift_times(row, delta_ns):
+        seen = set()  # the fixture shares one IMU dict between several fields
+
+        def walk(value):
+            if isinstance(value, dict):
+                if id(value) in seen:
+                    return
+                seen.add(id(value))
+                for key, child in value.items():
+                    if (key.endswith("monotonic_ns") or key == "timestamp_ns") and type(child) is int:
+                        value[key] = child + delta_ns
+                    else:
+                        walk(child)
+            elif isinstance(value, list):
+                for child in value:
+                    walk(child)
+        walk(row["sample"])
+
+    def segments_after_delay(self, delay_ms, skip_tick=False, number=0):
+        directory, manifest, rows = self.episode(number=number, count=8)
+        self.add_action_alignment(rows)
+        for row in rows[4:]:
+            self.shift_times(row, round(delay_ms * 1e6))
+            if skip_tick:  # one arm request never reached a recorded frame
+                for arm in (row["sample"]["commands"]["arm"], row["sample"]["action_alignment"]["arm"]):
+                    arm["requested"]["sequence"] += 1
+                    if "request_sequence" in arm["published"]:
+                        arm["published"]["request_sequence"] += 1
+        self.write(directory, manifest, rows)
+        report = validate_episode(directory, min_segment_frames=2)
+        self.assertTrue(report["valid"], report["errors"])
+        training = report["training_no_imu"]
+        self.assertEqual(training["eligible_frames"], 8)
+        return training
+
+    def test_capture_jitter_between_consecutive_ticks_does_not_split_segments(self):
+        training = self.segments_after_delay(20)  # 45 ms between ticks 4 and 5
+        self.assertEqual(training["sampling_gap_boundaries"], 0)
+        self.assertEqual(training["segments"], [{"start_idx": 0, "stop_idx": 8}])
+        self.assertEqual([(s["start_idx"], s["stop_idx"]) for s in training["action_segments"]], [(0, 8)])
+        self.assertEqual(training["sample_interval_periods"], {"default": 1.5, "consecutive_arm_ticks": 2.0})
+
+    def test_a_long_interval_or_a_skipped_tick_still_splits_segments(self):
+        for number, (delay_ms, skip_tick) in enumerate(((26, False), (20, True), (13, True))):
+            with self.subTest(delay_ms=delay_ms, skip_tick=skip_tick):
+                training = self.segments_after_delay(delay_ms, skip_tick, number)
+                self.assertEqual(training["sampling_gap_boundaries"], 1)
+                self.assertEqual(training["segments"], [{"start_idx": 0, "stop_idx": 4}, {"start_idx": 4, "stop_idx": 8}])
+                self.assertEqual([(s["start_idx"], s["stop_idx"]) for s in training["action_segments"]],
+                                 [(0, 4), (4, 8)])
+
     def test_new_sensor_recording_with_zero_imu_exports_real_joint_and_image_inputs(self):
         _, manifest, _ = self.episode()
         info = manifest["info"]
