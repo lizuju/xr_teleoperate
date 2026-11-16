@@ -92,6 +92,8 @@ class R1HeadWaistFollower:
         self.heading_offset = 0.0
         self._turn = None
         self._turn_events = []
+        self._hand_locks = (False, False)
+        self._locked_waist_target = None
         self._last_time = float(now)
         self.tracking_timeout = float(tracking_timeout)
         self.engage_threshold = float(engage_threshold)
@@ -121,6 +123,15 @@ class R1HeadWaistFollower:
             )
         self.reset(self.waist_reference, self._last_time)
 
+    def set_hand_locks(self, locked, waist_actual, now):
+        newly_locked = any(current and not previous for current, previous in zip(locked, self._hand_locks))
+        self._hand_locks = tuple(locked)
+        if newly_locked:
+            self._locked_waist_target = float(waist_actual)
+            self.reset(waist_actual, now)
+        elif not any(locked):
+            self._locked_waist_target = None
+
     def reset(self, waist_actual, now):
         waist_actual, now = float(waist_actual), float(now)
         if not math.isfinite(waist_actual) or not math.isfinite(now):
@@ -135,6 +146,10 @@ class R1HeadWaistFollower:
                 "event": "cancelled", "direction": turn["direction"],
                 "goal": turn["goal"], "waist": waist_actual,
             })
+            if any(self._hand_locks):
+                self._locked_waist_target = waist_actual
+        if self._locked_waist_target is not None:
+            waist_actual = self._locked_waist_target
         self._last_time = now
         self.waist_target = waist_actual
         self.total_yaw = 0.0
@@ -184,6 +199,7 @@ class R1HeadWaistFollower:
         goal = self.next_turn_stop(direction)
         if goal is None:
             return None
+        self._locked_waist_target = None
         self._turn = {
             "direction": direction, "goal": goal,
             "offset_start": self.heading_offset, "target_start": self.waist_target,
@@ -223,6 +239,8 @@ class R1HeadWaistFollower:
         self.heading_offset = turn["offset_start"] + (self.waist_target - turn["target_start"])
         if reached:
             self._turn = None
+            if any(self._hand_locks):
+                self._locked_waist_target = self.waist_target
             self._turn_events.append({
                 "event": "reached", "direction": turn["direction"], "goal": goal,
             })
@@ -271,7 +289,7 @@ class R1HeadWaistFollower:
                     self.following = False
                     self._trigger_since = None
                     self._trigger_sign = 0.0
-            elif self.head_follow and heading_is_valid and abs(residual) > self.engage_threshold:
+            elif self.head_follow and not any(self._hand_locks) and heading_is_valid and abs(residual) > self.engage_threshold:
                 trigger_sign = math.copysign(1.0, residual)
                 if self._trigger_since is None or trigger_sign != self._trigger_sign:
                     self._trigger_since = now

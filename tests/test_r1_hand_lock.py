@@ -1,4 +1,4 @@
-"""Operator hand locks ([ left, ] right): the locked arm and its hand hold; nothing else does."""
+"""Operator hand locks hold that arm, its hand, and the waist; explicit turns still work."""
 import ast
 import math
 from pathlib import Path
@@ -53,6 +53,15 @@ class KeyTest(unittest.TestCase):
         self.ns["on_press"]("right")
         self.assertEqual(self.ns["WAIST_TURN_REQUEST"], "right")
         self.assertEqual(self.ns["HAND_LOCKS"].snapshot(), (False, False))
+
+    def test_lock_discards_an_older_queued_turn_but_a_later_arrow_can_turn(self):
+        self.ns["on_press"]("right")
+        self.ns["on_press"]("]")
+        self.assertIsNone(self.ns["WAIST_TURN_REQUEST"])
+        self.ns["on_press"]("left")
+        self.assertEqual(self.ns["WAIST_TURN_REQUEST"], "left")
+        self.ns["on_press"]("]")
+        self.assertEqual(self.ns["WAIST_TURN_REQUEST"], "left")
 
 
 class LoopTest(unittest.TestCase):
@@ -145,6 +154,22 @@ class LoopTest(unittest.TestCase):
         lost["take_waist_turn_request"] = Mock(return_value="right")
         self.run_loop(lost)
         self.assertFalse(lost["waist_follower"].turning)
+
+    def test_lock_stops_a_turn_and_publishes_the_same_waist_angle_despite_feedback_drift(self):
+        ns, _ = self.context()
+        ns["args"].waist_follow_compensation = "torso"
+        follower = ns["waist_follower"] = R1HeadWaistFollower(0.43, 0.98)
+        follower.command_turn(-1)
+        ns["HAND_LOCKS"].toggle("right")
+        self.run_loop(ns)
+        self.assertFalse(follower.turning)
+        self.assertEqual(ns["arm_ctrl"].ctrl_dual_arm_and_head.call_args.kwargs["waist_yaw_target"], 0.43)
+        ns["arm_ctrl"].get_current_waist_yaw.return_value = 0.48
+        self.run_loop(ns, 3)
+        self.assertEqual(ns["arm_ctrl"].ctrl_dual_arm_and_head.call_args.kwargs["waist_yaw_target"], 0.43)
+        self.assertFalse(ns["tracking_hold_active"])
+        self.assertEqual(ns["capture_mode"], "following")
+        np.testing.assert_allclose(ns["right_wrist_target"], self.case.right, atol=1e-12)
 
 
 class Retargeter:
