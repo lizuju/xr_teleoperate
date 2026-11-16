@@ -73,6 +73,30 @@ class LinkerO6ControlLoopTest(unittest.TestCase):
             lambda: False, lambda state, action: self.outputs.append((state, action)),
         )
 
+    def test_running_loop_reports_its_achieved_rate(self):
+        loop = LinkerO6ControlLoop(
+            sample, self.retargeter, self.controller, 200.0, 0.25,
+            lambda: False, lambda state, action: None,
+        )
+        self.assertIn("0.0 Hz achieved of 200 Hz", loop.timing_summary())
+        loop.start()
+        time.sleep(0.15)
+        loop.stop()
+        self.assertGreater(loop.step_count, 5)
+        text = loop.timing_summary()
+        rate = float(text.split("] ")[1].split(" Hz")[0])
+        self.assertGreater(rate, 20.0)
+        self.assertLessEqual(rate, 230.0)
+        self.assertIn("of 200 Hz", text)
+        self.assertIn("longest gap", text)
+        self.assertEqual(text, loop.timing_summary())  # frozen once the loop has stopped
+
+    def test_teleop_sets_a_short_gil_switch_interval_by_default(self):
+        source = (Path(__file__).resolve().parents[1] / "teleop" / "teleop_hand_and_arm.py").read_text(encoding="utf-8")
+        self.assertIn("'--gil-switch-interval-ms', type=float, default=1.0", source)
+        self.assertIn("sys.setswitchinterval(args.gil_switch_interval_ms / 1000.0)", source)
+        self.assertIn("linker_o6_loop.timing_summary()", source)
+
     def test_same_xr_frame_is_not_reoptimized_but_commands_keep_ticking(self):
         snapshot = sample()
         self.loop.get_tele_data = lambda: snapshot

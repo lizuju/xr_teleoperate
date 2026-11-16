@@ -48,6 +48,13 @@ class LinkerO6ControlLoop:
             "tracking_fresh": {"left": False, "right": False},
             "paused": False,
         }
+        # Achieved rate, reported once at exit: on 2026-11-16 the 90 Hz loop really ran at
+        # 22-47 Hz, which aged every finger command by tens of milliseconds.
+        self.step_count = 0
+        self.late_steps = 0
+        self.max_step_interval_ms = 0.0
+        self.run_started = None
+        self.run_stopped = None
         self.thread = threading.Thread(target=self._run, name="linker-o6-control", daemon=True)
 
     def start(self):
@@ -163,19 +170,37 @@ class LinkerO6ControlLoop:
             return deepcopy(self.recording_sample["target_inputs"])
 
     def _run(self):
+        previous = None
         try:
             while not self.stop_event.is_set() and not self.should_stop():
                 started = time.monotonic()
+                if previous is None:
+                    self.run_started = started
+                else:
+                    interval = started - previous
+                    self.max_step_interval_ms = max(self.max_step_interval_ms, interval * 1000.0)
+                    self.late_steps += interval > 2.0 * self.period
+                previous = started
                 self._step()
+                self.step_count += 1
                 self.stop_event.wait(max(0.0, self.period - (time.monotonic() - started)))
         except Exception as error:
             self.error = error
         finally:
+            self.run_stopped = time.monotonic()
             try:
                 self.controller.stop()
             except Exception as error:
                 if self.error is None:
                     self.error = error
+
+    def timing_summary(self):
+        end = self.run_stopped if self.run_stopped is not None else time.monotonic()
+        elapsed = end - self.run_started if self.run_started is not None else 0.0
+        rate = self.step_count / elapsed if elapsed > 0.0 else 0.0
+        return (f"[R1 HAND LOOP] {rate:.1f} Hz achieved of {1.0 / self.period:.0f} Hz over {elapsed:.0f} s; "
+                f"steps more than 2 periods apart: {self.late_steps}; "
+                f"longest gap {self.max_step_interval_ms:.0f} ms")
 
     def raise_if_failed(self):
         if self.error is not None:

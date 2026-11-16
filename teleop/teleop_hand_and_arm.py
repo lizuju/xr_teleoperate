@@ -522,6 +522,8 @@ if __name__ == '__main__':
     parser.add_argument('--linker-o6-urdf-root', type=str, default='/home/hnh/unitree_r1_dev/linkerhand-urdf/O6', help='Official Linker O6 URDF root')
     parser.add_argument('--linker-o6-method', choices=['vector', 'position', 'dexpilot'], default='vector', help='dex-retargeting optimizer for Linker O6')
     parser.add_argument('--linker-o6-frequency', type=float, default=90.0, help='Linker O6 hand loop rate; separate from --frequency because tracking arrives near 90 Hz')
+    parser.add_argument('--gil-switch-interval-ms', type=float, default=1.0,
+                        help='Python thread switch interval in ms (Python default 5). 0 keeps the default.')
     parser.add_argument('--linker-o6-live-state', type=str, default=None, help='Atomic JSON target snapshot for isolated Linker O6 simulation')
     parser.add_argument('--right-ee', choices=['linker_o6', 'dex1'], default='linker_o6', help='R1_A7 right wrist device. dex1 is a Unitree Dex1-1 gripper '
                         '(dex1_1_service on PC2) that follows the right thumb-index distance; the left wrist stays a Linker O6.')
@@ -671,6 +673,13 @@ if __name__ == '__main__':
         parser.error("--frequency must be positive.")
     if not (math.isfinite(args.linker_o6_frequency) and args.linker_o6_frequency > 0.0):
         parser.error("--linker-o6-frequency must be positive.")
+    if not (math.isfinite(args.gil_switch_interval_ms) and 0.0 <= args.gil_switch_interval_ms <= 50.0):
+        parser.error("--gil-switch-interval-ms must be between 0 and 50.")
+    # Threads take turns with Python's GIL every switch interval. At the 5 ms default the
+    # 90 Hz hand loop ran at 22-47 Hz on 2026-11-16 (its retargeting takes 0.7 ms): it
+    # waited behind the main loop, DDS readers and the recorder. 1 ms lets it in sooner.
+    if args.gil_switch_interval_ms > 0.0:
+        sys.setswitchinterval(args.gil_switch_interval_ms / 1000.0)
     if not (math.isfinite(args.arm_translation_scale) and args.arm_translation_scale > 0.0):
         parser.error("--arm-translation-scale must be positive.")
     if not (math.isfinite(args.waist_follow_threshold_deg) and args.waist_follow_threshold_deg > 0.0):
@@ -2633,6 +2642,12 @@ if __name__ == '__main__':
                                    wrist_stabilizers[0].summary(), wrist_stabilizers[1].summary())
         except Exception as e:
             logger_mp.warning(f"Failed to write session summary: {e}")
+        try:
+            if linker_o6_loop is not None:
+                logger_mp.info(linker_o6_loop.timing_summary()
+                               + f"; GIL switch interval {sys.getswitchinterval() * 1000.0:.1f} ms")
+        except Exception as e:
+            logger_mp.warning(f"Failed to write the hand loop summary: {e}")
         try:
             if globals().get("GC_MONITOR") is not None:
                 globals()["GC_MONITOR"].close()
