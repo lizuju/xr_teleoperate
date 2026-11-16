@@ -225,6 +225,31 @@ def training_timing(sample):
     return result
 
 
+# Segment continuity. Consecutive frames from consecutive control ticks (the arm request
+# sequence steps by exactly 1) may be up to 2 periods apart: the capture point follows
+# the arm request, which drifts inside the 25 ms tick with IK solve time. On 2026-11-16
+# every tick of a 54 s episode was present while intervals ranged 14.6-46 ms, and the
+# old 1.5-period rule cut 31 segments there; across 14 episodes it cost 2567 frames.
+# Without proof of consecutive ticks (or with a skipped tick) the limit stays 1.5.
+TRAINING_SAMPLE_INTERVAL_PERIODS = 1.5
+TRAINING_CONSECUTIVE_TICK_INTERVAL_PERIODS = 2.0
+
+
+def arm_request_sequence(sample):
+    commands = sample.get("commands") if isinstance(sample, dict) else None
+    arm = commands.get("arm") if isinstance(commands, dict) else None
+    requested = arm.get("requested") if isinstance(arm, dict) else None
+    value = requested.get("sequence") if isinstance(requested, dict) else None
+    return value if type(value) is int else None
+
+
+def sample_interval_limit_ns(frequency, sequence, previous_sequence):
+    consecutive_tick = (sequence is not None and previous_sequence is not None
+                        and sequence == previous_sequence + 1)
+    periods = TRAINING_CONSECUTIVE_TICK_INTERVAL_PERIODS if consecutive_tick else TRAINING_SAMPLE_INTERVAL_PERIODS
+    return periods * 1e9 / frequency
+
+
 def training_frame_rejections(frame, info):
     """Vision/joint BC policy. IMU validity and IMU packet gaps are not inputs."""
     if end_effectors(info) is None:
@@ -408,7 +433,10 @@ def validate_episode(path, min_segment_frames=DEFAULT_MIN_SEGMENT_FRAMES):
                                   "min_segment_frames": min_segment_frames, "action_segments": [],
                                   "longest_segment_frames": 0, "exportable_segments": 0,
                                   "exportable_frames": 0, "short_segment_frames": 0,
-                                  "sampling_gap_boundaries": 0}}
+                                  "sampling_gap_boundaries": 0,
+                                  "sample_interval_periods": {
+                                      "default": TRAINING_SAMPLE_INTERVAL_PERIODS,
+                                      "consecutive_arm_ticks": TRAINING_CONSECUTIVE_TICK_INTERVAL_PERIODS}}}
 
     def error(message):
         report["error_count"] += 1
@@ -598,8 +626,10 @@ def validate_episode(path, min_segment_frames=DEFAULT_MIN_SEGMENT_FRAMES):
     timing_bases = Counter()
     training_previous_ns = None
     training_previous_idx = None
+    training_previous_seq = None
     action_previous_ns = None
     action_previous_idx = None
+    action_previous_seq = None
     with stream:
         for line_number, line in enumerate(stream, 1):
             label = f"line {line_number}"
@@ -1197,10 +1227,12 @@ def validate_episode(path, min_segment_frames=DEFAULT_MIN_SEGMENT_FRAMES):
             training_exclusions.update(rejections)
             training = report["training_no_imu"]
             idx, stamp = frame.get("idx"), sample.get("monotonic_ns")
+            tick = arm_request_sequence(sample)
             if not rejections and type(idx) is int:
                 contiguous = (training_previous_idx is not None and idx == training_previous_idx + 1)
                 gap_ok = (training_previous_ns is not None and frequency is not None
-                          and 0 < stamp - training_previous_ns <= 1.5e9 / frequency)
+                          and 0 < stamp - training_previous_ns
+                          <= sample_interval_limit_ns(frequency, tick, training_previous_seq))
                 if contiguous and not gap_ok:
                     training["sampling_gap_boundaries"] += 1
                 if contiguous and gap_ok:
@@ -1208,20 +1240,21 @@ def validate_episode(path, min_segment_frames=DEFAULT_MIN_SEGMENT_FRAMES):
                 else:
                     training["segments"].append({"start_idx": idx, "stop_idx": idx + 1})
                 training["eligible_frames"] += 1
-                training_previous_idx, training_previous_ns = idx, stamp
+                training_previous_idx, training_previous_ns, training_previous_seq = idx, stamp, tick
             else:
-                training_previous_idx = training_previous_ns = None
+                training_previous_idx = training_previous_ns = training_previous_seq = None
             # An exportable segment is a run of usable actions; its usable observations are the anchors.
             if not set(rejections) - TRAINING_OBSERVATION_REASONS and type(idx) is int:
                 if (action_previous_idx is not None and idx == action_previous_idx + 1 and frequency is not None
-                        and 0 < stamp - action_previous_ns <= 1.5e9 / frequency):
+                        and 0 < stamp - action_previous_ns
+                        <= sample_interval_limit_ns(frequency, tick, action_previous_seq)):
                     training["action_segments"][-1]["stop_idx"] = idx + 1
                     training["action_segments"][-1]["anchors"] += not rejections
                 else:
                     training["action_segments"].append({"start_idx": idx, "stop_idx": idx + 1, "anchors": int(not rejections)})
-                action_previous_idx, action_previous_ns = idx, stamp
+                action_previous_idx, action_previous_ns, action_previous_seq = idx, stamp, tick
             else:
-                action_previous_idx = action_previous_ns = None
+                action_previous_idx = action_previous_ns = action_previous_seq = None
 
     if report["frames_checked"] == 0:
         error("frames.jsonl: episode has no frames")
