@@ -107,7 +107,10 @@ def on_press(key):
         logger_mp.info(f"[R1 WAIST TURN] {key} turn requested.")
     elif key in HAND_LOCK_KEYS:
         side = HAND_LOCK_KEYS[key]
-        locked = HAND_LOCKS.toggle(side)
+        with WAIST_TURN_LOCK:
+            locked = HAND_LOCKS.toggle(side)
+            if locked:
+                WAIST_TURN_REQUEST = None
         logger_mp.info(f"[R1 HAND LOCK] {side} arm and hand: {'lock' if locked else 'unlock'} requested.")
     else:
         logger_mp.warning(f"[on_press] {key} was pressed, but no action is defined for this key.")
@@ -274,7 +277,7 @@ def log_waist_turn_events(follower):
             logger_mp.info("[R1 WAIST TURN] reached %.1f deg from the start heading.", goal)
         else:
             logger_mp.warning(
-                "[R1 WAIST TURN] turn to %.1f deg stopped at %.1f deg (tracking lost or paused); "
+                "[R1 WAIST TURN] turn to %.1f deg stopped at %.1f deg (tracking lost, paused, or hand locked); "
                 "press the arrow again to continue.", goal, math.degrees(event["waist"] - follower.turn_origin),
             )
 
@@ -1670,7 +1673,7 @@ if __name__ == '__main__':
             logger_mp.info("[R1 CONTROL] [p] pauses and holds; [r] realigns and resumes; when recording is enabled, [s] also starts the next episode after resume; [q] exits.")
         if r1_independent_hands:
             logger_mp.info("[R1 HAND LOCK] [ locks/unlocks the left arm and O6, ] the right arm and its hand; "
-                           "the locked side holds its pose while everything else keeps following.")
+                           "locking also holds the waist angle; arrow keys explicitly turn it to a new held angle.")
             wrist_holds = (R1WristHold(r1_robot_left_reference), R1WristHold(r1_robot_right_reference))
             wrist_workspaces = (R1WristWorkspace(r1_robot_left_reference), R1WristWorkspace(r1_robot_right_reference))
             held_head_q_target = arm_ctrl.get_current_head_q().copy()
@@ -1894,9 +1897,18 @@ if __name__ == '__main__':
                     hold.resume_streak = hold.resume_streak + 1 if present else 0
                     hand_present.append(present and (hold.tracking or hold.resume_streak >= 2))
                 # An operator lock ([ left, ] right) holds that arm and its hand like a lost
-                # hand, but it is a command, not a fault: it does not hold the waist, count as a
-                # tracking hold or mark recorded frames as not following.
+                # hand, but it is a command, not a fault: it also holds the waist without
+                # counting as a tracking hold or marking recorded frames as not following.
                 hand_locked = HAND_LOCKS.snapshot()
+                if args.waist_follow:
+                    waist_follower.set_hand_locks(
+                        hand_locked, arm_ctrl.get_current_waist_yaw(), time.monotonic(),
+                    )
+                    if any(locked and not previous for locked, previous in zip(hand_locked, hand_locked_previous)):
+                        logger_mp.info(
+                            "[R1 WAIST LOCK] Holding %.1f deg; arrow keys can turn to a new held angle.",
+                            math.degrees(waist_follower.waist_target),
+                        )
                 hand_lost = tuple(not present and not locked for present, locked in zip(hand_present, hand_locked))
                 hand_present = tuple(present and not locked for present, locked in zip(hand_present, hand_locked))
                 for index, (side, hold, present) in enumerate(zip(("left", "right"), wrist_holds, hand_present)):

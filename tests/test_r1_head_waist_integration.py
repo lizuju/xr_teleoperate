@@ -115,7 +115,7 @@ class R1HeadWaistIntegrationTest(unittest.TestCase):
         }
         controller.get_reference_q.return_value = np.zeros(14)
         controller.get_target_shaper_snapshot.return_value = None
-        follower = Mock(total_yaw=0.7, following=True, turning=False)
+        follower = Mock(total_yaw=0.7, following=True, turning=False, waist_target=0.43)
         follower.update.return_value = (np.array([0.2, 0.27]), 1.2)
         # Head-only target while a hand is held; distinct from update() and the held head.
         follower.head_target.return_value = np.array([0.15, 0.25])

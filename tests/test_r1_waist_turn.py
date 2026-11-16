@@ -222,6 +222,84 @@ class WaistTurnFollowerTest(unittest.TestCase):
             R1HeadWaistFollower(0.0, 0.0, turn_origin=float("nan"))
 
 
+class WaistHandLockTest(unittest.TestCase):
+    def test_each_hand_locks_at_actual_angle_and_head_motion_does_not_change_it(self):
+        for locks in ((True, False), (False, True)):
+            with self.subTest(locks=locks):
+                follower = R1HeadWaistFollower(0.0, 0.0)
+                follower.set_hand_locks(locks, 0.15, 0.0)
+                for i in range(1, 81):
+                    now = i * DT
+                    follower.set_hand_locks(locks, 0.20, now)
+                    head, target = follower.update(head_pose(0.8), np.eye(4), 0.20, now)
+                    self.assertEqual(target, 0.15)
+                self.assertFalse(follower.following)
+                self.assertGreater(head[1], 0.5)
+
+    def test_lock_cancels_an_active_turn_and_clears_its_velocity(self):
+        follower = R1HeadWaistFollower(0.0, 0.0)
+        robot = Robot(follower)
+        follower.command_turn(-1)
+        robot.run(1.0)
+        actual = robot.waist + 0.02
+        follower.set_hand_locks((False, True), actual, robot.now)
+        robot.run(3.0, head_yaw=0.7)
+        self.assertFalse(follower.turning)
+        self.assertEqual(follower.waist_target, actual)
+        self.assertEqual(follower._velocity, 0.0)
+        self.assertEqual([event["event"] for event in robot.events], ["cancelled"])
+
+    def test_lock_stops_active_head_following(self):
+        follower = R1HeadWaistFollower(0.0, 0.0)
+        robot = Robot(follower).run(1.0, head_yaw=0.8)
+        self.assertTrue(follower.following)
+        held = robot.waist
+        follower.set_hand_locks((True, False), held, robot.now)
+        robot.run(2.0, head_yaw=0.8)
+        self.assertEqual(follower.waist_target, held)
+        self.assertFalse(follower.following)
+
+    def test_both_hands_must_unlock_before_head_following_resumes(self):
+        follower = R1HeadWaistFollower(0.0, 0.0)
+        robot = Robot(follower)
+        follower.set_hand_locks((True, True), 0.0, 0.0)
+        follower.set_hand_locks((False, True), 0.1, 0.0)
+        robot.run(1.0, head_yaw=0.8)
+        self.assertEqual(follower.waist_target, 0.0)
+        follower.set_hand_locks((False, False), 0.0, robot.now)
+        robot.run(1.0, head_yaw=0.8)
+        self.assertGreater(follower.waist_target, 0.0)
+
+    def test_arrow_turn_while_locked_holds_at_the_new_stop(self):
+        follower = R1HeadWaistFollower(0.0, 0.0)
+        follower.set_hand_locks((False, True), 0.0, 0.0)
+        robot = Robot(follower)
+        follower.command_turn(-1)
+        robot.run_until_idle(head_yaw=0.7)
+        follower.reset(-QUARTER + 0.05, robot.now)
+        robot.run(2.0, head_yaw=0.7)
+        self.assertEqual(follower.waist_target, -QUARTER)
+
+    def test_feedback_drift_and_tracking_gap_do_not_redefine_a_locked_angle(self):
+        follower = R1HeadWaistFollower(0.0, 0.0)
+        follower.set_hand_locks((True, False), 0.1, 0.0)
+        follower.reset(0.2, 0.1)
+        _, target = follower.update(head_pose(0.8), np.eye(4), 0.2, 1.0)
+        self.assertEqual(target, 0.1)
+
+    def test_locking_second_hand_stops_an_explicit_turn_at_current_angle(self):
+        follower = R1HeadWaistFollower(0.0, 0.0)
+        follower.set_hand_locks((True, False), 0.0, 0.0)
+        robot = Robot(follower)
+        follower.command_turn(-1)
+        robot.run(1.0)
+        held = robot.waist
+        follower.set_hand_locks((True, True), held, robot.now)
+        robot.run(2.0)
+        self.assertFalse(follower.turning)
+        self.assertEqual(follower.waist_target, held)
+
+
 class WaistTurnTeleopTest(unittest.TestCase):
     """The keyboard and loop helpers, executed from the production source."""
 

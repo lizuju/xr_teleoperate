@@ -24,7 +24,7 @@ from aiohttp import web
 #
 # The proxy also rewrites mDNS (.local) ICE candidates in the SDP offer into the
 # IPv4 addresses the headset can reach; PC2 advertises its own hostname.
-DEFAULT_BIND_HOST = "192.168.5.10"
+DEFAULT_BIND_HOST = "192.168.50.165"
 DEFAULT_UPSTREAM_HOST = "192.168.123.164"
 UPSTREAM_PATH = "/offer"
 CERT_DIR = Path.home() / ".config/xr_teleoperate"
@@ -82,6 +82,9 @@ async def proxy(request):
             raise web.HTTPBadRequest(text="Invalid JSON", headers=CORS) from error
         if not isinstance(payload, dict) or not isinstance(payload.get("sdp"), str):
             raise web.HTTPBadRequest(text="Missing SDP string", headers=CORS)
+        if payload.get("video_metadata") == "r1-video-meta-v1":
+            # PC2 sees the gateway address; keep headsets distinct across reconnects.
+            payload["native_client_id"] = request.remote
         names = list(dict.fromkeys(match[2] for match in CANDIDATE_HOST.finditer(payload["sdp"])))
         addresses = await asyncio.gather(*(resolve_mdns(name) for name in names))
         resolved = dict(zip(names, addresses))

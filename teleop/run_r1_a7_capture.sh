@@ -108,7 +108,7 @@ exec "${dev_root}/.venv-xr/bin/python" -u teleop_hand_and_arm.py \
   --camera-calibration "${CAMERA_CALIBRATION:-}" \
   --record-max-tracking-age-ms "${RECORD_MAX_TRACKING_AGE_MS:-100}" \
   --network-interface eno1 \
-  --img-server-ip 192.168.5.10 \
+  --img-server-ip 192.168.50.165 \
   --headless \
   --record \
   --task-dir "${dev_root}/teleop-recordings" \

@@ -2,8 +2,8 @@
 
 [ toggles the left side, ] the right side (the full-width 【 】 of a Chinese input
 method work too). A lock is a deliberate command, not a tracking fault: the locked arm
-and its hand keep their last target while the rest of the robot keeps following, the
-waist may still turn, and recorded frames stay "following" so they remain usable for
+and its hand keep their last target while the other arm and head keep following. The
+waist holds its angle until an explicit arrow-key turn, and frames stay "following" for
 training. The control loop re-anchors an unlocked arm at its held pose, and the hand
 loop makes an unlocked gripper wait until the operator's pinch matches its grip.
 """
