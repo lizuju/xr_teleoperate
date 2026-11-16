@@ -129,6 +129,7 @@ def capture_metadata(args, camera_config, retargeter, calibration=None, recordin
         "sensor_sync": {
             "schema": "r1_sensor_sync_v1", "feedback_tolerance_ms": 25.0,
             "clock_uncertainty_limit_ms": 5.0,
+            "clock_max_age_ms": CAMERA_CLOCK_MAX_AGE_NS / 1e6,
             "method": "nearest received feedback to the middle of the selected image times; no interpolation or extrapolation",
             "imu": {"quaternion_order": "wxyz", "gyroscope_unit": "rad/s",
                     "accelerometer_unit": "m/s^2", "rpy_unit": "rad",
@@ -236,6 +237,11 @@ def _end_effector_state(entry):
             "torque": channel("torque"), "temperature": channel("temperature"),
             "errors": channel("errors")}
 
+
+# A camera clock sample may be used for up to 15 s after it was measured, judged at
+# sample time. Until 2026-11-16 this was 10 s, the same as the image client's limit at
+# frame arrival, so frames that arrived just inside it failed here a few ms later.
+CAMERA_CLOCK_MAX_AGE_NS = 15_000_000_000
 
 class R1Capture:
     def __init__(self, arm_controller, hand_controller, hand_loop, tracking_timeout, image_shape,
@@ -447,7 +453,7 @@ class R1Capture:
                                                for side in sorted(self.wrist_image_shapes)]
         clock_ok = pairing.timestamp_basis == "mapped_source" and all(
             (entry.get("timing") or {}).get("clock_valid") is True
-            and 0 <= now - entry["timing"]["clock_measured_monotonic_ns"] <= 10_000_000_000
+            and 0 <= now - entry["timing"]["clock_measured_monotonic_ns"] <= CAMERA_CLOCK_MAX_AGE_NS
             and entry["timing"]["clock_uncertainty_ns"] <= 5_000_000
             for entry in camera_sources)
         stereo_ok = (image_source.get("timing") or {}).get("stereo_skew_ns")

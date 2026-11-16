@@ -99,9 +99,18 @@ TRAINING_CAMERAS = {"color_0": "head_left", "color_1": "head_right",
 # the skew runs up to one arm period; 25 ms rejected every slightly long tick and cut
 # 3-7% of frames out of each episode in scattered pieces. 35 ms took the eight
 # successful ice-cream episodes from 8592 to 13259 exportable frames; 40 ms added none.
+# camera_clock_age_ms was 10 s until 2026-11-16. The image client keeps using a clock
+# sample while it is at most 10 s old when a frame arrives, but the frame is judged
+# slightly later, at sample time, so every refresh left 2-4 frames per camera at
+# 10.0-10.1 s: about 40 frames of each ice-cream episode, which also split segments.
+# The client's own 10 s limit is unchanged; the 5 ms uncertainty bound still applies.
 TRAINING_TIME_LIMITS = {"observation_skew_ms": 25.0, "observation_age_ms": 150.0,
                         "request_age_ms": 100.0, "request_skew_ms": 35.0,
-                        "hand_input_age_ms": 150.0, "tracking_age_ms": 150.0}
+                        "hand_input_age_ms": 150.0, "tracking_age_ms": 150.0,
+                        "camera_clock_age_ms": 15000.0}
+# Episodes recorded before 2026-11-16 carry no sensor_sync.clock_max_age_ms; their
+# capture-time sensor_alignment.clock_valid flag used a 10 s clock age limit.
+LEGACY_CAPTURE_CLOCK_MAX_AGE_MS = 10000.0
 # Rejections that only disqualify a row as an observation. Its action is still a
 # real accepted target, so earlier rows may keep it inside their action chunk.
 TRAINING_OBSERVATION_REASONS = frozenset((
@@ -265,8 +274,11 @@ def training_frame_rejections(frame, info):
     if alignment.get("aligned") is not True:
         reasons.append("cameras_unaligned")
     sensor = sample.get("sensor_alignment") or {}
+    # Clock validity is re-derived per camera just below (camera_clock_invalid) with the
+    # training age limit. The capture-time clock_valid flag is not trusted here: before
+    # 2026-11-16 it used 10 s and so rejected frames this limit accepts.
     if (alignment.get("timestamp_basis") != "mapped_source"
-            or not all(sensor.get(key) is True for key in ("clock_valid", "stereo_aligned", "feedback_aligned"))):
+            or not all(sensor.get(key) is True for key in ("stereo_aligned", "feedback_aligned"))):
         reasons.append("sensor_unaligned")
     for name in ("image", "left_wrist_image", "right_wrist_image"):
         clock = (sources.get(name) or {}).get("timing") or {}
@@ -278,7 +290,8 @@ def training_frame_rejections(frame, info):
                 or not 0 < clock["source_monotonic_ns"]
                 or clock["source_monotonic_ns"] + clock["clock_offset_ns"] != clock["mapped_monotonic_ns"]
                 or not 0 <= clock["clock_uncertainty_ns"] <= 5_000_000
-                or not 0 <= now - clock["clock_measured_monotonic_ns"] <= 10_000_000_000):
+                or not 0 <= now - clock["clock_measured_monotonic_ns"]
+                <= TRAINING_TIME_LIMITS["camera_clock_age_ms"] * 1_000_000):
             reasons.append("camera_clock_invalid")
             break
     timing = training_timing(sample)
@@ -461,6 +474,13 @@ def validate_episode(path, min_segment_frames=DEFAULT_MIN_SEGMENT_FRAMES):
         info = {}
     require_r1_commands = end_effectors(info) is not None
     hand_dims = {side: END_EFFECTOR_DIMS[device] for side, device in (end_effectors(info) or {}).items()}
+    # The capture-time clock_valid flag is cross-checked with the limit it was recorded with.
+    sensor_sync_info = info.get("sensor_sync") if isinstance(info.get("sensor_sync"), dict) else {}
+    capture_clock_max_age_ms = sensor_sync_info.get("clock_max_age_ms", LEGACY_CAPTURE_CLOCK_MAX_AGE_MS)
+    if (type(capture_clock_max_age_ms) not in (int, float) or not math.isfinite(capture_clock_max_age_ms)
+            or not 0 < capture_clock_max_age_ms <= 60_000):
+        error("info.sensor_sync.clock_max_age_ms: expected a positive number of milliseconds up to 60000")
+        capture_clock_max_age_ms = LEGACY_CAPTURE_CLOCK_MAX_AGE_MS
     image = info.get("image", {})
     image = image if isinstance(image, dict) else {}
     size = (image.get("width"), image.get("height"))
@@ -1145,7 +1165,8 @@ def validate_episode(path, min_segment_frames=DEFAULT_MIN_SEGMENT_FRAMES):
                         measured = timing.get("clock_measured_monotonic_ns")
                         uncertainty = timing.get("clock_uncertainty_ns")
                         clock_ok &= (timing.get("clock_valid") is True and type(measured) is int
-                                     and 0 <= sample["monotonic_ns"] - measured <= 10_000_000_000
+                                     and 0 <= sample["monotonic_ns"] - measured
+                                     <= capture_clock_max_age_ms * 1_000_000
                                      and type(uncertainty) is int and 0 <= uncertainty <= 5_000_000)
                     eye_skew = (source_data.get("image", {}).get("timing") or {}).get("stereo_skew_ns")
                     stereo_ok = (type(eye_skew) is int and isinstance(alignment, dict)

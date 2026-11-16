@@ -536,8 +536,79 @@ class TrainingExportTests(unittest.TestCase):
                                                "usable_with_imu": False}
         row["sample"]["imu"] = {"quaternion": [0]*4}
         self.assertEqual(training_frame_rejections(row, manifest["info"]), [])
-        row["sample"]["sensor_alignment"]["clock_valid"] = False
+        row["sample"]["sensor_alignment"]["stereo_aligned"] = False
         self.assertIn("sensor_unaligned", training_frame_rejections(row, manifest["info"]))
+
+    def set_clock_age(self, row, age_ns):
+        sample = row["sample"]
+        for name in ("image", "left_wrist_image", "right_wrist_image"):
+            sample["sources"][name]["timing"]["clock_measured_monotonic_ns"] = sample["monotonic_ns"] - age_ns
+
+    def test_camera_clock_age_is_rechecked_with_the_training_limit(self):
+        _, manifest, rows = self.episode(count=1)
+        row = rows[0]
+        # Recorded before 2026-11-16: capture marked a 10.05 s old clock invalid.
+        self.set_clock_age(row, 10_050_000_000)
+        row["sample"]["sensor_alignment"].update(clock_valid=False, usable=False, usable_with_imu=False)
+        self.assertEqual(training_frame_rejections(row, manifest["info"]), [])
+        self.set_clock_age(row, 15_000_000_000)
+        self.assertEqual(training_frame_rejections(row, manifest["info"]), [])
+        self.set_clock_age(row, 15_000_000_001)
+        self.assertIn("camera_clock_invalid", training_frame_rejections(row, manifest["info"]))
+        self.set_clock_age(row, 1_000_000)
+        row["sample"]["sources"]["left_wrist_image"]["timing"]["clock_valid"] = False
+        self.assertIn("camera_clock_invalid", training_frame_rejections(row, manifest["info"]))
+
+    def test_capture_clock_flag_is_validated_with_the_limit_it_was_recorded_with(self):
+        directory, manifest, rows = self.episode(count=4)
+        self.set_clock_age(rows[1], 12_000_000_000)
+        rows[1]["sample"]["sensor_alignment"].update(clock_valid=False, usable=False, usable_with_imu=False)
+        self.write(directory, manifest, rows)
+        report = validate_episode(directory, min_segment_frames=2)
+        self.assertTrue(report["valid"], report["errors"])
+        self.assertEqual(report["training_no_imu"]["excluded_counts"].get("camera_clock_invalid", 0), 0)
+        self.assertEqual(report["training_no_imu"]["eligible_frames"], 4)
+
+        manifest["info"]["sensor_sync"] = {"schema": "r1_sensor_sync_v1", "clock_max_age_ms": 15000.0}
+        self.write(directory, manifest, rows)
+        report = validate_episode(directory, min_segment_frames=2)
+        self.assertFalse(report["valid"])
+        self.assertTrue(any(e.endswith("sample.sensor_alignment.clock_valid: quality flag mismatch")
+                            for e in report["errors"]), report["errors"])
+        rows[1]["sample"]["sensor_alignment"].update(clock_valid=True, usable=True, usable_with_imu=True)
+        self.write(directory, manifest, rows)
+        report = validate_episode(directory, min_segment_frames=2)
+        self.assertTrue(report["valid"], report["errors"])
+
+        manifest["info"]["sensor_sync"]["clock_max_age_ms"] = -1
+        self.write(directory, manifest, rows)
+        report = validate_episode(directory, min_segment_frames=2)
+        self.assertIn("info.sensor_sync.clock_max_age_ms: expected a positive number of milliseconds up to 60000",
+                      report["errors"])
+
+    def test_capture_accepts_a_camera_clock_up_to_fifteen_seconds_old(self):
+        now = 30_000_000_000
+
+        def capture_clock_valid(age_ns, sequence):
+            arm, hand, loop, xr, head = build(now, image_shape=(12, 32))
+            timing = {"clock_valid": True, "clock_id": "pc2", "mapped_monotonic_ns": now,
+                      "source_monotonic_ns": now - 1_000_000_000, "clock_offset_ns": 1_000_000_000,
+                      "clock_measured_monotonic_ns": now - age_ns, "clock_uncertainty_ns": 1000,
+                      "stereo_skew_ns": 0}
+            head.timing = timing
+            head.sequence = sequence
+            wrist = SimpleNamespace(bgr=np.zeros((12, 16, 3), np.uint8), sequence=sequence,
+                                    received_monotonic_ns=now, timing=timing)
+            capture = R1Capture(arm, hand, loop, .5, (12, 32),
+                                wrist_image_shapes={"left": (12, 16), "right": (12, 16)})
+            with patch('teleop.utils.r1_capture.time.monotonic_ns', return_value=now), \
+                    patch('teleop.utils.r1_capture.time.time_ns', return_value=now + 1_000_000_000_000):
+                frame = capture.frame(xr, head, "following", {"left": wrist, "right": wrist})
+            return frame["sample"]["sensor_alignment"]["clock_valid"]
+
+        self.assertTrue(capture_clock_valid(10_050_000_000, 1))
+        self.assertTrue(capture_clock_valid(15_000_000_000, 2))
+        self.assertFalse(capture_clock_valid(15_000_000_001, 3))
 
     def test_time_gaps_split_and_stale_tracking_rejected(self):
         directory, manifest, rows = self.episode(count=8)
