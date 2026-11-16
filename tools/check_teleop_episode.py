@@ -92,6 +92,12 @@ TRAINING_CAMERAS = {"color_0": "head_left", "color_1": "head_right",
 # the unlocked hands' input age had a P95 of 106-125 ms over the headset Wi-Fi, and the
 # scattered rejections left only about 27% of each successful episode in segments of at
 # least 40 frames. 150 ms roughly doubled that; 200 ms added almost nothing more.
+# hand_input_age_ms was 150 until 2026-11-16. The age runs from the headset's hand pose
+# time, so it carries Vision Pro hand tracking and Wi-Fi latency (~60-70 ms) plus the
+# hand loop, which ran at ~33 Hz instead of 90: the unlocked hand's age had p50 107 ms
+# and p90 142 ms, and most stale frames had fresh packets and tracking. On the 14
+# successful episodes of that day 200 ms took exportable frames from 56.5% to 84.5%;
+# 250 ms added 0.3 points. The XR/hand tracking source limit stays 150 ms.
 # The XR and hand tracking sources describe the same headset samples, so their age
 # limit moved with it; at 100 ms they still rejected the frames the change targets.
 # request_skew_ms was 25 until 2026-11-11. A frame pairs the 90 Hz hand request with the
@@ -106,7 +112,7 @@ TRAINING_CAMERAS = {"color_0": "head_left", "color_1": "head_right",
 # The client's own 10 s limit is unchanged; the 5 ms uncertainty bound still applies.
 TRAINING_TIME_LIMITS = {"observation_skew_ms": 25.0, "observation_age_ms": 150.0,
                         "request_age_ms": 100.0, "request_skew_ms": 35.0,
-                        "hand_input_age_ms": 150.0, "tracking_age_ms": 150.0,
+                        "hand_input_age_ms": 200.0, "tracking_age_ms": 150.0,
                         "camera_clock_age_ms": 15000.0}
 # Episodes recorded before 2026-11-16 carry no sensor_sync.clock_max_age_ms; their
 # capture-time sensor_alignment.clock_valid flag used a 10 s clock age limit.
