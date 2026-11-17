@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run a trained ACT policy against the live R1_A7 + O6.
+"""Run a trained ACT policy against the live R1_A7 + left O6 + right Dex1.
 
 Default is shadow mode: it reads feedback and cameras and logs what the policy would
 command, and never activates or publishes anything. Only --execute can move the robot,
@@ -9,7 +9,9 @@ and only after r is pressed. q / Ctrl+C stop the program; they are not an e-stop
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import sys
@@ -24,14 +26,17 @@ for path in (ROOT, ROOT / "tools"):
         sys.path.insert(0, str(path))
 
 from replay_r1_episode_on_robot import (NETWORK_INTERFACE, current_pose, hold_until_quit, send_pose, shutdown,
-                                        start_keyboard, stop_keyboard, teleop_pids)
+                                        stop_keyboard, teleop_pids)
 from teleop.utils.act_runtime import (ACTION_DIM, ActionEnsemble, GravityModel, ObservationBuilder, PolicyClient,
                                       PolicyGuard, group_errors, join_action, split_action, summarize)
 from teleop.utils.frame_sync import CameraSynchronizer
+from teleop.utils.act_contract import validate_contract
+from teleop.utils.icecream_task import IcecreamTask, PHASES
 from teleop.utils.r1_episode_replay import ReplayPose
 
-DEFAULT_WORKER_PYTHON = ROOT.parent / ".venv-train/bin/python"
-DEFAULT_LOG_ROOT = ROOT.parent / "policy-runs"
+DEV_ROOT = Path(os.environ.get("R1_DEV_ROOT", ROOT.parent))
+DEFAULT_WORKER_PYTHON = DEV_ROOT / ".venv-train/bin/python"
+DEFAULT_LOG_ROOT = DEV_ROOT / "policy-runs"
 
 
 def parse_args(argv=None):
@@ -39,7 +44,7 @@ def parse_args(argv=None):
     parser.add_argument("checkpoint", type=Path)
     parser.add_argument("--execute", action="store_true", help="Actually command the robot after r. Default: shadow")
     parser.add_argument("--shadow-seconds", type=float, help="Stop shadow mode after this long. Default: until q")
-    parser.add_argument("--max-seconds", type=float, default=60.0, help="Hold after this long of execution")
+    parser.add_argument("--max-seconds", type=float, default=60.0, help="Whole-run wall-clock limit, including phase changes and pauses")
     parser.add_argument("--blend-seconds", type=float, default=2.0, help="Blend from the live pose to the policy over this long")
     parser.add_argument("--max-start-delta", type=float, default=0.35, help="Refuse to start if the first arm target is further than this (rad)")
     parser.add_argument("--allow-out-of-range-start", action="store_true", help="Start even if the live pose is outside the training range")
@@ -56,7 +61,18 @@ def parse_args(argv=None):
     parser.add_argument("--worker-python", type=Path, default=DEFAULT_WORKER_PYTHON)
     parser.add_argument("--device", default="auto", help="Inference device: auto, cuda or cpu")
     parser.add_argument("--log-dir", type=Path, help=f"Default: a new directory under {DEFAULT_LOG_ROOT}")
-    return parser.parse_args(argv)
+    parser.add_argument("--auto-stage", action="store_true", help="Use learned completion plus joint feedback; reviewed phase model required")
+    parser.add_argument("--dispense-min-phase-seconds", type=float, default=3.0,
+                        help="Minimum dispensing-phase duration; not a measured flow timer")
+    args = parser.parse_args(argv)
+    for key in ("max_seconds", "max_chunk_age", "max_tracking_error"):
+        if not math.isfinite(getattr(args,key)) or getattr(args,key) <= 0:
+            parser.error(f"{key} must be finite and positive")
+    for key in ("blend_seconds", "max_start_delta", "ensemble_k", "dispense_min_phase_seconds",
+                "arm_target_velocity_limit", "arm_target_accel_limit", "arm_velocity_limit", "arm_dq_limit"):
+        if not math.isfinite(getattr(args,key)) or getattr(args,key) < 0:
+            parser.error(f"{key} must be finite and nonnegative")
+    return args
 
 
 class PolicyRun:
@@ -66,6 +82,14 @@ class PolicyRun:
         self.arm, self.hand, self.cameras, self.client = arm, hand, cameras, client
         self.builder, self.ensemble, self.guard = builder, ensemble, guard
         self.tick = 0
+        self.clock_origin = time.monotonic()
+        self.fps = 40.0
+        self.task = None
+        self.completion = None
+        self.paused = False
+        self.finished = False
+        self.execution_deadline = None
+        self.advance_requested = False
         self.ignore_before_tick = 0
         self.last_chunk_at = None
         self.observation_failures = {}
@@ -80,17 +104,19 @@ class PolicyRun:
 
     def step(self):
         """Advance one tick. Returns (policy target or None, live pose)."""
+        self.tick = max(self.tick, int((time.monotonic() - self.clock_origin) * self.fps))
         head, wrists = self.cameras()
         self.builder.observe(head, wrists)
         response = self.client.poll()
         now = time.monotonic()
         if response is not None:
-            (tick, sent_at), inference_ms, chunk = response
+            (tick, sent_at), inference_ms, chunk, completion = response
             if tick >= self.ignore_before_tick:
                 # Age counts from the request: a late result still comes from the old observation.
                 if now - sent_at <= self.guard.max_chunk_age_s:
                     self.ensemble.add(tick, chunk)
-                    self.last_chunk_at = now
+                    self.last_chunk_at = sent_at
+                    self.completion = completion
                 else:
                     self.stale_chunks += 1
             self.inference_ms.append(inference_ms)
@@ -98,7 +124,8 @@ class PolicyRun:
         if self.client.idle:
             qpos, images, reason = self.builder.build(time.monotonic_ns())
             if reason is None:
-                self.client.send(self.tick, time.monotonic(), qpos, images)
+                self.client.send(self.tick, time.monotonic(), qpos, images,
+                                 None if self.task is None else self.task.context(time.monotonic()))
                 self.sent += 1
             else:
                 self.observation_failures[reason] = self.observation_failures.get(reason, 0) + 1
@@ -111,28 +138,46 @@ class PolicyRun:
         self.tick += 1
         return target, pose
 
+    def reset_predictions(self):
+        self.ensemble.reset()
+        self.ignore_before_tick = self.tick
+        self.last_chunk_at = self.completion = None
+
     def write(self, **entry):
+        if self.task is not None:
+            entry.update(phase=PHASES[self.task.phase], phase_complete=self.completion,
+                         task_done=self.task.done)
         self.log.write(json.dumps(entry, separators=(",", ":")) + "\n")
+        self.log.flush()
 
     def summary(self):
         return {"ticks": self.tick, "requests": self.sent, "observation_failures": self.observation_failures,
                 "stale_chunks": self.stale_chunks,
                 "inference_ms": summarize(self.inference_ms), "round_trip_ms": summarize(self.round_trip_ms),
                 "target_minus_live_max": {name: summarize(values) for name, values in self.target_error.items()},
-                "clamped_ticks": self.guard.clamped_ticks}
+                "clamped_ticks": self.guard.clamped_ticks,
+                "task_events": [] if self.task is None else self.task.events,
+                "task_done": False if self.task is None else self.task.done}
 
 
 def pace(start, period):
     time.sleep(max(0.0, period - (time.monotonic() - start)))
 
 
-def run_shadow(run, period, stop, seconds=None, until=lambda: False):
+def run_shadow(run, period, stop, seconds=None, until=lambda: False, phase_preview=False):
     """Reads and logs only. Nothing here can reach a publisher."""
     began = time.monotonic()
     report_at = began + 1.0
     while not stop[0] and not until() and (seconds is None or time.monotonic() - began < seconds):
         started = time.monotonic()
         target, pose = run.step()
+        if phase_preview and run.task is not None:
+            if run.task.started is None:
+                run.task.start(started, run.live_action(pose))
+            if run.advance_requested:
+                run.advance_requested = False
+                run.task.advance(started, run.live_action(pose), "shadow_operator_preview")
+                run.reset_predictions()
         if run.client.failed:
             raise RuntimeError(f"inference worker failed: {run.client.failed}")
         if target is not None:
@@ -156,39 +201,53 @@ def blended(start, target, alpha):
     return start + min(max(alpha, 0.0), 1.0) * (target - start)
 
 
-def execute_loop(run, arm, hand, guard, gravity, period, stop, args):
+def execute_loop(run, arm, hand, guard, gravity, period, stop, args, initial_hold=None, blend=True):
     """Commands the robot until q, the time limit, or a guard trip. Returns the pose to hold."""
     live = current_pose(arm, hand)
-    send_pose(arm, hand, live)
-    start_action = run.live_action(live)
+    hold = live if initial_hold is None else initial_hold
+    send_pose(arm, hand, hold)
+    start_action = run.live_action(hold)
+    if run.execution_deadline is None:
+        run.execution_deadline = time.monotonic() + args.max_seconds
     # Activation blocks for a while, so anything already in flight saw an older pose.
     run.ensemble.reset()
     run.ignore_before_tick = run.tick
     run.last_chunk_at = None
+    if run.task is not None and run.task.started is None:
+        run.task.start(time.monotonic(), start_action)
     deadline = time.monotonic() + 2.0
     first = None
     while first is None:
         started = time.monotonic()
-        if stop[0]:
-            return live
+        if stop[0] or run.paused:
+            return hold
+        if started >= run.execution_deadline:
+            run.finished = True
+            return hold
         first, _ = run.step()
         if run.client.failed or (first is None and started > deadline):
+            guard.tripped = "no policy output after activation"
             print("[POLICY] no policy output after activation; holding.", flush=True)
-            return live
-        send_pose(arm, hand, live)
+            return hold
+        send_pose(arm, hand, hold)
         arm.hold_targets()
         pace(started, period)
+    if run.task is not None:
+        first = run.task.apply(first)
     delta = float(np.abs(split_action(first)["arm_q"] - live.arm_q).max())
     if delta > args.max_start_delta:
+        guard.tripped = "first arm target too far from current pose"
         print(f"[POLICY] first arm target is {delta:.3f} rad from the live pose (limit {args.max_start_delta:.3f}); holding.", flush=True)
-        return live
+        return hold
     print(f"[POLICY] commanding. Blend {args.blend_seconds:.1f}s, limit {args.max_seconds:.0f}s. "
           "q exits and is not an e-stop; the hardware e-stop is the robot button.", flush=True)
     began = time.monotonic()
-    hold = live
-    while not stop[0] and time.monotonic() - began < args.max_seconds:
+    while not stop[0] and time.monotonic() < run.execution_deadline:
         started = time.monotonic()
         target, pose = run.step()
+        if run.paused:
+            run.write(t=started, mode="paused", live=run.live_action(pose).tolist())
+            return hold
         snapshot = arm.get_recording_snapshot()
         tracking = float(np.abs(np.asarray(snapshot["requested"]["arm_q"]) - np.asarray(snapshot["state"]["q"])).max())
         # Not started: a stall inside step() must stop this tick, not the next one.
@@ -198,31 +257,49 @@ def execute_loop(run, arm, hand, guard, gravity, period, stop, args):
         if reason is not None:
             print(f"[POLICY] holding: {reason}", flush=True)
             return hold
-        command = blended(start_action, guard.clamp(target), (started - began) / args.blend_seconds)
+        if run.task is not None:
+            changed = run.advance_requested
+            run.advance_requested = False
+            if changed:
+                run.task.advance(started, run.live_action(hold))
+            else:
+                changed = run.task.observe(started, run.live_action(pose), run.completion)
+            if run.task.done:
+                run.write(t=started, mode="completed", live=run.live_action(pose).tolist())
+                return hold
+            if changed:
+                if run.task.phase == 2:
+                    run.task.hold_pose = run.live_action(hold).copy()
+                run.reset_predictions()
+                return hold
+            target = run.task.apply(target)
+        alpha = (started - began) / args.blend_seconds if blend and args.blend_seconds > 0 else 1.0
+        command = blended(start_action, guard.clamp(target), alpha)
         hold = pose_from_action(command, gravity)
         send_pose(arm, hand, hold)
         run.write(t=started, tick=run.tick, mode="execute", target=target.tolist(), command=command.tolist(),
                   live=run.live_action(pose).tolist(), tracking=tracking)
         pace(started, period)
+    run.finished = True
     print("[POLICY] time limit reached." if not stop[0] else "[POLICY] stop requested.", flush=True)
     return hold
 
 
 def check_policy_metadata(meta):
-    dataset = meta["dataset"]
+    validate_contract(meta["dataset"])
     if meta["action_dim"] != ACTION_DIM or meta["state_dim"] != ACTION_DIM:
-        raise RuntimeError("Policy is not the 29-dimension R1_A7 + O6 layout")
-    if dataset["camera_names"] != ["head_left", "head_right", "left_wrist", "right_wrist"]:
-        raise RuntimeError(f"Unexpected policy cameras: {dataset['camera_names']}")
+        raise RuntimeError("Policy is not the 24-dimension R1_A7 + left O6 + right Dex1 layout")
 
 
 def check_policy_cameras(dataset, camera_config):
-    """A policy is only valid on the head images it trained on."""
-    height, width = camera_config["head_camera"]["image_shape"]
-    trained = dataset.get("source_image_sizes", {}).get("color_0")
-    if trained != [width // 2, height]:
-        raise RuntimeError(f"Policy trained on head eye size {trained}, but the stream is "
-                           f"{[width // 2, height]}. Export and train again from recordings of this stream.")
+    sizes = dataset.get("source_image_sizes", {})
+    for key, camera in (("color_0", "head_camera"), ("color_1", "head_camera"),
+                        ("color_2", "left_wrist_camera"), ("color_3", "right_wrist_camera")):
+        shape = (camera_config.get(camera) or {}).get("image_shape")
+        actual = None if not shape else [shape[1] // (2 if camera == "head_camera" else 1), shape[0]]
+        if actual is None or sizes.get(key) != actual:
+            raise RuntimeError(f"Policy trained on {key} size {sizes.get(key)}, but {camera} is {actual}. "
+                               "Export and train again from recordings of this stream.")
 
 
 def main(argv=None):
@@ -245,7 +322,15 @@ def main(argv=None):
     run = None
     try:
         meta = client.meta
+        (log_dir / "run.json").write_text(json.dumps({
+            "checkpoint": str(args.checkpoint.resolve()),
+            "checkpoint_sha256": hashlib.sha256(args.checkpoint.read_bytes()).hexdigest(),
+            "dataset": meta["dataset"], "mode": "execute" if args.execute else "shadow",
+            "started_at": time.time(), "args": {k: str(v) if isinstance(v, Path) else v for k,v in vars(args).items()},
+        }, indent=2, ensure_ascii=False) + "\n")
         check_policy_metadata(meta)
+        if args.auto_stage and not meta.get("context_dim"):
+            raise ValueError("--auto-stage requires a phase-conditioned model")
         fps = float(meta["dataset"]["fps"])
         period = 1.0 / fps
         print(f"[POLICY] mode={'EXECUTE' if args.execute else 'shadow'} device={meta['device']} step={meta['step']} "
@@ -262,34 +347,57 @@ def main(argv=None):
                                   dq_feedforward=True, dq_feedforward_limit=args.arm_dq_limit, dq_feedforward_filter=0.5,
                                   target_velocity_limit=args.arm_target_velocity_limit,
                                   target_accel_limit=args.arm_target_accel_limit)
-        hand = LinkerO6Controller()
+        from teleop.robot_control.robot_hand_dex1_r1 import Dex1LowCmdGripper, O6Dex1Hands
+        gripper_low, gripper_high = validate_contract(meta["dataset"])
+        hardware = meta["dataset"]["controller_config"]
+        hand = O6Dex1Hands(LinkerO6Controller(sides=("left",)), Dex1LowCmdGripper(
+            arm, slot=hardware["dex1_slot"], kp=hardware["dex1_kp"], kd=hardware["dex1_kd"],
+            grip_delta=hardware["dex1_grip_delta"], closed_q=gripper_low, open_q=gripper_high))
         hand.wait_until_ready(timeout=3.0)
         img_client = TeleImagerCameraClient(server_host=args.img_server_ip, request_bgr=True)
         check_policy_cameras(meta["dataset"], img_client.get_cam_config())
 
         def cameras():
-            return img_client.get_head_frame(), {"left": correct_palm_frame(img_client.get_left_wrist_frame()),
-                                                 "right": correct_palm_frame(img_client.get_right_wrist_frame())}
+            return img_client.get_head_frame(), {"left": correct_palm_frame(img_client.get_left_wrist_frame(), "linker_o6"),
+                                                 "right": correct_palm_frame(img_client.get_right_wrist_frame(), "dex1_1")}
 
         sync = CameraSynchronizer(["head", "left_wrist", "right_wrist"], anchor="head")
         guard = PolicyGuard(meta["normalization"], max_tracking_error=args.max_tracking_error,
-                            max_chunk_age_s=args.max_chunk_age)
+                            max_chunk_age_s=args.max_chunk_age, gripper_limits=(gripper_low, gripper_high))
         run = PolicyRun(arm, hand, cameras, client, ObservationBuilder(arm, hand, sync, image_hw=tuple(meta["dataset"]["image_size_hw"])),
                         ActionEnsemble(client.chunk_size, args.ensemble_k), guard, log_dir / "ticks.jsonl")
+        run.fps = fps
+        if meta.get("context_dim"):
+            run.task = IcecreamTask((gripper_low, gripper_high), args.auto_stage, args.dispense_min_phase_seconds)
         stop = [False]
         started = threading.Event()
         if sys.stdin.isatty():
-            listener, tty_snapshot = start_keyboard(stop, started)
+            from replay_r1_episode_on_robot import snapshot_tty
+            from sshkeyboard import listen_keyboard
+            tty_snapshot = snapshot_tty()
+            def policy_key(key):
+                if key == "q":
+                    stop[0] = True
+                elif key == "p":
+                    run.paused = True
+                elif key == "r":
+                    run.paused = False
+                    started.set()
+                elif key == "n":
+                    run.advance_requested = True
+            listener = threading.Thread(target=listen_keyboard,
+                                        kwargs={"on_press": policy_key, "until": None, "sequential": True}, daemon=True)
+            listener.start()
 
         if not args.execute:
             print("[POLICY] shadow mode: nothing is activated or published. q exits.", flush=True)
-            run_shadow(run, period, stop, args.shadow_seconds)
+            run_shadow(run, period, stop, args.shadow_seconds, phase_preview=True)
             return 0
 
         if listener is None:
             print("[POLICY] --execute needs a terminal for r and q.", file=sys.stderr)
             return 2
-        print("[POLICY] previewing in shadow mode. Press r to start commanding, q to exit. "
+        print("[POLICY] previewing in shadow mode. r starts/resumes, p pauses, n confirms the next phase, q exits. "
               "Hardware e-stop is the robot button.", flush=True)
         run_shadow(run, period, stop, until=started.is_set)
         if stop[0]:
@@ -315,8 +423,34 @@ def main(argv=None):
         pose = current_pose(arm, hand)
         arm.reset_target_shaper(pose.arm_q)
         arm.start_publishing()
-        last = execute_loop(run, arm, hand, guard, GravityModel(), period, stop, args)
-        hold_until_quit(arm, hand, last, stop)
+        gravity = GravityModel()
+        last, blend_next = None, True
+        while not stop[0]:
+            started.clear()
+            last = execute_loop(run, arm, hand, guard, gravity, period, stop, args, last, blend_next)
+            blend_next = False
+            if run.finished or guard.tripped or (run.task is not None and run.task.done):
+                hold_until_quit(arm, hand, last, stop)
+                break
+            if run.paused:
+                print("[POLICY] paused; r resumes, q exits. Corrections must be recorded by teleop after this writer exits.", flush=True)
+                pause_started = time.monotonic()
+                while run.paused and not stop[0]:
+                    send_pose(arm, hand, last)
+                    if time.monotonic() >= run.execution_deadline:
+                        run.finished = True
+                        break
+                    time.sleep(period)
+                if run.task is not None:
+                    run.task.started += time.monotonic() - pause_started
+                run.reset_predictions()
+                blend_next = True
+                if run.finished:
+                    hold_until_quit(arm, hand, last, stop)
+                    break
+            elif run.task is None:
+                hold_until_quit(arm, hand, last, stop)
+                break
         return 0
     finally:
         if run is not None:

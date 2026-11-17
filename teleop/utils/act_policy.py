@@ -1,4 +1,4 @@
-"""ACT (Zhao et al. 2023) for the R1_A7 + O6 dataset: four cameras and joints in, joint chunks out.
+"""ACT (Zhao et al. 2023) for the R1_A7 + left O6 + right Dex1 dataset: four cameras and joints in, joint chunks out.
 
 Training and inference only; nothing here talks to DDS, cameras or the robot.
 Needs torchvision, so it runs in .venv-train, not in the teleop environment.
@@ -18,7 +18,7 @@ from torchvision.ops.misc import FrozenBatchNorm2d
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
-CHECKPOINT_SCHEMA = "r1_act_checkpoint_v1"
+CHECKPOINT_SCHEMA = "r1_act_checkpoint_v2"
 
 
 def sine_position(height, width, dim, device):
@@ -37,13 +37,13 @@ def sine_position(height, width, dim, device):
 class ACTPolicy(nn.Module):
     def __init__(self, state_dim, action_dim, num_cameras, chunk_size=40, hidden_dim=512, nheads=8,
                  dim_feedforward=3200, encoder_layers=4, decoder_layers=1, vae_encoder_layers=4,
-                 latent_dim=32, dropout=0.1, pretrained=True):
+                 latent_dim=32, dropout=0.1, pretrained=True, context_dim=0):
         super().__init__()
         self.config = dict(state_dim=state_dim, action_dim=action_dim, num_cameras=num_cameras,
                            chunk_size=chunk_size, hidden_dim=hidden_dim, nheads=nheads,
                            dim_feedforward=dim_feedforward, encoder_layers=encoder_layers,
                            decoder_layers=decoder_layers, vae_encoder_layers=vae_encoder_layers,
-                           latent_dim=latent_dim, dropout=dropout)
+                           latent_dim=latent_dim, dropout=dropout, context_dim=context_dim)
         self.latent_dim = latent_dim
         self.chunk_size = chunk_size
         backbone = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1 if pretrained else None,
@@ -68,6 +68,9 @@ class ACTPolicy(nn.Module):
 
         self.latent_proj = nn.Linear(latent_dim, hidden_dim)
         self.state_proj = nn.Linear(state_dim, hidden_dim)
+        self.context_proj = nn.Linear(context_dim, hidden_dim) if context_dim else None
+        self.completion_head = nn.Sequential(nn.LayerNorm(hidden_dim), nn.Linear(hidden_dim, hidden_dim),
+                                             nn.GELU(), nn.Linear(hidden_dim, 1)) if context_dim else None
         self.token_position = nn.Parameter(torch.zeros(1, 2, hidden_dim))
         self.encoder = encoder(encoder_layers)
         self.queries = nn.Parameter(torch.zeros(1, chunk_size, hidden_dim))
@@ -94,8 +97,8 @@ class ACTPolicy(nn.Module):
         mu, logvar = self.vae_output(self.vae_encoder(tokens, src_key_padding_mask=padding)[:, 0]).chunk(2, dim=-1)
         return mu, logvar
 
-    def forward(self, images, qpos, actions=None, is_pad=None):
-        """With actions: training pass, (pred, mu, logvar). Without: the deployed z=0 pass."""
+    def forward(self, images, qpos, actions=None, is_pad=None, context=None):
+        """Return actions, style statistics and optional completion from current observations."""
         if actions is None:
             mu = logvar = None
             latent = torch.zeros(qpos.shape[0], self.latent_dim, device=qpos.device, dtype=qpos.dtype)
@@ -103,9 +106,17 @@ class ACTPolicy(nn.Module):
             mu, logvar = self.encode_style(qpos, actions, is_pad)
             latent = mu + torch.randn_like(mu) * (0.5 * logvar).exp()
         tokens = torch.stack((self.latent_proj(latent), self.state_proj(qpos)), dim=1) + self.token_position
-        memory = self.encoder(torch.cat((tokens, self.encode_images(images)), dim=1))
+        if self.context_proj is not None:
+            if context is None or context.shape[-1] != self.config["context_dim"]:
+                raise ValueError("Phase-conditioned policy requires its task context")
+            tokens = tokens + self.context_proj(context)[:, None]
+        image_tokens = self.encode_images(images)
+        # Completion cannot see the VAE latent, which encodes future demonstration actions.
+        complete = None if self.completion_head is None else self.completion_head(
+            tokens[:, 1] + image_tokens.mean(dim=1)).squeeze(-1)
+        memory = self.encoder(torch.cat((tokens, image_tokens), dim=1))
         decoded = self.decoder(self.queries.expand(qpos.shape[0], -1, -1), memory)
-        return self.action_head(decoded), mu, logvar
+        return self.action_head(decoded), mu, logvar, complete
 
     def parameter_groups(self, lr, lr_backbone):
         backbone = [p for p in self.backbone.parameters() if p.requires_grad]
@@ -125,7 +136,7 @@ def act_loss(pred, target, is_pad, mu, logvar, kl_weight):
     return l1 + kl_weight * kl, l1, kl
 
 
-def augment_images(images, max_shift=4, jitter=0.2):
+def augment_images(images, max_shift=0, jitter=0.1):
     """Per-image small shifts and brightness/contrast. Each camera moves independently."""
     batch, cameras, channels, height, width = images.shape
     flat = images.view(-1, channels, height, width)
@@ -147,14 +158,14 @@ def augment_images(images, max_shift=4, jitter=0.2):
     return flat.clamp(0, 1).view(batch, cameras, channels, height, width)
 
 
-def save_checkpoint(path, model, normalization, dataset_info, step, optimizer=None, metrics=None):
+def save_checkpoint(path, model, normalization, dataset_info, step, optimizer=None, metrics=None, training_state=None):
     path = Path(path)
     temporary = path.with_name(f".{path.name}.tmp")
     torch.save({"schema": CHECKPOINT_SCHEMA, "config": model.config,
                 "model": {key: value.cpu() for key, value in model.state_dict().items()},
                 "normalization": normalization, "dataset": dataset_info, "step": int(step),
                 "optimizer": None if optimizer is None else optimizer.state_dict(),
-                "metrics": metrics or {}}, temporary)
+                "metrics": metrics or {}, "training_state": training_state}, temporary)
     os.replace(temporary, path)
 
 
@@ -182,10 +193,13 @@ class ChunkPredictor:
                       for key in ("qpos_mean", "qpos_std", "action_mean", "action_std")}
 
     @torch.inference_mode()
-    def __call__(self, images, qpos):
+    def __call__(self, images, qpos, context=None):
         images = torch.from_numpy(images).to(self.device).permute(0, 3, 1, 2)[None].float() / 255
         qpos = torch.from_numpy(qpos).to(self.device)[None]
         qpos = (qpos - self.stats["qpos_mean"]) / self.stats["qpos_std"]
         with torch.autocast(self.device.split(":")[0], dtype=torch.bfloat16, enabled=self.device.startswith("cuda")):
-            chunk = self.model(images, qpos)[0][0]
-        return (chunk.float() * self.stats["action_std"] + self.stats["action_mean"]).cpu().numpy()
+            task = None if context is None else torch.from_numpy(context).to(self.device)[None]
+            output = self.model(images, qpos, context=task)
+            chunk = output[0][0]
+            complete = None if output[3] is None else float(output[3].sigmoid()[0])
+        return (chunk.float() * self.stats["action_std"] + self.stats["action_mean"]).cpu().numpy(), complete

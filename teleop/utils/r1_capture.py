@@ -10,6 +10,7 @@ import numpy as np
 from teleop.utils.camera_calibration import (COLOR_KEYS, WRIST_COLOR_KEYS, camera_calibration_metadata,
                                              expected_cameras)
 from teleop.utils.frame_sync import CameraSynchronizer, feedback_target_ns
+from teleop.utils.camera_color import IMAGE_COLOR_PROFILE
 
 
 #: An action older than this is rejected for training anyway (request_age_ms), so
@@ -72,6 +73,7 @@ def capture_metadata(args, camera_config, retargeter, calibration=None, recordin
             versions[package] = None
     code_paths = [root / "teleop/teleop_hand_and_arm.py", Path(__file__),
                   root / "teleop/utils/camera_calibration.py",
+                  root / "teleop/utils/camera_color.py",
                   root / "teleop/utils/recording_tf.py",
                   root / "teleop/utils/episode_writer.py",
                   root / "teleop/teleimager/src/teleimager/client.py"]
@@ -94,6 +96,7 @@ def capture_metadata(args, camera_config, retargeter, calibration=None, recordin
         "end_effector": ("linker_o6" if set(end_effectors.values()) == {"linker_o6"}
                          else f"{end_effectors['left']}_left+{end_effectors['right']}_right"),
         "end_effectors": end_effectors,
+        "image_color_profile": IMAGE_COLOR_PROFILE,
         "gripper_position_limits": {
             side: {"min_q_rad": hand.closed_q, "max_q_rad": hand.open_q}
             for side, hand in hands.items() if end_effectors[side] == "dex1_1"

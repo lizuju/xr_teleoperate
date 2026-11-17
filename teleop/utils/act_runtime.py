@@ -18,22 +18,26 @@ import cv2
 import numpy as np
 
 from teleop.utils.frame_sync import feedback_target_ns
+from teleop.utils.act_contract import ACTION_DIM, GROUP_SLICES
 
 
 IMAGE_HW = (544, 640)
-GROUP_SLICES = {"left_arm": slice(0, 7), "right_arm": slice(7, 14), "left_ee": slice(14, 20),
-                "right_ee": slice(20, 26), "body": slice(26, 29)}
-ACTION_DIM = 29
 # Same limits the exporter applied to every training row.
 OBSERVATION_SKEW_MS = 25.0
 OBSERVATION_AGE_MS = 150.0
 CLOCK_UNCERTAINTY_NS = 5_000_000
-CLOCK_MAX_AGE_NS = 10_000_000_000
+CLOCK_MAX_AGE_NS = 15_000_000_000
 
 
 def prepare_training_image(bgr, image_hw=IMAGE_HW):
     """The one image transform shared by the exporter and live inference."""
-    pixels = cv2.resize(bgr, image_hw[::-1], interpolation=cv2.INTER_AREA)
+    height, width = image_hw
+    scale = min(height / bgr.shape[0], width / bgr.shape[1])
+    resized = cv2.resize(bgr, (max(1, round(bgr.shape[1] * scale)), max(1, round(bgr.shape[0] * scale))),
+                         interpolation=cv2.INTER_AREA)
+    pixels = np.zeros((height, width, 3), dtype=np.uint8)
+    y, x = (height - resized.shape[0]) // 2, (width - resized.shape[1]) // 2
+    pixels[y:y + resized.shape[0], x:x + resized.shape[1]] = resized
     return cv2.cvtColor(pixels, cv2.COLOR_BGR2RGB)
 
 
@@ -41,8 +45,8 @@ def split_action(values):
     values = np.asarray(values, dtype=np.float64)
     if values.shape != (ACTION_DIM,):
         raise ValueError(f"expected {ACTION_DIM} action values, got {values.shape}")
-    return {"arm_q": values[:14], "left_q": values[14:20], "right_q": values[20:26],
-            "waist_q": float(values[26]), "head_q": values[27:29]}
+    return {"arm_q": values[:14], "left_q": values[14:20], "right_q": values[20:21],
+            "waist_q": float(values[21]), "head_q": values[22:24]}
 
 
 def join_action(arm_q, left_q, right_q, waist_q, head_q):
@@ -145,14 +149,16 @@ class PolicyGuard:
     """Decides, each tick, whether the policy may keep commanding. A trip latches until exit."""
 
     def __init__(self, normalization, range_margin=0.1, max_tracking_error=0.5, tracking_hold_s=0.5,
-                 max_chunk_age_s=0.5):
+                 max_chunk_age_s=0.5, gripper_limits=(0.0, 5.4)):
         low, high = (np.asarray(normalization[key], dtype=np.float64) for key in ("action_min", "action_max"))
         margin = (high - low) * range_margin + 0.02
         self.low, self.high = low - margin, high + margin
         self.low[GROUP_SLICES["left_ee"]] = np.maximum(self.low[GROUP_SLICES["left_ee"]], 0.0)
-        self.low[GROUP_SLICES["right_ee"]] = np.maximum(self.low[GROUP_SLICES["right_ee"]], 0.0)
+        self.low[GROUP_SLICES["right_ee"]] = np.maximum(self.low[GROUP_SLICES["right_ee"]], gripper_limits[0])
         self.high[GROUP_SLICES["left_ee"]] = np.minimum(self.high[GROUP_SLICES["left_ee"]], 1.0)
-        self.high[GROUP_SLICES["right_ee"]] = np.minimum(self.high[GROUP_SLICES["right_ee"]], 1.0)
+        self.high[GROUP_SLICES["right_ee"]] = np.minimum(self.high[GROUP_SLICES["right_ee"]], gripper_limits[1])
+        if np.any(self.low > self.high):
+            raise ValueError("Training action range does not intersect the configured gripper limits")
         qlow, qhigh = (np.asarray(normalization[key], dtype=np.float64) for key in ("qpos_min", "qpos_max"))
         qmargin = (qhigh - qlow) * range_margin + 0.05
         self.qpos_low, self.qpos_high = qlow - qmargin, qhigh + qmargin
@@ -208,31 +214,35 @@ class GravityModel:
         return np.array(self.pin.rnea(self.model, self.data, np.asarray(arm_q, dtype=np.float64), self.zero, self.zero))
 
 
-def request_size(state_dim, cameras, image_hw):
-    return state_dim * 4 + cameras * image_hw[0] * image_hw[1] * 3
+def request_size(state_dim, cameras, image_hw, context_dim=0):
+    return (state_dim + context_dim) * 4 + cameras * image_hw[0] * image_hw[1] * 3
 
 
 def response_size(chunk_size, action_dim):
-    return 8 + chunk_size * action_dim * 4
+    return 16 + chunk_size * action_dim * 4
 
 
-def encode_request(qpos, images):
-    return np.asarray(qpos, dtype=np.float32).tobytes() + np.asarray(images, dtype=np.uint8).tobytes()
+def encode_request(qpos, images, context=None):
+    task = b"" if context is None else np.asarray(context, dtype=np.float32).tobytes()
+    return np.asarray(qpos, dtype=np.float32).tobytes() + task + np.asarray(images, dtype=np.uint8).tobytes()
 
 
-def decode_request(payload, state_dim, cameras, image_hw):
+def decode_request(payload, state_dim, cameras, image_hw, context_dim=0):
     split = state_dim * 4
+    end = split + context_dim * 4
     return (np.frombuffer(payload[:split], dtype=np.float32).copy(),
-            np.frombuffer(payload[split:], dtype=np.uint8).reshape(cameras, *image_hw, 3).copy())
+            np.frombuffer(payload[end:], dtype=np.uint8).reshape(cameras, *image_hw, 3).copy(),
+            np.frombuffer(payload[split:end], dtype=np.float32).copy())
 
 
-def encode_response(inference_ms, chunk):
-    return struct.pack("<d", inference_ms) + np.asarray(chunk, dtype=np.float32).tobytes()
+def encode_response(inference_ms, chunk, completion=None):
+    return struct.pack("<dd", inference_ms, -1.0 if completion is None else completion) + np.asarray(chunk, dtype=np.float32).tobytes()
 
 
 def decode_response(payload, chunk_size, action_dim):
-    return (struct.unpack("<d", payload[:8])[0],
-            np.frombuffer(payload[8:], dtype=np.float32).reshape(chunk_size, action_dim).astype(np.float64))
+    ms, complete = struct.unpack("<dd", payload[:16])
+    return (ms, np.frombuffer(payload[16:], dtype=np.float32).reshape(chunk_size, action_dim).astype(np.float64),
+            None if complete < 0 else complete)
 
 
 def read_exact(stream, size):
@@ -254,6 +264,9 @@ class PolicyClient:
         line = self.process.stdout.readline() if readable else b""
         if not line:
             self.process.kill()
+            self.process.wait()
+            self.process.stdin.close()
+            self.process.stdout.close()
             raise RuntimeError("inference worker did not start")
         self.meta = json.loads(line)
         self.chunk_size = self.meta["chunk_size"]
@@ -263,8 +276,10 @@ class PolicyClient:
         self._responses = deque()
         self._pending = None
         self.failed = None
-        threading.Thread(target=self._writer, name="act-worker-writer", daemon=True).start()
-        threading.Thread(target=self._reader, name="act-worker-reader", daemon=True).start()
+        self._writer_thread = threading.Thread(target=self._writer, name="act-worker-writer", daemon=True)
+        self._reader_thread = threading.Thread(target=self._reader, name="act-worker-reader", daemon=True)
+        self._writer_thread.start()
+        self._reader_thread.start()
 
     def _writer(self):
         try:
@@ -288,9 +303,9 @@ class PolicyClient:
             if payload is None:
                 self.failed = self.failed or f"worker exited with status {self.process.poll()}"
                 return
-            inference_ms, chunk = decode_response(payload, self.chunk_size, self.action_dim)
+            inference_ms, chunk, complete = decode_response(payload, self.chunk_size, self.action_dim)
             with self._lock:
-                self._responses.append((self._pending, inference_ms, chunk))
+                self._responses.append((self._pending, inference_ms, chunk, complete))
                 self._pending = None
 
     @property
@@ -298,13 +313,13 @@ class PolicyClient:
         with self._lock:
             return self._pending is None and not self._responses
 
-    def send(self, tick, sent_at, qpos, images):
+    def send(self, tick, sent_at, qpos, images, context=None):
         with self._lock:
             self._pending = (tick, sent_at)
-        self._outbox.put_nowait(encode_request(qpos, images))
+        self._outbox.put_nowait(encode_request(qpos, images, context))
 
     def poll(self):
-        """((tick, sent_at), inference_ms, chunk) for a finished request, else None."""
+        """((tick, sent_at), inference_ms, chunk, completion) for a finished request, else None."""
         with self._lock:
             return self._responses.popleft() if self._responses else None
 
@@ -313,15 +328,18 @@ class PolicyClient:
             self._outbox.put_nowait(None)
         except queue.Full:
             pass
-        try:
-            self.process.stdin.close()
-        except OSError:
-            pass
+        # Terminate before closing a pipe whose writer may be blocked on a full image payload.
+        if self.process.poll() is None:
+            self.process.terminate()
         try:
             self.process.wait(timeout=3.0)
         except subprocess.TimeoutExpired:
             self.process.kill()
             self.process.wait(timeout=3.0)
+        self._writer_thread.join(timeout=1.0)
+        self._reader_thread.join(timeout=1.0)
+        self.process.stdin.close()
+        self.process.stdout.close()
 
 
 def summarize(values):

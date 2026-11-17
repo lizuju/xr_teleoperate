@@ -319,9 +319,9 @@ class TrainingExportTests(unittest.TestCase):
             self.assertEqual(h["source/hands_observation_delay_ms"][0], 49.0)
             self.assertEqual(h["source/camera_timing/image/clock_id"].asstr()[0], "pc2")
             self.assertEqual(h["source/camera_timing/image/stereo_skew_ns"][0], 2_000_000)
-            np.testing.assert_array_equal(h["observations/images/head_left"][0, 0, 0], [200, 60, 20])
+            np.testing.assert_array_equal(h["observations/images/head_left"][0, 272, 320], [200, 60, 20])
         loader = R1ACTDataset(self.output, chunk_size=4)
-        images, qpos, actions, padding = loader[6]
+        images, qpos, actions, padding, context, complete = loader[6]
         self.assertEqual(tuple(images.shape), (4, 3, 544, 640))
         self.assertEqual(tuple(qpos.shape), (29,))
         self.assertEqual(padding.tolist(), [False, False, True, True])
