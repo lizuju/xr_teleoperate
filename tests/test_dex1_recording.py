@@ -20,6 +20,7 @@ from teleop.robot_control.robot_hand_dex1_r1 import Dex1PinchRetargeter, O6Dex1R
 from teleop.utils.camera_calibration import camera_calibration_metadata, load_camera_calibration, without_cameras
 from teleop.utils.episode_writer import EpisodeWriter
 from teleop.utils.r1_capture import R1Capture, capture_metadata
+from teleop.utils.camera_color import IMAGE_COLOR_PROFILE
 import test_r1_capture
 import test_training_export
 
@@ -36,7 +37,7 @@ def o6_hand():
 def to_mixed(manifest, rows):
     """Turn a two-O6 synthetic episode into left O6 + right Dex1-1."""
     info = manifest["info"]
-    info.update(end_effector=MIXED_NAME, end_effectors=dict(MIXED))
+    info.update(end_effector=MIXED_NAME, end_effectors=dict(MIXED), image_color_profile=IMAGE_COLOR_PROFILE)
     info["joint_names"]["right_ee"] = ["dex1_1_gripper"]
     for row in rows:
         for field in ("states", "actions"):
@@ -61,6 +62,7 @@ class MixedMetadataTest(unittest.TestCase):
         metadata = capture_metadata(args, camera_config, retargeter)
         self.assertEqual(metadata["end_effector"], MIXED_NAME)
         self.assertEqual(metadata["end_effectors"], MIXED)
+        self.assertEqual(metadata["image_color_profile"], IMAGE_COLOR_PROFILE)
         self.assertEqual(metadata["gripper_position_limits"], {"right": {"min_q_rad": 2.0, "max_q_rad": 5.4}})
         self.assertEqual(metadata["joint_names"]["right_ee"], ["dex1_1_gripper"])
         self.assertEqual(len(metadata["joint_names"]["left_ee"]), 6)

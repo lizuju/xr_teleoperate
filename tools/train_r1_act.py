@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""Train ACT on an exported R1/O6 dataset. Never connects to the robot.
-
-Run with .venv-train (GPU), and not while teleoperating: it loads the whole machine.
-"""
-
+"""Train the 24D left-O6/right-Dex1 policy offline in .venv-train."""
 import argparse
 import hashlib
 import json
@@ -14,171 +10,216 @@ import time
 
 import numpy as np
 import torch
+from torch.utils.data import DataLoader
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from teleop.utils.act_dataset import load_act_data
-from teleop.utils.act_policy import (ACTPolicy, act_loss, augment_images, masked_l1, read_checkpoint,
-                                     save_checkpoint)
+from teleop.utils.act_contract import validate_contract
+from teleop.utils.act_dataset import R1ACTDataset, BalancedBatchSampler
+from teleop.utils.act_policy import ACTPolicy, act_loss, augment_images, masked_l1, read_checkpoint, save_checkpoint
+from teleop.utils.icecream_task import CONTEXT_DIM
 
 
 def parse_args(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("dataset", type=Path, help="Directory holding dataset.json (r1_act_hdf5_v3)")
-    parser.add_argument("--output", type=Path, required=True, help="New run directory; existing only with --resume")
-    parser.add_argument("--resume", action="store_true", help="Continue from OUTPUT/latest.pt")
-    parser.add_argument("--steps", type=int, default=50_000)
-    parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--chunk-size", type=int, default=40, help="Prediction horizon in ticks; 40 is 1 s at 40 Hz")
-    parser.add_argument("--lr", type=float, default=1e-5)
-    parser.add_argument("--lr-backbone", type=float, default=1e-5)
-    parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--kl-weight", type=float, default=10.0)
-    parser.add_argument("--hidden-dim", type=int, default=512)
-    parser.add_argument("--dim-feedforward", type=int, default=3200)
-    parser.add_argument("--encoder-layers", type=int, default=4)
-    parser.add_argument("--dropout", type=float, default=0.1)
-    parser.add_argument("--no-pretrained", action="store_true", help="Do not start the backbone from ImageNet weights")
-    parser.add_argument("--no-augment", action="store_true", help="Disable image shifts and colour jitter")
-    parser.add_argument("--num-workers", type=int, default=4)
-    parser.add_argument("--eval-every", type=int, default=1000)
-    parser.add_argument("--save-every", type=int, default=2000)
-    parser.add_argument("--log-every", type=int, default=100)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--device", default="auto", help="auto, cuda or cpu")
-    return parser.parse_args(argv)
-
-
-def forever(loader):
-    while True:
-        yield from loader
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument('dataset', type=Path)
+    p.add_argument('--output', type=Path, required=True)
+    p.add_argument('--resume', action='store_true')
+    p.add_argument('--steps', type=int, default=50_000)
+    p.add_argument('--batch-size', type=int, default=2)
+    p.add_argument('--accumulate', type=int, default=4)
+    p.add_argument('--chunk-size', type=int, default=40)
+    p.add_argument('--conditioned', action='store_true', help='Use reviewed phase labels and learn phase completion')
+    p.add_argument('--lr', type=float, default=1e-4)
+    p.add_argument('--lr-backbone', type=float, default=1e-5)
+    p.add_argument('--weight-decay', type=float, default=1e-4)
+    p.add_argument('--kl-weight', type=float, default=10.0)
+    p.add_argument('--hidden-dim', type=int, default=512)
+    p.add_argument('--dim-feedforward', type=int, default=3200)
+    p.add_argument('--encoder-layers', type=int, default=4)
+    p.add_argument('--dropout', type=float, default=0.1)
+    p.add_argument('--no-pretrained', action='store_true')
+    p.add_argument('--no-augment', action='store_true')
+    p.add_argument('--num-workers', type=int, default=2)
+    p.add_argument('--eval-every', type=int, default=1000)
+    p.add_argument('--save-every', type=int, default=1000)
+    p.add_argument('--log-every', type=int, default=50)
+    p.add_argument('--patience', type=int, default=10, help='Stop after this many validation checks without improvement')
+    p.add_argument('--seed', type=int, default=42)
+    p.add_argument('--device', default='auto')
+    args = p.parse_args(argv)
+    for key in ('steps', 'batch_size', 'accumulate', 'chunk_size', 'eval_every', 'save_every', 'log_every', 'patience'):
+        if getattr(args, key) < 1:
+            p.error(f'{key} must be positive')
+    return args
 
 
 def dataset_info(root, metadata, train_loader, val_loader):
-    return {"path": str(Path(root).resolve()), "schema": metadata["schema"],
-            "manifest_sha256": hashlib.sha256((Path(root) / "dataset.json").read_bytes()).hexdigest(),
-            "fps": metadata["fps"], "task": metadata.get("task"), "joint_names": metadata["joint_names"],
-            "camera_names": metadata["camera_names"], "image_size_hw": metadata["image_size_hw"],
-            "source_image_sizes": metadata.get("source_image_sizes"),
-            "train_frames": len(train_loader.dataset), "val_frames": 0 if val_loader is None else len(val_loader.dataset),
-            "independent_validation": val_loader is not None}
+    info = {key: metadata[key] for key in ('schema', 'fps', 'task', 'joint_names', 'camera_names', 'image_size_hw',
+            'source_image_sizes', 'state_dim', 'action_dim', 'joint_groups', 'end_effectors', 'units',
+            'gripper_position_limits', 'controller_config', 'image_transform_kind', 'image_color_profile', 'phase_annotations') if key in metadata}
+    info.update(path=str(Path(root).resolve()),
+                manifest_sha256=hashlib.sha256((Path(root) / 'dataset.json').read_bytes()).hexdigest(),
+                train_frames=len(train_loader.dataset), val_frames=0 if val_loader is None else len(val_loader.dataset),
+                independent_validation=val_loader is not None)
+    by_id = {e['episode_id']: e for e in metadata.get('episodes', [])}
+    sources = {e['source_id']: e for e in metadata.get('sources', [])}
+    info['source_splits'] = {
+        split: [sources[i] for i in sorted({by_id[e]['source_id'] for e in ids})]
+        for split, ids in metadata.get('splits', {}).items()
+    }
+    return info
 
 
-def to_device(batch, device):
-    return [item.to(device, non_blocking=True) for item in batch]
+def rng_state():
+    state = np.random.get_state()
+    return {'python': random.getstate(), 'numpy': [state[0], state[1].tolist(), *state[2:]],
+            'torch': torch.get_rng_state(), 'cuda': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else []}
+
+
+def restore_rng(state):
+    random.setstate(state['python'])
+    n = state['numpy']
+    np.random.set_state((n[0], np.asarray(n[1], dtype=np.uint32), *n[2:]))
+    torch.set_rng_state(state['torch'])
+    if state['cuda']:
+        torch.cuda.set_rng_state_all(state['cuda'])
 
 
 @torch.no_grad()
 def validation_l1(model, loader, device, amp):
-    """Normalized L1 at z=0, exactly how the policy runs when deployed."""
     model.eval()
-    total, weight = 0.0, 0
+    total, weight, complete_sum = 0.0, 0, 0.0
     for batch in loader:
-        images, qpos, actions, is_pad = to_device(batch, device)
-        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp):
-            pred = model(images, qpos)[0]
-        count = int((~is_pad).sum())
-        total += float(masked_l1(pred.float(), actions, is_pad)) * count
+        images, qpos, actions, pad, context, complete = [x.to(device) for x in batch]
+        with torch.autocast('cuda', dtype=torch.bfloat16, enabled=amp):
+            pred, _, _, logits = model(images, qpos, context=context)
+        count = int((~pad).sum())
+        total += float(masked_l1(pred.float(), actions, pad)) * count
         weight += count
+        if logits is not None:
+            complete_sum += float(torch.nn.functional.binary_cross_entropy_with_logits(logits.float(), complete)) * len(images)
     model.train()
-    return total / max(weight, 1)
+    return total / max(weight, 1), complete_sum / len(loader.dataset)
 
 
 def train(args):
-    device = ("cuda" if torch.cuda.is_available() else "cpu") if args.device == "auto" else args.device
-    amp = device.startswith("cuda")
+    device = ('cuda' if torch.cuda.is_available() else 'cpu') if args.device == 'auto' else args.device
+    amp = device.startswith('cuda')
     if args.output.exists() and not args.resume:
-        raise SystemExit(f"{args.output} already exists; pass --resume or choose a new directory")
-    random.seed(args.seed), np.random.seed(args.seed), torch.manual_seed(args.seed)
-    torch.backends.cudnn.benchmark = True
-    train_loader, val_loader, _, metadata = load_act_data(
-        args.dataset, batch_size=args.batch_size, chunk_size=args.chunk_size, num_workers=args.num_workers,
-        pin_memory=amp)
-    if len(train_loader.dataset) < args.batch_size:
-        raise SystemExit(f"Only {len(train_loader.dataset)} training frames; collect more demonstrations")
-    info = dataset_info(args.dataset, metadata, train_loader, val_loader)
-    if val_loader is None:
-        print("[TRAIN] 警告：数据集没有独立验证集（只有一条来源录像）。训练误差不能说明泛化能力。", flush=True)
-    args.output.mkdir(parents=True, exist_ok=args.resume)
-    latest, best_path = args.output / "latest.pt", args.output / "best.pt"
-    start_step, best = 0, float("inf")
-    resume = read_checkpoint(latest) if args.resume else None
+        raise ValueError('Output exists; choose a new run or use --resume')
+    random.seed(args.seed); np.random.seed(args.seed); torch.manual_seed(args.seed)
+    torch.backends.cudnn.benchmark = False
+    train_data = R1ACTDataset(args.dataset, 'train', args.chunk_size)
+    val_data = R1ACTDataset(args.dataset, 'val', args.chunk_size)
+    meta = train_data.metadata
+    validate_contract(meta)
+    if not len(train_data) or not len(val_data):
+        raise ValueError('Training requires separate nonempty train and validation source episodes')
+    if args.conditioned and not (meta.get('phase_annotations') or {}).get('reviewed'):
+        raise ValueError('Conditioned training requires reviewed within-episode phase annotations')
+    settings = {k: getattr(args, k) for k in ('batch_size', 'accumulate', 'chunk_size', 'conditioned', 'seed', 'no_augment', 'kl_weight')}
+    resume = read_checkpoint(args.output / 'latest.pt') if args.resume else None
+    start = 0 if resume is None else resume['step']
+    sampler = BalancedBatchSampler(train_data, args.batch_size, start * args.accumulate,
+                                   args.steps * args.accumulate, args.seed, phases=args.conditioned)
+    options = dict(num_workers=args.num_workers, pin_memory=amp, persistent_workers=args.num_workers > 0,
+                   generator=torch.Generator().manual_seed(args.seed))
+    train_loader = DataLoader(train_data, batch_sampler=sampler, **options)
+    val_loader = DataLoader(val_data, batch_size=args.batch_size, shuffle=False, **options)
+    info = dataset_info(args.dataset, meta, train_loader, val_loader)
+    hashes = {split: {source['frames_sha256'] for source in sources}
+              for split, sources in info['source_splits'].items()}
+    if any(hashes[a] & hashes[b] for a, b in (('train', 'val'), ('train', 'test'), ('val', 'test'))):
+        raise ValueError('Source contents overlap between train, validation or test')
     if resume is not None:
-        if resume["dataset"]["manifest_sha256"] != info["manifest_sha256"]:
-            raise SystemExit("--resume: this run was trained on a different dataset export")
-        model = ACTPolicy(**resume["config"], pretrained=False)
-        model.load_state_dict(resume["model"])
-        start_step = resume["step"]
-        best = resume["metrics"].get("best", best)
+        if resume['dataset']['manifest_sha256'] != info['manifest_sha256']:
+            raise ValueError('Resume dataset differs from the saved dataset')
+        if resume['training_state']['settings'] != settings:
+            raise ValueError('Resume batch, context, augmentation, seed and horizon must match')
+        model = ACTPolicy(**resume['config'], pretrained=False)
+        model.load_state_dict(resume['model'])
     else:
-        model = ACTPolicy(metadata["state_dim"], metadata["action_dim"], len(metadata["camera_names"]),
-                          chunk_size=args.chunk_size, hidden_dim=args.hidden_dim,
+        model = ACTPolicy(24, 24, 4, chunk_size=args.chunk_size, hidden_dim=args.hidden_dim,
                           dim_feedforward=args.dim_feedforward, encoder_layers=args.encoder_layers,
-                          dropout=args.dropout, pretrained=not args.no_pretrained)
-        (args.output / "run.json").write_text(json.dumps(
-            {"args": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
-             "dataset": info}, indent=2, ensure_ascii=False) + "\n")
+                          dropout=args.dropout, pretrained=not args.no_pretrained,
+                          context_dim=CONTEXT_DIM if args.conditioned else 0)
     model.to(device).train()
     optimizer = torch.optim.AdamW(model.parameter_groups(args.lr, args.lr_backbone), weight_decay=args.weight_decay)
-    if resume is not None and resume["optimizer"] is not None:
-        optimizer.load_state_dict(resume["optimizer"])
-    normalization = metadata["normalization"]
-    metrics_file = (args.output / "metrics.jsonl").open("a", encoding="utf-8")
-
-    def checkpoint(path, step, with_optimizer):
-        save_checkpoint(path, model, normalization, info, step, optimizer if with_optimizer else None, {"best": best})
-
-    print(f"[TRAIN] device={device} frames train={info['train_frames']} val={info['val_frames']} "
-          f"params={sum(p.numel() for p in model.parameters()) / 1e6:.1f}M steps={start_step}->{args.steps}", flush=True)
-    batches = forever(train_loader)
-    started, window_start, running = time.monotonic(), start_step, []
-    step = start_step
+    best = float('inf') if resume is None else resume['metrics']['best']
+    bad_checks = 0 if resume is None else resume['training_state']['bad_checks']
+    if resume is not None:
+        optimizer.load_state_dict(resume['optimizer'])
+        restore_rng(resume['training_state']['rng'])
+    args.output.mkdir(parents=True, exist_ok=args.resume)
+    if resume is None:
+        sources = ['tools/train_r1_act.py', 'teleop/utils/act_policy.py', 'teleop/utils/act_dataset.py',
+                   'teleop/utils/act_contract.py', 'teleop/utils/act_runtime.py', 'teleop/utils/camera_color.py']
+        record = {'args': {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}, 'dataset': info,
+                  'torch': torch.__version__, 'device': device,
+                  'gpu': torch.cuda.get_device_name() if amp else None,
+                  'code_sha256': {f: hashlib.sha256((ROOT / f).read_bytes()).hexdigest() for f in sources}}
+        (args.output / 'run.json').write_text(json.dumps(record, indent=2, ensure_ascii=False) + '\n')
+    def checkpoint(name, step, optimizer_state):
+        state = {'settings': settings, 'rng': rng_state(), 'bad_checks': bad_checks}
+        save_checkpoint(args.output / name, model, meta['normalization'], info, step,
+                        optimizer if optimizer_state else None, {'best': best}, state)
+    print(f'[TRAIN] {device} 24D train={len(train_data)} val={len(val_data)} effective_batch={args.batch_size * args.accumulate}', flush=True)
+    stream, step = iter(train_loader), start
+    began = time.monotonic()
+    log = (args.output / 'metrics.jsonl').open('a')
     try:
         while step < args.steps:
-            images, qpos, actions, is_pad = to_device(next(batches), device)
-            if not args.no_augment:
-                images = augment_images(images)
-            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp):
-                pred, mu, logvar = model(images, qpos, actions, is_pad)
-                loss, l1, kl = act_loss(pred.float(), actions, is_pad, mu.float(), logvar.float(), args.kl_weight)
-            if not torch.isfinite(loss):
-                raise RuntimeError(f"Non-finite loss at step {step}; stopping without saving this state")
             optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 10.0)
-            optimizer.step()
-            step += 1
-            running.append((float(loss), float(l1), float(kl)))
-            evaluate = val_loader is not None and (step % args.eval_every == 0 or step == args.steps)
-            if step % args.log_every == 0 or evaluate or step == args.steps:
-                loss_mean, l1_mean, kl_mean = np.mean(running, axis=0)
-                running = []
-                entry = {"step": step, "loss": float(loss_mean), "l1": float(l1_mean), "kl": float(kl_mean),
-                         "steps_per_s": (step - window_start) / max(time.monotonic() - started, 1e-6)}
+            losses = []
+            for _ in range(args.accumulate):
+                images, qpos, actions, pad, context, complete = [x.to(device, non_blocking=True) for x in next(stream)]
+                if not args.no_augment:
+                    images = augment_images(images)
+                with torch.autocast('cuda', dtype=torch.bfloat16, enabled=amp):
+                    pred, mu, logvar, logits = model(images, qpos, actions, pad, context)
+                    loss, l1, kl = act_loss(pred.float(), actions, pad, mu.float(), logvar.float(), args.kl_weight)
+                    phase_loss = loss.new_tensor(0.) if logits is None else torch.nn.functional.binary_cross_entropy_with_logits(
+                        logits.float(), complete, pos_weight=loss.new_tensor(10.))
+                    loss = loss + phase_loss
+                if not torch.isfinite(loss):
+                    raise RuntimeError(f'Nonfinite loss at step {step}')
+                (loss / args.accumulate).backward()
+                losses.append([float(loss), float(l1), float(kl), float(phase_loss)])
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 10.)
+            optimizer.step(); step += 1
+            evaluate = step % args.eval_every == 0 or step == args.steps
+            if step % args.log_every == 0 or evaluate:
+                entry = dict(zip(('loss', 'l1', 'kl', 'phase_bce'), np.mean(losses, axis=0).tolist()))
+                entry.update(step=step, steps_per_s=(step-start) / max(time.monotonic()-began, 1e-6))
+                if amp:
+                    entry['peak_gpu_mb'] = torch.cuda.max_memory_allocated() / 2**20
                 if evaluate:
-                    entry["val_l1"] = validation_l1(model, val_loader, device, amp)
-                # Without a validation set the training L1 is the only signal; the eval tool says so.
-                score = entry.get("val_l1", entry["l1"] if val_loader is None else None)
-                if score is not None and score < best:
-                    best = score
-                    checkpoint(best_path, step, False)
-                    entry["best"] = True
-                metrics_file.write(json.dumps(entry) + "\n")
-                metrics_file.flush()
-                text = " ".join(f"{key}={value:.4f}" for key, value in entry.items() if isinstance(value, float))
-                print(f"[TRAIN] step={step} {text}", flush=True)
-            if step % args.save_every == 0 or step == args.steps:
-                checkpoint(latest, step, True)
+                    entry['val_l1'], entry['val_phase_bce'] = validation_l1(model, val_loader, device, amp)
+                    score = entry['val_l1'] + (entry['val_phase_bce'] * .1 if args.conditioned else 0.)
+                    if score < best:
+                        best, bad_checks = score, 0
+                        checkpoint('best.pt', step, False)
+                    else:
+                        bad_checks += 1
+                log.write(json.dumps(entry) + '\n'); log.flush()
+                print('[TRAIN] ' + json.dumps(entry), flush=True)
+            if step % args.save_every == 0 or step == args.steps or bad_checks >= args.patience:
+                checkpoint('latest.pt', step, True)
+            if bad_checks >= args.patience:
+                print('[TRAIN] validation patience reached', flush=True)
+                break
     except KeyboardInterrupt:
-        checkpoint(latest, step, True)
-        print(f"[TRAIN] interrupted; saved {latest} at step {step}", flush=True)
+        # Preserve the last completed checkpoint: a partial optimizer step cannot be resumed exactly.
+        print('[TRAIN] interrupted; resume from the last completed latest.pt checkpoint', flush=True)
         return 130
-    metrics_file.close()
-    print(f"[TRAIN] done: {latest} and {best_path}; best={'n/a' if best == float('inf') else f'{best:.4f}'}", flush=True)
+    finally:
+        log.close()
+    print(f'[TRAIN] completed step={step}, best_validation={best:.6f}', flush=True)
     return 0
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     sys.exit(train(parse_args()))

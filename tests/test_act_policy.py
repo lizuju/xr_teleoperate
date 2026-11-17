@@ -23,8 +23,8 @@ from teleop.utils.frame_sync import CameraSynchronizer
 HAS_TORCHVISION = importlib.util.find_spec("torchvision") is not None
 HAS_PINOCCHIO = importlib.util.find_spec("pinocchio") is not None
 HAS_SDK = importlib.util.find_spec("unitree_sdk2py") is not None and importlib.util.find_spec("sshkeyboard") is not None
-NORMALIZATION = {"action_min": [-1.0] * 14 + [0.2] * 12 + [-0.5] * 3, "action_max": [1.0] * 14 + [0.6] * 12 + [0.5] * 3,
-                 "qpos_min": [-1.0] * 29, "qpos_max": [1.0] * 29}
+NORMALIZATION = {"action_min": [-1.0] * 14 + [0.2] * 6 + [4.3] + [-0.5] * 3, "action_max": [1.0] * 14 + [0.6] * 6 + [5.4] + [0.5] * 3,
+                 "qpos_min": [-1.0] * 24, "qpos_max": [1.0] * 24}
 
 
 class EnsembleTests(unittest.TestCase):
@@ -52,13 +52,13 @@ class EnsembleTests(unittest.TestCase):
 
 class ActionLayoutTests(unittest.TestCase):
     def test_split_and_join_match_the_dataset_order(self):
-        values = np.arange(29.0)
+        values = np.arange(24.0)
         parts = split_action(values)
         self.assertEqual(parts["arm_q"].tolist(), list(range(14)))
         self.assertEqual(parts["left_q"].tolist(), list(range(14, 20)))
-        self.assertEqual(parts["right_q"].tolist(), list(range(20, 26)))
-        self.assertEqual(parts["waist_q"], 26.0)
-        self.assertEqual(parts["head_q"].tolist(), [27.0, 28.0])
+        self.assertEqual(parts["right_q"].tolist(), list(range(20, 21)))
+        self.assertEqual(parts["waist_q"], 21.0)
+        self.assertEqual(parts["head_q"].tolist(), [22.0, 23.0])
         np.testing.assert_array_equal(join_action(*(parts[k] for k in ("arm_q", "left_q", "right_q", "waist_q", "head_q"))), values)
 
     def test_wrong_length_is_refused(self):
@@ -66,25 +66,25 @@ class ActionLayoutTests(unittest.TestCase):
             split_action(np.zeros(28))
 
     def test_group_errors_report_the_worst_joint_of_each_group(self):
-        difference = np.zeros(29)
-        difference[3], difference[16], difference[28] = 0.5, -0.25, 0.1
+        difference = np.zeros(24)
+        difference[3], difference[16], difference[23] = 0.5, -0.25, 0.1
         errors = group_errors(difference)
         self.assertEqual((errors["left_arm"], errors["left_ee"], errors["body"], errors["right_arm"]), (0.5, 0.25, 0.1, 0.0))
 
 
 class ProtocolTests(unittest.TestCase):
     def test_request_and_response_round_trip_at_their_declared_sizes(self):
-        qpos = np.arange(29, dtype=np.float32)
+        qpos = np.arange(24, dtype=np.float32)
         images = np.random.randint(0, 255, (4, 6, 8, 3), dtype=np.uint8)
         payload = encode_request(qpos, images)
-        self.assertEqual(len(payload), request_size(29, 4, (6, 8)))
-        decoded_q, decoded_images = decode_request(payload, 29, 4, (6, 8))
+        self.assertEqual(len(payload), request_size(24, 4, (6, 8)))
+        decoded_q, decoded_images, context = decode_request(payload, 24, 4, (6, 8))
         np.testing.assert_array_equal(decoded_q, qpos)
         np.testing.assert_array_equal(decoded_images, images)
-        chunk = np.arange(5 * 29, dtype=np.float32).reshape(5, 29)
+        chunk = np.arange(5 * 24, dtype=np.float32).reshape(5, 24)
         payload = encode_response(12.5, chunk)
-        self.assertEqual(len(payload), response_size(5, 29))
-        inference_ms, decoded = decode_response(payload, 5, 29)
+        self.assertEqual(len(payload), response_size(5, 24))
+        inference_ms, decoded, complete = decode_response(payload, 5, 24)
         self.assertEqual(inference_ms, 12.5)
         np.testing.assert_array_equal(decoded, chunk)
 
@@ -94,13 +94,13 @@ sys.path.insert(0, sys.argv[1])
 import numpy as np
 from teleop.utils.act_runtime import encode_response, read_exact, request_size
 out = sys.stdout.buffer
-out.write((json.dumps({"chunk_size": 3, "action_dim": 29}) + "\n").encode()); out.flush()
+out.write((json.dumps({"chunk_size": 3, "action_dim": 24}) + "\n").encode()); out.flush()
 if sys.argv[2] == "exit":
     sys.exit(3)
 if sys.argv[2] == "hang":
     time.sleep(30)
-while read_exact(sys.stdin.buffer, request_size(29, 4, (6, 8))) is not None:
-    out.write(encode_response(1.5, np.ones((3, 29)))); out.flush()
+while read_exact(sys.stdin.buffer, request_size(24, 4, (6, 8))) is not None:
+    out.write(encode_response(1.5, np.ones((3, 24)))); out.flush()
 """
 
     def worker(self, behaviour):
@@ -109,7 +109,7 @@ while read_exact(sys.stdin.buffer, request_size(29, 4, (6, 8))) is not None:
         return client
 
     def request(self, client):
-        client.send(7, 0.0, np.zeros(29), np.zeros((4, 6, 8, 3), dtype=np.uint8))
+        client.send(7, 0.0, np.zeros(24), np.zeros((4, 6, 8, 3), dtype=np.uint8))
 
     def test_client_is_idle_only_when_nothing_is_outstanding(self):
         client = self.worker("ok")
@@ -121,8 +121,8 @@ while read_exact(sys.stdin.buffer, request_size(29, 4, (6, 8))) is not None:
         while response is None and time.monotonic() < deadline:
             response = client.poll()
             time.sleep(0.005)
-        (tick, _), inference_ms, chunk = response
-        self.assertEqual((tick, inference_ms, chunk.shape), (7, 1.5, (3, 29)))
+        (tick, _), inference_ms, chunk, complete = response
+        self.assertEqual((tick, inference_ms, chunk.shape), (7, 1.5, (3, 24)))
         self.assertTrue(client.idle)
 
     def test_a_dead_worker_is_reported_instead_of_blocking(self):
@@ -140,6 +140,15 @@ while read_exact(sys.stdin.buffer, request_size(29, 4, (6, 8))) is not None:
         self.assertLess(time.monotonic() - began, 0.2)
         self.assertFalse(client.idle)
 
+    def test_shutdown_unblocks_a_hung_worker_with_a_full_image_pipe(self):
+        client = self.worker("hang")
+        client.send(0,time.monotonic(),np.zeros(24),np.zeros((4,320,384,3),dtype=np.uint8))
+        time.sleep(.02)
+        started = time.monotonic()
+        client.close()
+        self.assertLess(time.monotonic()-started,4.0)
+        self.assertIsNotNone(client.process.poll())
+
 
 class GuardTests(unittest.TestCase):
     def guard(self, **options):
@@ -148,14 +157,14 @@ class GuardTests(unittest.TestCase):
 
     def test_targets_are_held_inside_the_trained_range_and_hands_inside_0_to_1(self):
         guard = self.guard()
-        clamped = guard.clamp(np.array([5.0] * 14 + [9.0] * 12 + [5.0] * 3))
+        clamped = guard.clamp(np.array([5.0] * 14 + [9.0] * 7 + [5.0] * 3))
         self.assertAlmostEqual(clamped[0], 1.0 + 0.2 + 0.02)
         self.assertLessEqual(clamped[14], 1.0)
         self.assertEqual(guard.clamped_ticks, 1)
 
     def test_an_in_range_target_passes_untouched(self):
         guard = self.guard()
-        target = np.array([0.5] * 14 + [0.4] * 12 + [0.1] * 3)
+        target = np.array([0.5] * 14 + [0.4] * 6 + [4.8] + [0.1] * 3)
         np.testing.assert_array_equal(guard.clamp(target), target)
         self.assertEqual(guard.clamped_ticks, 0)
 
@@ -177,7 +186,7 @@ class GuardTests(unittest.TestCase):
         self.assertIn("worker failed", self.guard().check(10.0, 10.0, 0.0, "exited"))
 
     def test_live_pose_outside_the_training_range_is_named(self):
-        qpos = np.zeros(29)
+        qpos = np.zeros(24)
         qpos[5] = 3.0
         self.assertEqual(self.guard().out_of_training_range(qpos), [5])
 
@@ -200,7 +209,7 @@ class ObservationTests(unittest.TestCase):
         q = list(np.arange(14) / 100)
         robot = {"q": q, "waist_q": 0.7, "head_q": [0.8, 0.9], "monotonic_ns": feedback}
         arm = SimpleNamespace(get_recording_samples=lambda target, since, end: {"nearest": robot if feedback <= end else None})
-        hands = {"left": {"q": [0.2] * 6, "monotonic_ns": feedback}, "right": {"q": [0.3] * 6, "monotonic_ns": feedback}}
+        hands = {"left": {"q": [0.2] * 6, "monotonic_ns": feedback}, "right": {"q": [0.3], "monotonic_ns": feedback}}
         hand = SimpleNamespace(get_recording_states_at=lambda target, end: hands)
         builder = ObservationBuilder(arm, hand, CameraSynchronizer(["head", "left_wrist", "right_wrist"]), image_hw=(6, 8))
         received = anchor + 30_000_000
@@ -216,7 +225,7 @@ class ObservationTests(unittest.TestCase):
         self.assertEqual(images[2, 0, 0].tolist(), [50, 50, 51])
         self.assertEqual(images[3, 0, 0].tolist(), [200, 200, 201])
         np.testing.assert_allclose(qpos[:2], [0.0, 0.01], atol=1e-6)
-        np.testing.assert_allclose(qpos[14:], [0.2] * 6 + [0.3] * 6 + [0.7, 0.8, 0.9])
+        np.testing.assert_allclose(qpos[14:], [0.2] * 6 + [0.3] + [0.7, 0.8, 0.9])
 
     def test_it_matches_the_row_the_exporter_trains_on(self):
         from check_teleop_episode import training_observation
@@ -246,7 +255,7 @@ class ObservationTests(unittest.TestCase):
         stamps = [anchor + offset * 1_000_000 for offset in (-4, 6, 16)]
         def states(target, end):
             stamp = min(stamps, key=lambda value: abs(value - target))
-            return {side: {"q": [0.2] * 6, "monotonic_ns": stamp} for side in ("left", "right")}
+            return {side: {"q": [0.2] * (6 if side == "left" else 1), "monotonic_ns": stamp} for side in ("left", "right")}
         builder = ObservationBuilder(SimpleNamespace(get_recording_samples=samples),
                                      SimpleNamespace(get_recording_states_at=states),
                                      CameraSynchronizer(["head", "left_wrist", "right_wrist"]), image_hw=(6, 8))
@@ -280,12 +289,12 @@ class RunnerSafetyTests(unittest.TestCase):
         arm = Mock()
         arm.get_recording_snapshot.return_value = {"state": {"q": [0.0] * 14, "head_q": [0.0, 0.0], "waist_q": 0.0}}
         hand = Mock()
-        hand.get_state.return_value = ([0.2] * 6, [0.2] * 6)
+        hand.get_state.return_value = ([0.2] * 6, [4.8])
         client = Mock(idle=False, failed=None)
         client.poll.return_value = None
         builder = Mock()
         ensemble = ActionEnsemble(2)
-        ensemble.add(0, np.zeros((2, 29)))
+        ensemble.add(0, np.zeros((2, 24)))
         run = runner.PolicyRun(arm, hand, lambda: (None, {}), client, builder, ensemble, PolicyGuard(NORMALIZATION), log)
         self.addCleanup(run.log.close)
         return run, arm, hand
@@ -297,8 +306,12 @@ class RunnerSafetyTests(unittest.TestCase):
 
     def test_policy_trained_on_other_head_images_is_refused(self):
         runner = self.load()
-        config = {"head_camera": {"image_shape": [544, 1280]}}
-        runner.check_policy_cameras({"source_image_sizes": {"color_0": [640, 544]}}, config)
+        config = {"head_camera": {"image_shape": [544, 1280]},
+                  "left_wrist_camera": {"image_shape": [480, 640]}, "right_wrist_camera": {"image_shape": [480, 640]}}
+        sizes = {"color_0": [640, 544], "color_1": [640, 544], "color_2": [640, 480], "color_3": [640, 480]}
+        runner.check_policy_cameras({"source_image_sizes": sizes}, config)
+        with self.assertRaises(RuntimeError):
+            runner.check_policy_cameras({"source_image_sizes": dict(sizes, color_3=[480, 640])}, config)
         for dataset in ({}, {"source_image_sizes": {"color_0": [544, 448]}}):
             with self.assertRaisesRegex(RuntimeError, "Export and train again"):
                 runner.check_policy_cameras(dataset, config)
@@ -314,14 +327,25 @@ class RunnerSafetyTests(unittest.TestCase):
                 getattr(hand, method).assert_not_called()
             self.assertGreater(run.tick, 0)
 
+    def test_phase_reentry_does_not_reset_the_whole_run_deadline(self):
+        runner = self.load()
+        with tempfile.TemporaryDirectory() as directory:
+            run, arm, hand = self.fake_run(runner,Path(directory)/"ticks.jsonl")
+            expired = run.execution_deadline = time.monotonic()-1
+            args = SimpleNamespace(max_seconds=60)
+            runner.execute_loop(run,arm,hand,run.guard,lambda q: np.zeros(14),.001,[False],args)
+            self.assertTrue(run.finished)
+            self.assertEqual(run.execution_deadline,expired)
+            self.assertEqual(run.sent,0)
+
     def test_execute_refuses_a_far_first_target_without_commanding_it(self):
         runner = self.load()
         with tempfile.TemporaryDirectory() as directory:
             run, arm, hand = self.fake_run(runner, Path(directory) / "ticks.jsonl")
             run.ignore_before_tick = 0
-            chunk = np.zeros((2, 29))
+            chunk = np.zeros((2, 24))
             chunk[:, 0] = 1.0
-            run.client.poll.side_effect = [((run.tick, time.monotonic()), 1.0, chunk)] + [None] * 10
+            run.client.poll.side_effect = [((run.tick, time.monotonic()), 1.0, chunk, None)] + [None] * 10
             args = SimpleNamespace(max_start_delta=0.35, blend_seconds=1.0, max_seconds=1.0)
             pose = runner.execute_loop(run, arm, hand, PolicyGuard(NORMALIZATION), lambda q: np.zeros(14), 0.001, [False], args)
             self.assertEqual(pose.arm_q.tolist(), [0.0] * 14)
@@ -336,9 +360,9 @@ class RunnerSafetyTests(unittest.TestCase):
                 "state": {"q": [0.0] * 14, "head_q": [0.0, 0.0], "waist_q": 0.0},
                 "requested": {"arm_q": [0.0] * 14}}
             run.ensemble = ActionEnsemble(400)
-            chunk = np.zeros((400, 29))
+            chunk = np.zeros((400, 24))
             chunk[:, 0] = 0.3
-            run.client.poll.side_effect = [((run.tick, time.monotonic()), 1.0, chunk)] + [None] * 1000
+            run.client.poll.side_effect = [((run.tick, time.monotonic()), 1.0, chunk, None)] + [None] * 1000
             args = SimpleNamespace(max_start_delta=0.35, blend_seconds=0.2, max_seconds=5.0)
             guard = PolicyGuard(NORMALIZATION, max_chunk_age_s=0.1)
             runner.execute_loop(run, arm, hand, guard, lambda q: np.zeros(14), 0.002, [False], args)
@@ -353,8 +377,8 @@ class RunnerSafetyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             run, _, _ = self.fake_run(runner, Path(directory) / "ticks.jsonl")
             run.ensemble = ActionEnsemble(400)
-            late = np.full((400, 29), 0.3)
-            run.client.poll.return_value = ((run.tick, time.monotonic() - 0.6), 900.0, late)
+            late = np.full((400, 24), 0.3)
+            run.client.poll.return_value = ((run.tick, time.monotonic() - 0.6), 900.0, late, None)
             target, _ = run.step()
             self.assertIsNone(target)
             self.assertIsNone(run.last_chunk_at)
@@ -368,15 +392,15 @@ class RunnerSafetyTests(unittest.TestCase):
                 "state": {"q": [0.0] * 14, "head_q": [0.0, 0.0], "waist_q": 0.0},
                 "requested": {"arm_q": [0.0] * 14}}
             run.ensemble = ActionEnsemble(400)
-            late, fresh = np.zeros((400, 29)), np.zeros((400, 29))
+            late, fresh = np.zeros((400, 24)), np.zeros((400, 24))
             late[:, 0], fresh[:, 0] = 0.3, 0.1
             polls = [0]
             def poll():
                 polls[0] += 1
                 if polls[0] == 1:
-                    return (run.tick, time.monotonic() - 0.6), 900.0, late
+                    return (run.tick, time.monotonic() - 0.6), 900.0, late, None
                 # The next request comes back on time, after the over-age one was dropped.
-                return ((run.tick, time.monotonic()), 1.0, fresh) if polls[0] == 2 else None
+                return ((run.tick, time.monotonic()), 1.0, fresh, None) if polls[0] == 2 else None
             run.client.poll.side_effect = poll
             args = SimpleNamespace(max_start_delta=0.35, blend_seconds=0.01, max_seconds=5.0)
             guard = PolicyGuard(NORMALIZATION, max_chunk_age_s=0.1)
@@ -393,17 +417,17 @@ class RunnerSafetyTests(unittest.TestCase):
                 "state": {"q": [0.0] * 14, "head_q": [0.0, 0.0], "waist_q": 0.0},
                 "requested": {"arm_q": [0.0] * 14}}
             run.ensemble = ActionEnsemble(400)
-            chunk = np.zeros((400, 29))
+            chunk = np.zeros((400, 24))
             polls, commands_at_stall = [0], []
             def poll():
                 polls[0] += 1
                 if polls[0] == 1:
-                    return (run.tick, time.monotonic()), 1.0, chunk
+                    return (run.tick, time.monotonic()), 1.0, chunk, None
                 if polls[0] == 5:
                     commands_at_stall.append(arm.ctrl_dual_arm_and_head.call_count)
                     sent_at = time.monotonic()
                     time.sleep(0.15)
-                    return (run.tick, sent_at), 1.0, chunk
+                    return (run.tick, sent_at), 1.0, chunk, None
                 return None
             run.client.poll.side_effect = poll
             args = SimpleNamespace(max_start_delta=0.35, blend_seconds=0.2, max_seconds=5.0)
@@ -419,7 +443,7 @@ class ModelTests(unittest.TestCase):
     def test_checkpoint_records_the_camera_images_it_trained_on(self):
         import train_r1_act
         sizes = {"color_0": [640, 544]}
-        metadata = {"schema": "r1_act_hdf5_v3", "fps": 40.0, "joint_names": [], "camera_names": [],
+        metadata = {"schema": "r1_act_hdf5_v4", "fps": 40.0, "joint_names": [], "camera_names": [],
                     "image_size_hw": [544, 640], "source_image_sizes": sizes}
         with tempfile.TemporaryDirectory() as directory:
             (Path(directory) / "dataset.json").write_text("{}")
@@ -431,18 +455,18 @@ class ModelTests(unittest.TestCase):
         from teleop.utils.act_policy import ACTPolicy
         self.torch = torch
         torch.manual_seed(0)
-        self.model = ACTPolicy(29, 29, 4, chunk_size=5, hidden_dim=32, nheads=2, dim_feedforward=32, encoder_layers=1,
+        self.model = ACTPolicy(24, 24, 4, chunk_size=5, hidden_dim=32, nheads=2, dim_feedforward=32, encoder_layers=1,
                                vae_encoder_layers=1, dropout=0.0, pretrained=False)
         self.images = torch.rand(2, 4, 3, 48, 64)
-        self.qpos = torch.rand(2, 29)
-        self.actions = torch.rand(2, 5, 29)
+        self.qpos = torch.rand(2, 24)
+        self.actions = torch.rand(2, 5, 24)
         self.is_pad = torch.tensor([[False] * 3 + [True] * 2, [False] * 5])
 
     def test_training_and_deployed_passes_have_the_expected_shapes(self):
-        pred, mu, logvar = self.model(self.images, self.qpos, self.actions, self.is_pad)
-        self.assertEqual((tuple(pred.shape), tuple(mu.shape), tuple(logvar.shape)), ((2, 5, 29), (2, 32), (2, 32)))
-        pred, mu, logvar = self.model(self.images, self.qpos)
-        self.assertEqual(tuple(pred.shape), (2, 5, 29))
+        pred, mu, logvar, complete = self.model(self.images, self.qpos, self.actions, self.is_pad)
+        self.assertEqual((tuple(pred.shape), tuple(mu.shape), tuple(logvar.shape)), ((2, 5, 24), (2, 32), (2, 32)))
+        pred, mu, logvar, complete = self.model(self.images, self.qpos)
+        self.assertEqual(tuple(pred.shape), (2, 5, 24))
         self.assertIsNone(mu)
 
     def test_deployed_pass_is_deterministic(self):
@@ -476,18 +500,18 @@ class ModelTests(unittest.TestCase):
 
     def test_checkpoint_round_trip_predicts_real_units(self):
         from teleop.utils.act_policy import ChunkPredictor, load_policy, save_checkpoint
-        normalization = {"qpos_mean": [0.0] * 29, "qpos_std": [1.0] * 29, "action_mean": [5.0] * 29, "action_std": [2.0] * 29}
+        normalization = {"qpos_mean": [0.0] * 24, "qpos_std": [1.0] * 24, "action_mean": [5.0] * 24, "action_std": [2.0] * 24}
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "a.pt"
             save_checkpoint(path, self.model, normalization, {"fps": 40}, 3, metrics={"best": 1.0})
             model, data = load_policy(path)
         self.assertEqual((data["step"], data["dataset"]["fps"]), (3, {"fps": 40}["fps"]))
         predict = ChunkPredictor(model, normalization, "cpu")
-        chunk = predict(np.zeros((4, 48, 64, 3), dtype=np.uint8), np.zeros(29, dtype=np.float32))
-        self.assertEqual(chunk.shape, (5, 29))
+        chunk, complete = predict(np.zeros((4, 48, 64, 3), dtype=np.uint8), np.zeros(24, dtype=np.float32))
+        self.assertEqual(chunk.shape, (5, 24))
         self.model.eval()
         self.torch.manual_seed(0)
-        raw = self.model(self.torch.zeros(1, 4, 3, 48, 64), self.torch.zeros(1, 29))[0][0].detach().numpy()
+        raw = self.model(self.torch.zeros(1, 4, 3, 48, 64), self.torch.zeros(1, 24))[0][0].detach().numpy()
         np.testing.assert_allclose(chunk, raw * 2 + 5, atol=1e-4)
 
     def test_a_few_steps_on_one_batch_reduce_the_loss(self):
@@ -496,7 +520,7 @@ class ModelTests(unittest.TestCase):
         optimizer = self.torch.optim.AdamW(self.model.parameter_groups(1e-3, 1e-4))
         losses = []
         for _ in range(25):
-            pred, mu, logvar = self.model(self.images, self.qpos, self.actions, self.is_pad)
+            pred, mu, logvar, complete = self.model(self.images, self.qpos, self.actions, self.is_pad)
             loss = act_loss(pred, self.actions, self.is_pad, mu, logvar, 0.1)[0]
             optimizer.zero_grad()
             loss.backward()

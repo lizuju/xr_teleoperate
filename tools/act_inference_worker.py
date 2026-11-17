@@ -29,26 +29,28 @@ def main():
     config, dataset = data["config"], data["dataset"]
     image_hw = tuple(dataset["image_size_hw"])
     state_dim, cameras = config["state_dim"], config["num_cameras"]
+    context_dim = config["context_dim"]
     # The first passes are slow on any device; do them before the runner starts timing.
     for _ in range(3):
-        predict(np.zeros((cameras, *image_hw, 3), dtype=np.uint8), np.asarray(data["normalization"]["qpos_mean"], dtype=np.float32))
+        predict(np.zeros((cameras, *image_hw, 3), dtype=np.uint8), np.asarray(data["normalization"]["qpos_mean"], dtype=np.float32),
+                np.zeros(context_dim, dtype=np.float32))
     output = sys.stdout.buffer
     output.write((json.dumps({"device": device, "chunk_size": config["chunk_size"], "action_dim": config["action_dim"],
-                              "state_dim": state_dim, "num_cameras": cameras, "step": data["step"],
+                              "state_dim": state_dim, "context_dim": context_dim, "num_cameras": cameras, "step": data["step"],
                               "dataset": dataset, "normalization": data["normalization"]}) + "\n").encode())
     output.flush()
-    size = request_size(state_dim, cameras, image_hw)
+    size = request_size(state_dim, cameras, image_hw, context_dim)
     while True:
         payload = read_exact(sys.stdin.buffer, size)
         if payload is None:
             return 0
-        qpos, images = decode_request(payload, state_dim, cameras, image_hw)
+        qpos, images, context = decode_request(payload, state_dim, cameras, image_hw, context_dim)
         started = time.perf_counter()
-        chunk = predict(images, qpos)
+        chunk, complete = predict(images, qpos, context)
         if not np.isfinite(chunk).all():
             print("[ACT WORKER] policy produced non-finite actions", file=sys.stderr, flush=True)
             return 3
-        output.write(encode_response((time.perf_counter() - started) * 1e3, chunk))
+        output.write(encode_response((time.perf_counter() - started) * 1e3, chunk, complete))
         output.flush()
 
 

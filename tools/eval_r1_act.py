@@ -19,9 +19,9 @@ if str(ROOT) not in sys.path:
 
 from teleop.utils.act_dataset import R1ACTDataset
 from teleop.utils.act_policy import load_policy
-from teleop.utils.act_runtime import GROUP_SLICES
+from teleop.utils.act_contract import GROUP_SLICES, validate_contract
 
-UNITS = {"left_arm": "rad", "right_arm": "rad", "left_ee": "0-1", "right_ee": "0-1", "body": "rad"}
+UNITS = {"left_arm": "rad", "right_arm": "rad", "left_ee": "0-1", "right_ee": "rad", "body": "rad"}
 
 
 class ErrorTable:
@@ -43,32 +43,79 @@ class ErrorTable:
         return self.sum[index] / max(self.count[index], 1)
 
 
+def evaluation_independence(info, metadata, split):
+    if split not in ("val", "test") or not info.get("source_splits"):
+        return False
+    used = info["source_splits"].get("train", [])
+    if split == "test":
+        used = used + info["source_splits"].get("val", [])
+    used_hashes = {s["frames_sha256"] for s in used}
+    used_paths = {s["episode"] for s in used}
+    selected = set(metadata["splits"][split])
+    source_ids = {e["source_id"] for e in metadata["episodes"] if e["episode_id"] in selected}
+    sources = [s for s in metadata["sources"] if s["source_id"] in source_ids]
+    return bool(sources) and all(s["frames_sha256"] not in used_hashes and s["episode"] not in used_paths
+                                 for s in sources)
+
+
 def evaluate(checkpoint, dataset_root=None, split="val", batch_size=16, num_workers=2, device="auto"):
     device = ("cuda" if torch.cuda.is_available() else "cpu") if device == "auto" else device
     model, data = load_policy(checkpoint, device)
     info = data["dataset"]
+    validate_contract(info)
     root = Path(info["path"] if dataset_root is None else dataset_root)
     dataset = R1ACTDataset(root, split, chunk_size=data["config"]["chunk_size"])
+    validate_contract(dataset.metadata)
     if dataset.metadata["joint_names"] != info["joint_names"] or dataset.metadata["camera_names"] != info["camera_names"]:
         raise ValueError("Dataset joints or cameras do not match this checkpoint")
     if len(dataset) == 0:
         raise ValueError(f"Dataset has no {split} frames")
+    for key in ("image_size_hw", "source_image_sizes", "gripper_position_limits", "controller_config", "image_color_profile"):
+        if dataset.metadata[key] != info[key]:
+            raise ValueError(f"Evaluation {key} must match the checkpoint")
+    if data["config"]["context_dim"] and not (dataset.metadata.get("phase_annotations") or {}).get("reviewed"):
+        raise ValueError("Conditioned evaluation requires reviewed phase annotations")
     stats = data["normalization"]
+    dataset.stats = {k: np.asarray(stats[k], dtype=np.float32) for k in ("qpos_mean", "qpos_std", "action_mean", "action_std")}
     action_mean, action_std = (np.asarray(stats[key], dtype=np.float64) for key in ("action_mean", "action_std"))
     qpos_mean, qpos_std = (np.asarray(stats[key], dtype=np.float64) for key in ("qpos_mean", "qpos_std"))
     chunk_size, action_dim = data["config"]["chunk_size"], data["config"]["action_dim"]
     tables = {name: ErrorTable(chunk_size, action_dim) for name in ("policy", "hold_current", "train_mean")}
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+    phase_tables = {}
+    regime_tables = {group: {regime: {kind: ErrorTable(chunk_size, action_dim) for kind in tables}
+                             for regime in ("moving", "holding")} for group in GROUP_SLICES}
+    completion_counts = {"true_positive": 0, "false_positive": 0, "false_negative": 0}
     with torch.inference_mode():
-        for images, qpos, actions, is_pad in loader:
+        for images, qpos, actions, is_pad, context, complete in loader:
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.startswith("cuda")):
-                pred = model(images.to(device), qpos.to(device))[0]
+                output = model(images.to(device), qpos.to(device), context=context.to(device))
+                pred = output[0]
             pad = is_pad.numpy()
             target = actions.numpy() * action_std + action_mean
             current = qpos.numpy() * qpos_std + qpos_mean
-            tables["policy"].add(pred.float().cpu().numpy() * action_std + action_mean, target, pad)
-            tables["hold_current"].add(np.repeat(current[:, None], chunk_size, axis=1), target, pad)
-            tables["train_mean"].add(np.broadcast_to(action_mean, target.shape), target, pad)
+            predictions = {"policy": pred.float().cpu().numpy() * action_std + action_mean,
+                           "hold_current": np.repeat(current[:, None], chunk_size, axis=1),
+                           "train_mean": np.broadcast_to(action_mean, target.shape)}
+            for kind, values in predictions.items():
+                tables[kind].add(values, target, pad)
+            for group, part in GROUP_SLICES.items():
+                threshold = .03 if group == "left_ee" else .02
+                moving = np.abs(target[..., part] - target[:, :1, part]).max(axis=-1) > threshold
+                for regime, selected in (("moving", moving), ("holding", ~moving)):
+                    for kind, values in predictions.items():
+                        regime_tables[group][regime][kind].add(values, target, pad | ~selected)
+            if output[3] is not None:
+                prediction = output[3].float().sigmoid().cpu().numpy() >= .9
+                truth = complete.numpy() > .5
+                completion_counts["true_positive"] += int((prediction & truth).sum())
+                completion_counts["false_positive"] += int((prediction & ~truth).sum())
+                completion_counts["false_negative"] += int((~prediction & truth).sum())
+                phases = context[:, :5].argmax(dim=1).numpy()
+                for phase in np.unique(phases):
+                    table = phase_tables.setdefault(int(phase), ErrorTable(chunk_size, action_dim))
+                    selected = phases == phase
+                    table.add(pred.float().cpu().numpy()[selected] * action_std + action_mean, target[selected], pad[selected])
     fps = info["fps"]
     horizons = {f"{index / fps:.3f}s": index for index in sorted({0, min(int(fps * .25), chunk_size - 1),
                                                                    min(int(fps * .5), chunk_size - 1), chunk_size - 1})}
@@ -80,8 +127,16 @@ def evaluate(checkpoint, dataset_root=None, split="val", batch_size=16, num_work
         groups[name]["beats_hold_current"] = groups[name]["policy"] < groups[name]["hold_current"]
     joint_names = info["joint_names"]
     report = {"checkpoint": str(checkpoint), "step": data["step"], "dataset": str(root), "split": split,
-              "frames": len(dataset), "independent": split == "val" and info["independent_validation"],
-              "groups": groups, "joints": dict(zip(joint_names, tables["policy"].joints().tolist()))}
+              "frames": len(dataset), "independent": evaluation_independence(info, dataset.metadata, split),
+              "groups": groups, "joints": dict(zip(joint_names, tables["policy"].joints().tolist())),
+              "phase_joint_mae": {str(k): dict(zip(joint_names, v.joints().tolist())) for k, v in phase_tables.items()},
+              "motion_definition": "Per group: accepted target differs from first chunk target by >0.02 rad (left O6 >0.03 normalized).",
+              "motion_regimes": {group: {regime: {
+                  "valid_steps": int(kind_tables["policy"].count.sum()),
+                  **{kind: float(table.joints()[GROUP_SLICES[group]].mean()) if table.count.sum() else None
+                     for kind, table in kind_tables.items()}}
+                  for regime, kind_tables in regimes.items()} for group, regimes in regime_tables.items()},
+              "completion_threshold": .9, "completion_counts": completion_counts}
     return report
 
 
@@ -101,7 +156,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("checkpoint", type=Path)
     parser.add_argument("--dataset", type=Path, help="Default: the dataset recorded in the checkpoint")
-    parser.add_argument("--split", choices=["train", "val"], default="val")
+    parser.add_argument("--split", choices=["train", "val", "test"], default="val")
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--device", default="auto")

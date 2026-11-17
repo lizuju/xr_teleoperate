@@ -107,7 +107,7 @@ class CaptureTimingTests(unittest.TestCase):
         wrist = SimpleNamespace(sequence=1, received_monotonic_ns=now,
                                 bgr=np.full((8, 16, 3), [20, 60, 200], np.uint8),
                                 timing=dict(head.timing, mapped_monotonic_ns=now-9_000_000))
-        corrected = namespace['correct_palm_frame'](wrist)
+        corrected = namespace['correct_palm_frame'](wrist, 'linker_o6')
         self.assertIs(corrected.timing, wrist.timing)
         np.testing.assert_array_equal(wrist.bgr[0, 0], [20, 60, 200])
         capture = R1Capture(arm, hand, loop, .25, (16, 32),

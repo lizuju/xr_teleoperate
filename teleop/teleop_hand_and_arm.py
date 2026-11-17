@@ -440,7 +440,7 @@ def acquire_live_writer_lock(live_state_path: Path):
 class PalmFrame:
     """A palm camera frame with its red and blue channels put back.
 
-    The two O6 palm cameras are UVC modules that hand us MJPG with red and blue
+    The O6 palm cameras are UVC modules that hand us MJPG with red and blue
     transposed relative to every other JPEG in this pipeline, so red arrives as
     blue and yellow as green. The head stereo comes off a different path
     (GStreamer H.264) and is already correct, which is why the correction is
@@ -460,9 +460,9 @@ class PalmFrame:
         self.timing = frame.timing
 
 
-def correct_palm_frame(frame):
-    """Wrap a palm frame so red and blue are the right way round."""
-    if frame is None or frame.bgr is None:
+def correct_palm_frame(frame, end_effector):
+    """O6 needs a red/blue swap; the replacement Dex1 camera already decodes to BGR."""
+    if end_effector != "linker_o6" or frame is None or frame.bgr is None:
         return frame
     return PalmFrame(frame)
 
@@ -909,11 +909,11 @@ if __name__ == '__main__':
             """
             left_frame = right_frame = None
             if camera_config['left_wrist_camera']['enable_zmq'] and (args.record or 'left' in wrist_panels):
-                left_frame = correct_palm_frame(img_client.get_left_wrist_frame())
+                left_frame = correct_palm_frame(img_client.get_left_wrist_frame(), "linker_o6")
                 if left_frame is not None and 'left' in wrist_panels:
                     tv_wrapper.render_wrist_to_xr('left', left_frame.bgr)
             if camera_config['right_wrist_camera']['enable_zmq'] and (args.record or 'right' in wrist_panels):
-                right_frame = correct_palm_frame(img_client.get_right_wrist_frame())
+                right_frame = correct_palm_frame(img_client.get_right_wrist_frame(), args.right_ee)
                 if right_frame is not None and 'right' in wrist_panels:
                     tv_wrapper.render_wrist_to_xr('right', right_frame.bgr)
             publish_torque_hud(
