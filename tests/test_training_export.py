@@ -228,6 +228,46 @@ class TrainingExportTests(unittest.TestCase):
         self.assertEqual(locked["usable_following_frames"], 3)
         self.assertEqual(locked["tracking_invalid_frames"], 0)
 
+    def test_a_locked_hand_out_of_view_does_not_stale_the_headset_frame_time(self):
+        # As recorded on 2026-11-19 (episode 0094): with the locked right hand out of view the
+        # headset drops the whole-frame time, so xr has no timestamp either.
+        _, manifest, rows = self.episode(count=1)
+        self.add_action_alignment(rows)
+        row = copy.deepcopy(rows[0])
+        sources = row["sample"]["sources"]
+        sources["xr"] = {"received_monotonic_ns": 0, "age_ms": None, "fresh": False}
+        sources["right_hand_tracking"] = {"received_monotonic_ns": 0, "age_ms": None, "fresh": False}
+        self.assertIn("tracking_stale", training_frame_rejections(row, manifest["info"]))
+        row["sample"]["hand_locks"] = {"left": False, "right": True}
+        self.assertNotIn("tracking_stale", training_frame_rejections(row, manifest["info"]))
+        # Locking the other hand does not excuse the lost right hand.
+        row["sample"]["hand_locks"] = {"left": True, "right": False}
+        self.assertIn("tracking_stale", training_frame_rejections(row, manifest["info"]))
+        # The unlocked hand must still be tracked.
+        row["sample"]["hand_locks"] = {"left": False, "right": True}
+        sources["left_hand_tracking"]["fresh"] = False
+        self.assertIn("tracking_stale", training_frame_rejections(row, manifest["info"]))
+        # With both hands locked the headset time is still required.
+        sources["left_hand_tracking"]["fresh"] = True
+        row["sample"]["hand_locks"] = {"left": True, "right": True}
+        self.assertIn("tracking_stale", training_frame_rejections(row, manifest["info"]))
+
+    def test_a_locked_hand_out_of_view_without_headset_time_is_still_usable(self):
+        path, manifest, rows = self.episode(count=3)
+        for row in rows:
+            row["sample"]["sources"]["xr"] = {"received_monotonic_ns": 0, "age_ms": None, "fresh": False}
+            row["sample"]["sources"]["right_hand_tracking"] = {
+                "received_monotonic_ns": 0, "age_ms": None, "fresh": False}
+        self.write(path, manifest, rows)
+        stale = validate_episode(path)
+        self.assertEqual(stale["usable_following_frames"], 0)
+        for row in rows:
+            row["sample"]["hand_locks"] = {"left": False, "right": True}
+        self.write(path, manifest, rows)
+        locked = validate_episode(path)
+        self.assertEqual(locked["usable_following_frames"], 3)
+        self.assertEqual(locked["tracking_invalid_frames"], 0)
+
     def test_tracking_sources_share_the_150_ms_hand_input_limit(self):
         _, manifest, rows = self.episode(count=1)
         self.add_action_alignment(rows)
