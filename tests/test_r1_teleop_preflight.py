@@ -262,8 +262,16 @@ class CameraClockTest(unittest.TestCase):
     def test_recording_and_execution_launchers_require_the_camera_clock(self):
         teleop = Path(__file__).resolve().parents[1] / "teleop"
         needed = f'{REQUIRE_CAMERA_CLOCK_ENV}=1 bash "${{script_dir}}/run_r1_a7_vector.sh" --check-only'
-        for name in ("run_r1_a7_capture.sh", "run_r1_a7_policy.sh"):
-            self.assertIn(needed, (teleop / name).read_text(), name)
+        self.assertIn(needed, (teleop / "run_r1_a7_capture.sh").read_text())
+        # Since #14 the policy launcher runs the preflight itself (left O6 + right Dex1),
+        # only when --execute is given. It must still demand a valid camera clock, and the
+        # check must come before the policy starts.
+        policy = (teleop / "run_r1_a7_policy.sh").read_text()
+        start = policy.index('"--execute" ]]')
+        execute_branch = policy[start:policy.index("\ndone", start)]
+        self.assertIn(f"{REQUIRE_CAMERA_CLOCK_ENV}=1", execute_branch)
+        self.assertIn('tools/check_r1_teleop.py"', execute_branch)
+        self.assertLess(policy.index("check_r1_teleop.py"), policy.rindex("run_r1_act_policy.py"))
         self.assertNotIn(REQUIRE_CAMERA_CLOCK_ENV, (teleop / "run_r1_a7_vector.sh").read_text())
 
 
