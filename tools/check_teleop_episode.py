@@ -256,6 +256,27 @@ def sample_interval_limit_ns(frequency, sequence, previous_sequence):
     return periods * 1e9 / frequency
 
 
+def lock_exempt_sources(hand_locks, sources):
+    """Tracking sources that a hand lock exempts from the freshness checks of one frame.
+
+    A locked hand ([ or ]) holds its pose, so its own tracking may lapse. When that hand
+    leaves the headset's view, the headset also drops the whole-frame time, so capture
+    records `xr` with no timestamp and fresh=False even though the other hand is tracked.
+    On 2026-11-19 that rejected 1345 frames in 6 successful episodes. So `xr` is exempt
+    too when every unlocked hand's own tracking source is fresh; those sources are still
+    checked as usual. With both hands locked, `xr` is still required.
+    """
+    hand_locks = hand_locks if isinstance(hand_locks, dict) else {}
+    sources = sources if isinstance(sources, dict) else {}
+    locked = [side for side in ("left", "right") if hand_locks.get(side) is True]
+    unlocked = [side for side in ("left", "right") if hand_locks.get(side) is not True]
+    exempt = {f"{side}_hand_tracking" for side in locked}
+    if locked and unlocked and all(
+            isinstance(sources.get(f"{side}_hand_tracking"), dict)
+            and sources[f"{side}_hand_tracking"].get("fresh") is True for side in unlocked):
+        exempt.add("xr")
+    return exempt
+
 def training_frame_rejections(frame, info):
     """Vision/joint BC policy. IMU validity and IMU packet gaps are not inputs."""
     if end_effectors(info) is None:
@@ -279,9 +300,11 @@ def training_frame_rejections(frame, info):
                      for side in ("left", "right"))):
             reasons.append("actions_unaligned")
     sources = sample.get("sources") or {}
-    # A hand the operator locked ([ or ]) is commanded to hold, so its own tracking may
-    # lapse without making the frame's action stale.
+    # A hand the operator locked ([ or ]) is commanded to hold, so its own tracking (and the
+    # headset's whole-frame time while it is out of view) may lapse without making the
+    # frame's action stale; see lock_exempt_sources.
     hand_locks = sample.get("hand_locks") if isinstance(sample.get("hand_locks"), dict) else {}
+    lock_exempt = lock_exempt_sources(hand_locks, sources)
     # A gripper waiting for pickup after an unlock keeps an old finger input on purpose,
     # but its arm follows again, so it is exempt from the input-age check only.
     hand_input_held = sample.get("hand_input_held") if isinstance(sample.get("hand_input_held"), dict) else {}
@@ -291,7 +314,7 @@ def training_frame_rejections(frame, info):
         (("image", "left_wrist_image", "right_wrist_image"), 500, "image_stale"),
     ):
         for name in names:
-            if name.endswith("_hand_tracking") and hand_locks.get(name[:-len("_hand_tracking")]) is True:
+            if name in lock_exempt:
                 continue
             entry = sources.get(name) or {}
             stamp = entry.get("received_monotonic_ns")
@@ -1023,9 +1046,10 @@ def validate_episode(path, min_segment_frames=DEFAULT_MIN_SEGMENT_FRAMES):
             elif color_specs and any(key in color_specs for key in ("color_2", "color_3")):
                 error(f"{label}.sample.camera_alignment: missing for a multi-camera sample")
             hand_locks = sample.get("hand_locks") if isinstance(sample.get("hand_locks"), dict) else {}
+            lock_exempt = lock_exempt_sources(hand_locks, source_data)
             report["tracking_invalid_frames"] += any(
                 (not isinstance(source_data.get(name), dict) or source_data[name].get("fresh") is not True)
-                and not (name.endswith("_hand_tracking") and hand_locks.get(name[:-len("_hand_tracking")]) is True)
+                and name not in lock_exempt
                 for name in tracking)
             commands_active = True
             if require_r1_commands:
@@ -1045,11 +1069,11 @@ def validate_episode(path, min_segment_frames=DEFAULT_MIN_SEGMENT_FRAMES):
                     for command in (left_published, right_published)
                 )
                 report["command_inactive_frames"] += not commands_active
-            # A locked hand's own tracking may lapse (see training_frame_rejections).
+            # A locked hand's own tracking may lapse (see lock_exempt_sources).
             following = commands_active and mode == "following" and all(
                 isinstance(source_data.get(name), dict) and source_data[name].get("fresh") is True
                 for name in required_sources
-                if not (name.endswith("_hand_tracking") and hand_locks.get(name[:-len("_hand_tracking")]) is True))
+                if name not in lock_exempt)
             tf = sample.get("tf")
             tf_metadata = info.get("tf")
             if tf is not None or tf_metadata is not None:
