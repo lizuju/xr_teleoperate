@@ -26,6 +26,7 @@ from teleop.robot_control.r1_hand_tracking import (
 )
 from teleop.robot_control.r1_wrist_workspace import R1WristWorkspace
 from teleop.robot_control.r1_hand_lock import HAND_LOCK_KEYS, R1HandLocks
+from teleop.robot_control.r1_head_lock import HEAD_LOCK_KEYS, R1HeadLock
 from teleop.utils.gc_tuning import freeze_startup_heap
 from sshkeyboard import listen_keyboard, stop_listening
 
@@ -54,6 +55,9 @@ WAIST_TURN_REQUEST = None
 # Operator locks: [ holds the left arm and its O6, ] the right arm and its hand; press
 # again to release. Read by the control loop and the hand loop.
 HAND_LOCKS = R1HandLocks()
+# Operator head lock: h holds the robot head's pitch/yaw target whatever the operator's
+# head does; h again lets it follow again, easing over at a limited speed.
+HEAD_LOCK = R1HeadLock()
 # After an unlock the Dex1-1 keeps its grip until the live pinch target is this close
 # to the held one (rad) or crosses it, so a relaxed hand does not drop the cup.
 DEX1_UNLOCK_PICKUP_RAD = 0.1
@@ -113,6 +117,9 @@ def on_press(key):
             if locked:
                 WAIST_TURN_REQUEST = None
         logger_mp.info(f"[R1 HAND LOCK] {side} arm and hand: {'lock' if locked else 'unlock'} requested.")
+    elif key in globals().get("HEAD_LOCK_KEYS", ()):
+        locked = globals()["HEAD_LOCK"].toggle()
+        logger_mp.info(f"[R1 HEAD LOCK] head: {'lock' if locked else 'unlock'} requested.")
     else:
         logger_mp.warning(f"[on_press] {key} was pressed, but no action is defined for this key.")
 
@@ -1320,6 +1327,7 @@ if __name__ == '__main__':
         logger_mp.info("----------------------------------------------------------------")
         if r1_a7_anchored:
             logger_mp.info("🟢  Press [r] once to prepare R1_A7; following starts automatically when both hands are stable.")
+            logger_mp.info("🔵  Press [h] to lock or unlock the robot head; while locked it holds its angle.")
         else:
             logger_mp.info("🟢  Press [r] to start syncing the robot with your movements.")
         if args.record:
@@ -2243,6 +2251,12 @@ if __name__ == '__main__':
                 if r1_frozen_generation != pause_generation:
                     hold_r1_published_targets(arm_ctrl)
                     r1_frozen_generation = pause_generation
+            # The tests run loop slices in their own namespace, so the lock is optional here.
+            head_lock = globals().get("HEAD_LOCK")
+            if head_lock is not None and run_motion and (args.waist_follow or r1_a7_anchored):
+                head_q_target = head_lock.apply(head_q_target, time.monotonic())
+                for message in head_lock.pop_events():
+                    logger_mp.info(message)
             if run_motion:
                 if args.waist_follow:
                     arm_ctrl.ctrl_dual_arm_and_head(
@@ -2276,6 +2290,8 @@ if __name__ == '__main__':
                 sol_q = np.array(held["arm_q"])
                 sol_tauff = np.array(held["arm_tau"])
                 head_q_target = np.array(held["head_q"])
+                if head_lock is not None:
+                    head_lock.observe(head_q_target, time.monotonic())
                 if r1_independent_hands:
                     left_wrist_target, right_wrist_target = (hold.target.copy() for hold in wrist_holds)
                 else:
@@ -2427,7 +2443,8 @@ if __name__ == '__main__':
                         tele_data, head_img, capture_mode,
                         {"left": left_wrist_img, "right": right_wrist_img},
                         hand_locks=dict(zip(("left", "right"), HAND_LOCKS.snapshot()))
-                        if r1_independent_hands else None))
+                        if r1_independent_hands else None,
+                        head_locked=head_lock.locked() if head_lock is not None else None))
             elif args.record:
                 # dex hand or gripper
                 if args.ee == "dex3" and args.input_mode == "hand":

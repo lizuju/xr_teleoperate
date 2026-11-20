@@ -305,7 +305,7 @@ class R1Capture:
                 return pairing, cutoff_ns
         return self.sync.pair(now), None
 
-    def frame(self, tele_data, image, mode, wrist_images=None, hand_locks=None):
+    def frame(self, tele_data, image, mode, wrist_images=None, hand_locks=None, head_locked=None):
         arm = self.arm.get_recording_snapshot()
         hand_sample = self.hand_loop.get_recording_sample()
         hand = hand_sample["hand"]
@@ -489,6 +489,8 @@ class R1Capture:
                 **({"hand_locks": {side: bool(hand_locks.get(side)) for side in ("left", "right")}}
                    if hand_locks is not None else {}),
                 **({"hand_input_held": hand_input_held} if hand_input_held is not None else {}),
+                # h holds the robot head on purpose; its commanded target is in the actions.
+                **({"head_lock": bool(head_locked)} if head_locked is not None else {}),
                 "camera_alignment": self.sync.alignment(pairing),
                 "imu": {"monotonic_ns": state["monotonic_ns"], "sequence": state["sequence"],
                         "tick": state["tick"], **state["imu"]},
