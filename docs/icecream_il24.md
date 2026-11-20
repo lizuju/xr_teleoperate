@@ -149,6 +149,16 @@ annotations='/home/hnh/unitree_r1_dev/work/icecream-il24-20261116/reviewed_phase
   --execute --max-seconds 90 --img-server-ip 192.168.50.165
 ```
 
+从双臂垂下等离训练起点较远的姿态开始时，加 `--start-pose` 指向一条录制，让机器人先慢慢移到它的起始姿态：
+
+```bash
+./teleop/run_r1_a7_policy.sh /path/to/validated/best.pt \
+  --execute --start-pose "$R1_DEV_ROOT/teleop-recordings/icecream_dex1/<某条录制>" \
+  --max-seconds 90 --img-server-ip 192.168.50.165
+```
+
+第一次 `r` 以 `--start-speed`（默认 0.3 rad/s；腰最快 20°/s）把手臂、头、腰和手移到该录制第 `--start-frame` 帧（默认 0）的实测姿态并保持；第二次 `r` 再检查训练范围，然后开始策略。起始姿态超出训练范围，或移过去需要超过 `--max-start-approach-seconds`（默认 15 秒）时拒绝。
+
 - `r`：开始或从手动暂停恢复；先检查起始关节范围和首个目标差。
 - `p`：保持当前命令目标并暂停。
 - `n`：阶段模型人工确认下一阶段；基础模型无阶段切换。

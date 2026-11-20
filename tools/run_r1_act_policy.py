@@ -4,6 +4,9 @@
 Default is shadow mode: it reads feedback and cameras and logs what the policy would
 command, and never activates or publishes anything. Only --execute can move the robot,
 and only after r is pressed. q / Ctrl+C stop the program; they are not an e-stop.
+
+With --start-pose EPISODE, --execute first eases the robot to that recording's start pose
+(first r), holds it, and starts the policy only on the second r.
 """
 
 from __future__ import annotations
@@ -32,7 +35,9 @@ from teleop.utils.act_runtime import (ACTION_DIM, ActionEnsemble, GravityModel, 
 from teleop.utils.frame_sync import CameraSynchronizer
 from teleop.utils.act_contract import validate_contract
 from teleop.utils.icecream_task import IcecreamTask, PHASES
-from teleop.utils.r1_episode_replay import ReplayPose
+from teleop.utils.r1_episode_replay import (APPROACH_HAND_VEL, APPROACH_WAIST_VEL, ReplayError, ReplayPose,
+                                           approach_duration, approach_limits, build_approach_poses,
+                                           recorded_start_pose)
 
 DEV_ROOT = Path(os.environ.get("R1_DEV_ROOT", ROOT.parent))
 DEFAULT_WORKER_PYTHON = DEV_ROOT / ".venv-train/bin/python"
@@ -64,7 +69,20 @@ def parse_args(argv=None):
     parser.add_argument("--auto-stage", action="store_true", help="Use learned completion plus joint feedback; reviewed phase model required")
     parser.add_argument("--dispense-min-phase-seconds", type=float, default=3.0,
                         help="Minimum dispensing-phase duration; not a measured flow timer")
+    parser.add_argument("--start-pose", type=Path,
+                        help="Recorded episode whose start is where execution begins: with --execute the first r "
+                             "eases the robot there and holds it, the second r starts the policy")
+    parser.add_argument("--start-frame", type=int, default=0, help="Frame of --start-pose to use (default the first)")
+    parser.add_argument("--start-speed", type=float, default=0.3, help="Arm and head speed of the start-pose approach (rad/s)")
+    parser.add_argument("--max-start-approach-seconds", type=float, default=15.0,
+                        help="Refuse a start-pose approach that would take longer than this")
     args = parser.parse_args(argv)
+    if not (math.isfinite(args.start_speed) and 0.0 < args.start_speed <= 1.0):
+        parser.error("--start-speed must be in (0, 1] rad/s")
+    if args.start_frame < 0:
+        parser.error("--start-frame must be nonnegative")
+    if not (math.isfinite(args.max_start_approach_seconds) and args.max_start_approach_seconds > 0.0):
+        parser.error("--max-start-approach-seconds must be positive")
     for key in ("max_seconds", "max_chunk_age", "max_tracking_error"):
         if not math.isfinite(getattr(args,key)) or getattr(args,key) <= 0:
             parser.error(f"{key} must be finite and positive")
@@ -201,6 +219,29 @@ def blended(start, target, alpha):
     return start + min(max(alpha, 0.0), 1.0) * (target - start)
 
 
+def ease_to_start(arm, hand, target, args, period, stop):
+    """Ease the activated robot from its live pose to a recorded start pose.
+
+    Arm and head move at no more than --start-speed and the waist no faster than the replay
+    approach. Returns the pose to hold, or None if q stopped the move.
+    """
+    live = current_pose(arm, hand)
+    limits = approach_limits(arm=args.start_speed, head=args.start_speed,
+                             waist=min(APPROACH_WAIST_VEL, args.start_speed), hand=APPROACH_HAND_VEL)
+    seconds, deltas = approach_duration(live, target, limits=limits, min_seconds=2.0,
+                                        max_seconds=args.max_start_approach_seconds)
+    print(f"[POLICY] easing to the recorded start pose over {seconds:.1f}s (arm {deltas['arm']:.3f} rad, "
+          f"head {deltas['head']:.3f} rad, waist {deltas['waist']:.3f} rad). "
+          "Hardware e-stop is the robot button.", flush=True)
+    for pose in build_approach_poses(live, target, seconds, hz=1.0 / period):
+        if stop[0]:
+            print("[POLICY] start-pose approach stopped.", flush=True)
+            return None
+        send_pose(arm, hand, pose)
+        time.sleep(period)
+    return target
+
+
 def execute_loop(run, arm, hand, guard, gravity, period, stop, args, initial_hold=None, blend=True):
     """Commands the robot until q, the time limit, or a guard trip. Returns the pose to hold."""
     live = current_pose(arm, hand)
@@ -329,6 +370,12 @@ def main(argv=None):
             "started_at": time.time(), "args": {k: str(v) if isinstance(v, Path) else v for k,v in vars(args).items()},
         }, indent=2, ensure_ascii=False) + "\n")
         check_policy_metadata(meta)
+        start_target = None
+        if args.start_pose is not None:
+            start_target, start_sides = recorded_start_pose(args.start_pose, args.start_frame)
+            if start_sides != meta["dataset"].get("end_effectors"):
+                raise ValueError(f"--start-pose was recorded with {start_sides}, "
+                                 f"but the policy drives {meta['dataset'].get('end_effectors')}")
         if args.auto_stage and not meta.get("context_dim"):
             raise ValueError("--auto-stage requires a phase-conditioned model")
         fps = float(meta["dataset"]["fps"])
@@ -369,6 +416,15 @@ def main(argv=None):
         run.fps = fps
         if meta.get("context_dim"):
             run.task = IcecreamTask((gripper_low, gripper_high), args.auto_stage, args.dispense_min_phase_seconds)
+        if start_target is not None:
+            outside = guard.out_of_training_range(run.live_action(start_target))
+            if outside:
+                names = [meta["dataset"]["joint_names"][index] for index in outside]
+                print(f"[POLICY] refusing --start-pose: it is outside the training range at {names}", flush=True)
+                return 2
+            away = float(np.abs(start_target.arm_q - current_pose(arm, hand).arm_q).max())
+            print(f"[POLICY] start pose: {args.start_pose} frame {args.start_frame}; "
+                  f"the arm is {away:.3f} rad away from it now.", flush=True)
         stop = [False]
         started = threading.Event()
         if sys.stdin.isatty():
@@ -397,6 +453,9 @@ def main(argv=None):
         if listener is None:
             print("[POLICY] --execute needs a terminal for r and q.", file=sys.stderr)
             return 2
+        if start_target is not None:
+            print("[POLICY] --start-pose: the first r eases the robot to the recorded start pose and holds it; "
+                  "the second r starts the policy.", flush=True)
         print("[POLICY] previewing in shadow mode. r starts/resumes, p pauses, n confirms the next phase, q exits. "
               "Hardware e-stop is the robot button.", flush=True)
         run_shadow(run, period, stop, until=started.is_set)
@@ -404,7 +463,8 @@ def main(argv=None):
             return 0
         pose = current_pose(arm, hand)
         outside = guard.out_of_training_range(run.live_action(pose))
-        if outside and not args.allow_out_of_range_start:
+        # With --start-pose the live pose is checked once the robot is held at the start pose.
+        if outside and start_target is None and not args.allow_out_of_range_start:
             names = [meta["dataset"]["joint_names"][index] for index in outside]
             print(f"[POLICY] refusing to start: live pose is outside the training range at {names}", flush=True)
             return 2
@@ -425,6 +485,29 @@ def main(argv=None):
         arm.start_publishing()
         gravity = GravityModel()
         last, blend_next = None, True
+        if start_target is not None:
+            try:
+                last = ease_to_start(arm, hand, start_target, args, period, stop)
+            except ReplayError as exc:
+                print(f"[POLICY] not moving to the start pose: {exc}", flush=True)
+                hold_until_quit(arm, hand, current_pose(arm, hand), stop)
+                return 2
+            if last is None:
+                return 0
+            started.clear()
+            print("[POLICY] holding the recorded start pose. r starts the policy; q exits (not an e-stop).", flush=True)
+            while not started.is_set() and not stop[0]:
+                send_pose(arm, hand, last)
+                arm.hold_targets()
+                time.sleep(period)
+            if stop[0]:
+                return 0
+            outside = guard.out_of_training_range(run.live_action(current_pose(arm, hand)))
+            if outside and not args.allow_out_of_range_start:
+                names = [meta["dataset"]["joint_names"][index] for index in outside]
+                print(f"[POLICY] refusing to start: the held pose is outside the training range at {names}", flush=True)
+                hold_until_quit(arm, hand, last, stop)
+                return 2
         while not stop[0]:
             started.clear()
             last = execute_loop(run, arm, hand, guard, gravity, period, stop, args, last, blend_next)

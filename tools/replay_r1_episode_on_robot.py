@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Replay a recorded R1_A7 + Linker O6 episode onto the real robot.
+"""Replay a recorded R1_A7 episode onto the real robot: two Linker O6 hands, or a left O6
+with a right Dex1-1 gripper (lowcmd slot, as recorded).
 
 By default this only validates the episode and prints a plan. It does not
 send motion until you run without --check-only and then press r. q / Ctrl+C
@@ -197,6 +198,18 @@ def hold_until_quit(arm_ctrl, hand_ctrl, pose, stop):
         time.sleep(1.0 / CONTROL_HZ)
 
 
+def make_hand_controller(arm_ctrl, plan):
+    """The hand controller for the episode's hands: two O6, or a left O6 with a right Dex1-1."""
+    from teleop.robot_control.robot_hand_linker_o6 import LinkerO6Controller
+    if plan.end_effectors.get("right") != "dex1_1":
+        return LinkerO6Controller()
+    from teleop.robot_control.robot_hand_dex1_r1 import Dex1LowCmdGripper, O6Dex1Hands
+    settings, limits = plan.dex1_settings, plan.gripper_limits
+    return O6Dex1Hands(LinkerO6Controller(sides=("left",)), Dex1LowCmdGripper(
+        arm_ctrl, slot=settings["slot"], kp=settings["kp"], kd=settings["kd"],
+        grip_delta=settings["grip_delta"], closed_q=limits["min_q"], open_q=limits["max_q"]))
+
+
 def run_robot(args, plan):
     speed = validate_speed(args.speed)
     pids = teleop_pids()
@@ -218,7 +231,7 @@ def run_robot(args, plan):
         target_velocity_limit=args.arm_target_velocity_limit,
         target_accel_limit=args.arm_target_accel_limit,
     )
-    hand_ctrl = LinkerO6Controller()
+    hand_ctrl = make_hand_controller(arm_ctrl, plan)
     stop = [False]
     started = threading.Event()
     listener, tty_snapshot = start_keyboard(stop, started)

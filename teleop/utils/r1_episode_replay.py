@@ -1,4 +1,7 @@
-"""Load published R1/O6 commands from an xr_teleop_episode_v2 recording.
+"""Load published R1 arm and hand commands from an xr_teleop_episode_v2 recording.
+
+Hands are two Linker O6 (the original setup) or a left O6 with a right Dex1-1 gripper on
+lowcmd (since 2026-11-09); the Dex1-1 command is one joint angle in rad.
 
 This module never talks to DDS, IK, cameras, or the robot. It turns
 ``frames.jsonl`` into time-stamped joint waypoints so a separate runner can
@@ -20,6 +23,11 @@ SCHEMA = "xr_teleop_episode_v2"
 ARM_DOF = 14
 HEAD_DOF = 2
 HAND_DOF = 6
+DEX1_DOF = 1
+# A recorded gripper command may sit this far (rad) outside its recorded range before it is refused.
+DEX1_RANGE_TOLERANCE = 0.05
+TWO_O6 = {"left": "linker_o6", "right": "linker_o6"}
+O6_DEX1 = {"left": "linker_o6", "right": "dex1_1"}
 DEFAULT_APPROACH_HZ = 40.0
 MIN_APPROACH_S = 1.0
 DEFAULT_MAX_APPROACH_S = 8.0
@@ -77,6 +85,9 @@ class ReplayPlan:
     duration_s: float = 0.0
     max_gap_ms: float = 0.0
     warnings: list = field(default_factory=list)
+    end_effectors: dict = field(default_factory=lambda: dict(TWO_O6))
+    gripper_limits: dict = None   # {"min_q", "max_q"} in rad for a right Dex1-1
+    dex1_settings: dict = None    # slot, kp, kd, grip_delta recorded at launch
 
     @property
     def first(self):
@@ -118,7 +129,43 @@ def _mode(value, location):
     return int(value)
 
 
-def _published_pose(commands, location):
+def hand_layout(info):
+    """(end_effectors, gripper_limits, dex1_settings) of a recorded R1_A7 episode.
+
+    Two Linker O6, or a left O6 with a right Dex1-1 on lowcmd; anything else cannot be
+    replayed onto this robot.
+    """
+    info = info if isinstance(info, dict) else {}
+    refusal = "robot replay requires info.robot=R1_A7 with two Linker O6, or a left O6 and a right Dex1-1"
+    if info.get("robot") != "R1_A7":
+        raise ReplayError(refusal)
+    sides = info.get("end_effectors")
+    if sides == O6_DEX1:
+        limits = (info.get("gripper_position_limits") or {}).get("right") or {}
+        low = _finite_scalar(limits.get("min_q_rad"), "info.gripper_position_limits.right.min_q_rad")
+        high = _finite_scalar(limits.get("max_q_rad"), "info.gripper_position_limits.right.max_q_rad")
+        if not low < high:
+            raise ReplayError("info.gripper_position_limits.right: min_q_rad must be below max_q_rad")
+        launch = info.get("launch_arguments") if isinstance(info.get("launch_arguments"), dict) else {}
+        if launch.get("dex1_transport", "lowcmd") != "lowcmd":
+            raise ReplayError("Dex1-1 replay supports only the lowcmd transport")
+        settings = {"slot": int(launch.get("dex1_slot", 33)), "kp": float(launch.get("dex1_kp", 5.0)),
+                    "kd": float(launch.get("dex1_kd", 0.05)), "grip_delta": float(launch.get("dex1_grip_delta", 0.5))}
+        return dict(O6_DEX1), {"min_q": low, "max_q": high}, settings
+    if info.get("end_effector") == "linker_o6" and sides in (None, TWO_O6):
+        return dict(TWO_O6), None, None
+    raise ReplayError(refusal)
+
+
+def _dex1_q(value, limits, location):
+    q = _finite_vector(value, DEX1_DOF, location)
+    if q[0] < limits["min_q"] - DEX1_RANGE_TOLERANCE or q[0] > limits["max_q"] + DEX1_RANGE_TOLERANCE:
+        raise ReplayError(f"{location}: {q[0]:.3f} rad is outside the recorded gripper range "
+                          f"[{limits['min_q']:.3f}, {limits['max_q']:.3f}]")
+    return np.clip(q, limits["min_q"], limits["max_q"])
+
+
+def _published_pose(commands, location, gripper_limits=None):
     if not isinstance(commands, dict):
         return None
     arm = commands.get("arm")
@@ -134,18 +181,22 @@ def _published_pose(commands, location):
     if not isinstance(left, dict) or not isinstance(right, dict):
         return None
     left_q = _finite_vector(left.get("q"), HAND_DOF, f"{location}.hands.left.q")
-    right_q = _finite_vector(right.get("q"), HAND_DOF, f"{location}.hands.right.q")
     if np.any(left_q < -1e-6) or np.any(left_q > 1.0 + 1e-6):
         raise ReplayError(f"{location}.hands.left.q: expected values in [0, 1]")
-    if np.any(right_q < -1e-6) or np.any(right_q > 1.0 + 1e-6):
-        raise ReplayError(f"{location}.hands.right.q: expected values in [0, 1]")
+    if gripper_limits is None:
+        right_q = _finite_vector(right.get("q"), HAND_DOF, f"{location}.hands.right.q")
+        if np.any(right_q < -1e-6) or np.any(right_q > 1.0 + 1e-6):
+            raise ReplayError(f"{location}.hands.right.q: expected values in [0, 1]")
+        right_q = np.clip(right_q, 0.0, 1.0)
+    else:
+        right_q = _dex1_q(right.get("q"), gripper_limits, f"{location}.hands.right.q")
     return ReplayPose(
         arm_q=_finite_vector(published_arm.get("arm_q"), ARM_DOF, f"{location}.arm_q"),
         arm_tau=_finite_vector(published_arm.get("arm_tau"), ARM_DOF, f"{location}.arm_tau"),
         head_q=_finite_vector(published_arm.get("head_q"), HEAD_DOF, f"{location}.head_q"),
         waist_q=_finite_scalar(published_arm.get("waist_q"), f"{location}.waist_q"),
         left_q=np.clip(left_q, 0.0, 1.0),
-        right_q=np.clip(right_q, 0.0, 1.0),
+        right_q=right_q,
         left_mode=_mode(left.get("mode"), f"{location}.hands.left.mode"),
         right_mode=_mode(right.get("mode"), f"{location}.hands.right.mode"),
     )
@@ -175,8 +226,7 @@ def load_replay_plan(path):
     if outcome == "discarded":
         raise ReplayError("episode outcome is discarded")
     info = manifest.get("info") if isinstance(manifest.get("info"), dict) else {}
-    if info.get("robot") != "R1_A7" or info.get("end_effector") != "linker_o6":
-        raise ReplayError("robot replay requires info.robot=R1_A7 and end_effector=linker_o6")
+    end_effectors, gripper_limits, dex1_settings = hand_layout(info)
 
     waypoints = []
     skipped_leading = 0
@@ -209,7 +259,7 @@ def load_replay_plan(path):
             if previous_ns is not None:
                 max_gap_ms = max(max_gap_ms, (monotonic_ns - previous_ns) / 1e6)
             location = f"frame {frame.get('idx', line_number - 1)}"
-            pose = _published_pose(sample.get("commands"), location)
+            pose = _published_pose(sample.get("commands"), location, gripper_limits)
             if pose is None:
                 if previous is None:
                     skipped_leading += 1
@@ -254,6 +304,9 @@ def load_replay_plan(path):
         duration_s=duration_s,
         max_gap_ms=max_gap_ms,
         warnings=warnings,
+        end_effectors=end_effectors,
+        gripper_limits=gripper_limits,
+        dex1_settings=dex1_settings,
     )
 
 
@@ -377,5 +430,61 @@ def plan_summary(plan):
         "first_waist_q": first.waist_q,
         "last_waist_q": last.waist_q,
         "warnings": list(plan.warnings),
+        "end_effectors": dict(plan.end_effectors),
         "sends_robot_commands": False,
     }
+
+
+def recorded_start_pose(path, frame=0):
+    """Measured pose of one recorded frame (default the first), for easing the robot there.
+
+    Returns (pose, end_effectors); the hand modes are 1 so the hands follow the target.
+    Unlike the replay plan this reads ``states`` (where the robot was), not commands.
+    """
+    if type(frame) is not int or frame < 0:
+        raise ReplayError("start frame must be a non-negative integer")
+    directory = episode_directory(path)
+    try:
+        manifest = json.loads((directory / "episode.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ReplayError(f"episode.json: {exc}") from exc
+    info = manifest.get("info") if isinstance(manifest, dict) and isinstance(manifest.get("info"), dict) else {}
+    end_effectors, gripper_limits, _ = hand_layout(info)
+    line = None
+    try:
+        with (directory / "frames.jsonl").open(encoding="utf-8") as stream:
+            for index, text in enumerate(stream):
+                if index == frame:
+                    line = text
+                    break
+        states = json.loads(line).get("states") if line is not None else None
+    except (OSError, ValueError, AttributeError) as exc:
+        raise ReplayError(f"frames.jsonl: {exc}") from exc
+    if line is None:
+        raise ReplayError(f"episode has no frame {frame}")
+    if not isinstance(states, dict):
+        raise ReplayError(f"frame {frame}: missing states")
+
+    def qpos(group, length):
+        value = states.get(group)
+        return _finite_vector(value.get("qpos") if isinstance(value, dict) else None, length,
+                              f"frame {frame}.states.{group}.qpos")
+
+    body = qpos("body", 3)  # waist_yaw, head_pitch, head_yaw
+    if gripper_limits is None:
+        right_q = np.clip(qpos("right_ee", HAND_DOF), 0.0, 1.0)
+    else:
+        right = states.get("right_ee")
+        right_q = _dex1_q(right.get("qpos") if isinstance(right, dict) else None, gripper_limits,
+                          f"frame {frame}.states.right_ee.qpos")
+    pose = ReplayPose(
+        arm_q=np.concatenate([qpos("left_arm", 7), qpos("right_arm", 7)]),
+        arm_tau=np.zeros(ARM_DOF, dtype=np.float64),
+        head_q=np.array(body[1:3], dtype=np.float64),
+        waist_q=float(body[0]),
+        left_q=np.clip(qpos("left_ee", HAND_DOF), 0.0, 1.0),
+        right_q=right_q,
+        left_mode=1,
+        right_mode=1,
+    )
+    return pose, end_effectors
