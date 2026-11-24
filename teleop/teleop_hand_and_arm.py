@@ -2065,9 +2065,18 @@ if __name__ == '__main__':
                             args, actual_waist_yaw, time.monotonic(),
                             turn_origin=r1_waist_yaw_reference,
                         )
+                    # The rotation that carries the operator's wrist motion into the frame of the
+                    # robot reference. In torso mode televuer gives the wrist relative to the
+                    # operator's own torso and the reference stays in the fixed-waist IK frame, so
+                    # it is the activation angle, as at activation, however far the waist has turned
+                    # since. Using the live waist here rotated every motion by that turn: after the
+                    # 2026-11-24 takeover at -88 deg the arm moved 91 deg off the operator's direction.
+                    # world mode re-takes the head-yaw reference below, which faces the live waist.
+                    torso_mapping = args.waist_follow and getattr(args, "waist_follow_compensation", "torso") == 'torso'
+                    mapping_yaw = r1_waist_yaw_reference if torso_mapping else actual_waist_yaw
                     r1_waist_to_root = np.array([
-                        [math.cos(actual_waist_yaw), -math.sin(actual_waist_yaw), 0.0],
-                        [math.sin(actual_waist_yaw), math.cos(actual_waist_yaw), 0.0],
+                        [math.cos(mapping_yaw), -math.sin(mapping_yaw), 0.0],
+                        [math.sin(mapping_yaw), math.cos(mapping_yaw), 0.0],
                         [0.0, 0.0, 1.0],
                     ])
                     r1_vision_left_reference = tele_data.left_wrist_pose.copy()
