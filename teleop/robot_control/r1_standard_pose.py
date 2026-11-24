@@ -47,6 +47,26 @@ def load_standard_pose(path):
     return pose
 
 
+def standard_start_pose(path):
+    """The standard pose as a policy start (run_r1_act_policy.py --start-pose): (ReplayPose, end_effectors).
+
+    Arms and head come from the file, the waist sits on its 0 stop, and the hands go to the
+    file's mean recorded start. As with a recorded start, arm_tau is zero and the hand modes are 1.
+    """
+    from teleop.utils.r1_episode_replay import O6_DEX1, ReplayPose
+
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    pose = load_standard_pose(path)
+    if data.get("end_effectors") != O6_DEX1:
+        raise ValueError(f"a policy start needs end_effectors {O6_DEX1} in the standard pose file")
+    left = _vector(data.get("left_hand_q"), 6, "left_hand_q")
+    right = _vector(data.get("right_hand_q"), 1, "right_hand_q")
+    if np.any(left < 0.0) or np.any(left > 1.0):
+        raise ValueError("left_hand_q must be within 0..1")
+    return ReplayPose(arm_q=pose["arm_q"], arm_tau=np.zeros(14), head_q=pose["head_q"], waist_q=0.0,
+                      left_q=left, right_q=right, left_mode=1, right_mode=1), dict(O6_DEX1)
+
+
 def arm_gravity(arm_ik):
     """Gravity torque for an arm_q, from the IK's reduced model (as the IK's own feedforward)."""
     import pinocchio as pin

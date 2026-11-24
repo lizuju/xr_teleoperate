@@ -1,5 +1,5 @@
 {
-  "description": "Standard start pose for ice-cream teleop recordings (o key): the mean commanded frame-0 arm and head pose of the 46 full-task train recordings of split-run2.json, the training set of icecream_act24_71_320x384_pause4 (round 2). The waist goes to the activation heading (the 0 deg stop).",
+  "description": "Standard start pose for ice-cream teleop recordings (o key): the mean commanded frame-0 arm and head pose of the 46 full-task train recordings of split-run2.json, the training set of icecream_act24_71_320x384_pause4 (round 2). The waist goes to the activation heading (the 0 deg stop). left_hand_q and right_hand_q are the mean measured frame-0 O6 and Dex1-1 positions of the same starts; teleop o leaves the hands to the operator, a policy --start-pose eases them there.",
   "created": "2026-11-23",
   "source": {
     "split": "autodl/icecream52-20261119/split-run2.json",
@@ -58,5 +58,20 @@
   "head_q": [
     0.1074,
     -0.0337
+  ],
+  "end_effectors": {
+    "left": "linker_o6",
+    "right": "dex1_1"
+  },
+  "left_hand_q": [
+    0.633,
+    0.344,
+    0.253,
+    0.318,
+    0.358,
+    0.38
+  ],
+  "right_hand_q": [
+    5.33
   ]
 }

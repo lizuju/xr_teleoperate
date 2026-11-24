@@ -6,7 +6,9 @@ command, and never activates or publishes anything. Only --execute can move the 
 and only after r is pressed. q / Ctrl+C stop the program; they are not an e-stop.
 
 With --start-pose EPISODE, --execute first eases the robot to that recording's start pose
-(first r), holds it, and starts the policy only on the second r.
+(first r), holds it, and starts the policy only on the second r. --start-pose standard (or a
+standard pose .json) uses the teleop o-key start pose instead, so policy runs and new
+recordings start from the same place.
 """
 
 from __future__ import annotations
@@ -30,6 +32,7 @@ for path in (ROOT, ROOT / "tools"):
 
 from replay_r1_episode_on_robot import (NETWORK_INTERFACE, current_pose, hold_until_quit, send_pose, shutdown,
                                         stop_keyboard, teleop_pids)
+from teleop.robot_control.r1_standard_pose import DEFAULT_POSE_PATH, standard_start_pose
 from teleop.utils.act_runtime import (ACTION_DIM, WAIST_INDEX, ActionEnsemble, GravityModel, ObservationBuilder,
                                       PolicyClient, PolicyGuard, WaistHold, group_errors, join_action, split_action,
                                       summarize)
@@ -71,8 +74,10 @@ def parse_args(argv=None):
     parser.add_argument("--dispense-min-phase-seconds", type=float, default=3.0,
                         help="Minimum dispensing-phase duration; not a measured flow timer")
     parser.add_argument("--start-pose", type=Path,
-                        help="Recorded episode whose start is where execution begins: with --execute the first r "
-                             "eases the robot there and holds it, the second r starts the policy")
+                        help="Where execution begins: a recorded episode (its --start-frame), or 'standard' / a "
+                             "standard pose .json (the teleop o-key pose: mean start of the round 2 demos, waist at "
+                             "0). With --execute the first r eases the robot there and holds it, the second r starts "
+                             "the policy")
     parser.add_argument("--start-frame", type=int, default=0, help="Frame of --start-pose to use (default the first)")
     parser.add_argument("--start-speed", type=float, default=0.3, help="Arm and head speed of the start-pose approach (rad/s)")
     parser.add_argument("--max-start-approach-seconds", type=float, default=15.0,
@@ -91,6 +96,10 @@ def parse_args(argv=None):
         parser.error("--start-speed must be in (0, 1] rad/s")
     if args.start_frame < 0:
         parser.error("--start-frame must be nonnegative")
+    if args.start_pose == Path("standard"):
+        args.start_pose = DEFAULT_POSE_PATH
+    if args.start_pose is not None and args.start_pose.suffix == ".json" and args.start_frame != 0:
+        parser.error("--start-frame applies to a recorded episode, not a standard pose file")
     if not (math.isfinite(args.max_start_approach_seconds) and args.max_start_approach_seconds > 0.0):
         parser.error("--max-start-approach-seconds must be positive")
     if not (math.isfinite(args.waist_snap_deg) and 0.0 <= args.waist_snap_deg < 45.0):
@@ -392,7 +401,10 @@ def main(argv=None):
         check_policy_metadata(meta)
         start_target = None
         if args.start_pose is not None:
-            start_target, start_sides = recorded_start_pose(args.start_pose, args.start_frame)
+            if args.start_pose.suffix == ".json":
+                start_target, start_sides = standard_start_pose(args.start_pose)
+            else:
+                start_target, start_sides = recorded_start_pose(args.start_pose, args.start_frame)
             if start_sides != meta["dataset"].get("end_effectors"):
                 raise ValueError(f"--start-pose was recorded with {start_sides}, "
                                  f"but the policy drives {meta['dataset'].get('end_effectors')}")
@@ -443,7 +455,8 @@ def main(argv=None):
                 print(f"[POLICY] refusing --start-pose: it is outside the training range at {names}", flush=True)
                 return 2
             away = float(np.abs(start_target.arm_q - current_pose(arm, hand).arm_q).max())
-            print(f"[POLICY] start pose: {args.start_pose} frame {args.start_frame}; "
+            where = args.start_pose if args.start_pose.suffix == ".json" else f"{args.start_pose} frame {args.start_frame}"
+            print(f"[POLICY] start pose: {where}; "
                   f"the arm is {away:.3f} rad away from it now.", flush=True)
         stop = [False]
         started = threading.Event()
