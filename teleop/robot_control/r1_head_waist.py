@@ -28,6 +28,22 @@ def compensate_wrist_for_waist(target, waist_actual, waist_reference):
     return result
 
 
+#: Number keys that turn the waist straight to a waist joint angle (absolute, not counted
+#: from the start heading), laid out left to right like the keyboard: 1 and 2 turn left
+#: (positive, the same way as the left arrow), 4 and 5 turn right (negative).
+#: The outer two stop 2 deg inside the +-150 deg URDF range: the arm controller stops teleop
+#: when the waist feedback passes 2.618 rad, so a goal on the limit itself would trip it on
+#: the smallest overshoot.
+WAIST_EDGE_ANGLE = math.radians(148.0)
+WAIST_ANGLE_KEYS = {
+    "1": WAIST_EDGE_ANGLE,
+    "2": math.pi / 2.0,
+    "3": 0.0,
+    "4": -math.pi / 2.0,
+    "5": -WAIST_EDGE_ANGLE,
+}
+
+
 class R1HeadWaistFollower:
     #: Residual yaw needed to start following, and how long it must hold. The residual
     #: is the head yaw the waist has not absorbed yet, not the raw head yaw.
@@ -199,6 +215,21 @@ class R1HeadWaistFollower:
         goal = self.next_turn_stop(direction)
         if goal is None:
             return None
+        return self._start_turn(direction, goal)
+
+    def command_turn_to(self, goal):
+        """Turn the waist straight to the joint angle goal (radians) at the turn limits.
+
+        For the number keys. Returns the goal. Like command_turn, a press during a turn
+        retargets it from where the waist target is; a goal the waist target is already
+        on ends as reached on the next update.
+        """
+        goal = float(goal)
+        if not math.isfinite(goal) or abs(goal) > self.WAIST_LIMIT:
+            raise ValueError("goal must be a finite angle inside the waist range")
+        return self._start_turn(1 if goal >= self.waist_target else -1, goal)
+
+    def _start_turn(self, direction, goal):
         self._locked_waist_target = None
         self._turn = {
             "direction": direction, "goal": goal,
@@ -229,7 +260,13 @@ class R1HeadWaistFollower:
             -self.turn_acceleration * dt, self.turn_acceleration * dt,
         ))
         step = self._velocity * dt
-        reached = remaining == 0.0 or (step * remaining > 0.0 and abs(step) >= abs(remaining))
+        # Land only from a speed a planned approach ends at (at most about 1.2 accel steps).
+        # A number key can retarget a fast turn to a goal inside its braking distance;
+        # that turn passes the goal, slows, and comes back instead of stopping dead.
+        gentle = abs(self._velocity) <= 2.0 * self.turn_acceleration * dt
+        reached = gentle and (
+            remaining == 0.0 or (step * remaining > 0.0 and abs(step) >= abs(remaining))
+        )
         if reached:
             self.waist_target = goal
             self._velocity = 0.0

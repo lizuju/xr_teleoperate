@@ -20,7 +20,9 @@ sys.path.append(parent_dir)
 from teleop.utils.ipc import IPC_Server
 from teleop.utils.xr_record_gate import recording_blocked_by_tracking, tracking_diagnostics
 from teleop.utils.hand_torque_hud import publish_torque_hud
-from teleop.robot_control.r1_head_waist import R1HeadWaistFollower, compensate_wrist_for_waist
+from teleop.robot_control.r1_head_waist import (
+    WAIST_ANGLE_KEYS, R1HeadWaistFollower, compensate_wrist_for_waist,
+)
 from teleop.robot_control.r1_hand_tracking import (
     R1WristHold, hand_tracking_freshness, hand_tracking_present,
 )
@@ -127,7 +129,7 @@ def on_press(key):
             else:
                 logger_mp.info("[RECORD] Next episode requested; waiting for any previous save to finish.")
         RECORD_TOGGLE = True
-    elif key in ('left', 'right'):
+    elif key in ('left', 'right') or key in globals().get("WAIST_ANGLE_KEYS", ()):
         with WAIST_TURN_LOCK:
             WAIST_TURN_REQUEST = key
         logger_mp.info(f"[R1 WAIST TURN] {key} turn requested.")
@@ -198,7 +200,7 @@ def next_loop_tick(previous_tick, period, now):
     return tick
 
 def take_waist_turn_request():
-    """Return the pending arrow-key turn ('left' or 'right') once, or None."""
+    """Return the pending waist key ('left', 'right' or a WAIST_ANGLE_KEYS number) once, or None."""
     global WAIST_TURN_REQUEST
     with WAIST_TURN_LOCK:
         key, WAIST_TURN_REQUEST = WAIST_TURN_REQUEST, None
@@ -315,7 +317,11 @@ def waist_follower_from_args(args, waist_actual, now, turn_origin=None):
 
 
 def start_waist_turn(follower, key, args):
-    """Start an arrow-key turn to the next 90 deg stop and log it; return the goal or None."""
+    """Start a key turn and log it; return the goal or None.
+
+    An arrow goes to the next 90 deg stop on that side, a number key straight to its
+    waist joint angle (WAIST_ANGLE_KEYS).
+    """
     if getattr(args, "waist_follow_compensation", "torso") != "torso":
         logger_mp.warning(
             "[R1 WAIST TURN] %s ignored: world compensation would fold the arms through a 90 deg turn; "
@@ -323,6 +329,17 @@ def start_waist_turn(follower, key, args):
         )
         return None
     start = follower.waist_target
+    angles = globals().get("WAIST_ANGLE_KEYS", {})
+    if key in angles:
+        goal = follower.command_turn_to(angles[key])
+        logger_mp.info(
+            "[R1 WAIST TURN] %s: waist joint %.1f -> %.1f deg at up to %.0f deg/s.",
+            key, math.degrees(start), math.degrees(goal), math.degrees(follower.turn_velocity),
+        )
+        return goal
+    if key not in ("left", "right"):
+        logger_mp.warning("[R1 WAIST TURN] %s ignored: not a waist key.", key)
+        return None
     goal = follower.command_turn(1 if key == "left" else -1)
     if goal is None:
         logger_mp.warning(
@@ -342,11 +359,12 @@ def log_waist_turn_events(follower):
     for event in follower.pop_turn_events():
         goal = math.degrees(event["goal"] - follower.turn_origin)
         if event["event"] == "reached":
-            logger_mp.info("[R1 WAIST TURN] reached %.1f deg from the start heading.", goal)
+            logger_mp.info("[R1 WAIST TURN] reached %.1f deg from the start heading (waist joint %.1f deg).",
+                           goal, math.degrees(event["goal"]))
         else:
             logger_mp.warning(
                 "[R1 WAIST TURN] turn to %.1f deg stopped at %.1f deg (tracking lost, paused, or hand locked); "
-                "press the arrow again to continue.", goal, math.degrees(event["waist"] - follower.turn_origin),
+                "press the key again to continue.", goal, math.degrees(event["waist"] - follower.turn_origin),
             )
 
 
@@ -1740,7 +1758,9 @@ if __name__ == '__main__':
                         )
                     logger_mp.info(
                         "[R1 WAIST TURN] [left]/[right] arrow turns the waist to the next stop on that side "
-                        "(start heading or +/-90 deg) at up to %.0f deg/s; keep facing forward while it turns.",
+                        "(start heading or +/-90 deg); number keys turn it straight to a waist joint angle: "
+                        "[1] left 148, [2] left 90, [3] 0, [4] right 90, [5] right 148 deg. "
+                        "Up to %.0f deg/s; keep facing forward while it turns.",
                         math.degrees(waist_follower.turn_velocity),
                     )
                 if STOP:
@@ -2018,7 +2038,7 @@ if __name__ == '__main__':
                         if waist_follower is not None and waist_follower.turning:
                             logger_mp.warning(
                                 "[R1 WAIST TURN] the pause stopped the turn to %.1f deg at %.1f deg; "
-                                "press the arrow again to continue.",
+                                "press the key again to continue.",
                                 math.degrees(waist_follower.turn_goal - r1_waist_yaw_reference),
                                 math.degrees(actual_waist_yaw - r1_waist_yaw_reference),
                             )

@@ -1,4 +1,4 @@
-"""Arrow-key waist turns: stop placement, motion limits, and no turning back."""
+"""Arrow-key and number-key waist turns: stop placement, motion limits, and no turning back."""
 import ast
 import math
 from pathlib import Path
@@ -13,10 +13,11 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 MAIN_PATH = ROOT / "teleop" / "teleop_hand_and_arm.py"
 sys.path.insert(0, str(ROOT / "teleop" / "robot_control"))
-from r1_head_waist import R1HeadWaistFollower
+from r1_head_waist import WAIST_ANGLE_KEYS, WAIST_EDGE_ANGLE, R1HeadWaistFollower
 
 DT = 0.025
 QUARTER = math.pi / 2.0
+EDGE = math.radians(148.0)
 
 
 def head_pose(yaw):
@@ -222,6 +223,117 @@ class WaistTurnFollowerTest(unittest.TestCase):
             R1HeadWaistFollower(0.0, 0.0, turn_origin=float("nan"))
 
 
+class WaistAngleKeyTest(unittest.TestCase):
+    """Number keys 1-5: straight to a waist joint angle at the arrow-key turn limits."""
+
+    def accelerations(self, start, targets):
+        velocities = np.concatenate([[0.0], np.diff([start] + targets) / DT, [0.0]])
+        return np.abs(np.diff(velocities)) / DT
+
+    def test_keys_are_five_joint_angles_inside_the_urdf_range(self):
+        self.assertEqual(sorted(WAIST_ANGLE_KEYS), ["1", "2", "3", "4", "5"])
+        # Left to right like the keyboard: 1 is the far left, 5 the far right.
+        for key, angle in zip("12345", (EDGE, QUARTER, 0.0, -QUARTER, -EDGE)):
+            self.assertAlmostEqual(WAIST_ANGLE_KEYS[key], angle, places=12)
+        # Left keys turn the same way as the left arrow.
+        follower = R1HeadWaistFollower(0.0, 0.0)
+        self.assertAlmostEqual(follower.next_turn_stop(1), WAIST_ANGLE_KEYS["2"])
+        self.assertAlmostEqual(follower.next_turn_stop(-1), WAIST_ANGLE_KEYS["4"])
+        self.assertEqual(WAIST_EDGE_ANGLE, EDGE)
+        # The arm controller stops teleop on waist feedback past 2.618 rad: keep 2 deg for overshoot.
+        self.assertGreaterEqual(R1HeadWaistFollower.WAIST_LIMIT - EDGE, math.radians(1.99))
+
+    def test_number_key_goes_straight_to_its_joint_angle(self):
+        follower = R1HeadWaistFollower(0.05, 0.0)
+        robot = Robot(follower)
+        self.assertEqual(follower.command_turn_to(WAIST_ANGLE_KEYS["5"]), -EDGE)
+        seconds = robot.run_until_idle(limit=15.0)
+        self.assertEqual(follower.waist_target, -EDGE)
+        self.assertAlmostEqual(follower.heading_offset, -EDGE - 0.05)
+        self.assertEqual([event["event"] for event in robot.events], ["reached"])
+        # 151 deg at 30 deg/s with the 0.5 s ramps.
+        self.assertGreater(seconds, 5.3)
+        self.assertLess(seconds, 5.9)
+        self.assertGreaterEqual(min(robot.targets), -EDGE)
+        robot.run(3.0)
+        self.assertEqual(follower.waist_target, -EDGE)
+        self.assertFalse(follower.following)
+
+    def test_edge_to_edge_sweep_respects_the_turn_limits(self):
+        follower = R1HeadWaistFollower(-EDGE, 0.0, turn_origin=0.0)
+        robot = Robot(follower, lag=0.3)
+        follower.command_turn_to(WAIST_ANGLE_KEYS["1"])
+        seconds = robot.run_until_idle(limit=15.0)
+        self.assertEqual(follower.waist_target, EDGE)
+        self.assertGreater(seconds, 10.0)
+        self.assertLess(seconds, 10.8)
+        velocities = np.diff([-EDGE] + robot.targets) / DT
+        self.assertLessEqual(np.max(np.abs(velocities)), follower.turn_velocity + 1e-9)
+        self.assertLessEqual(np.max(self.accelerations(-EDGE, robot.targets)), follower.turn_acceleration * 1.0001)
+        self.assertLessEqual(max(robot.targets), EDGE)
+        self.assertGreaterEqual(min(robot.targets), -EDGE)
+
+    def test_retarget_just_ahead_of_a_fast_turn_does_not_stop_dead(self):
+        follower = R1HeadWaistFollower(-QUARTER, 0.0, turn_origin=0.0)
+        robot = Robot(follower)
+        follower.command_turn_to(WAIST_ANGLE_KEYS["1"])
+        while follower.waist_target < math.radians(87.0):
+            robot.run(DT)
+            self.assertLess(robot.now, 10.0)
+        self.assertAlmostEqual(follower._velocity, follower.turn_velocity, places=9)
+        # +90 is 3 deg ahead; stopping from 30 deg/s needs 7.5 deg.
+        follower.command_turn_to(WAIST_ANGLE_KEYS["2"])
+        robot.run_until_idle()
+        self.assertEqual(follower.waist_target, QUARTER)
+        # The old snap stopped it from 25 deg/s in one tick (16x the limit). The planned
+        # landing of the way back may end up to about 1.2 accel steps, like any approach.
+        self.assertLessEqual(np.max(self.accelerations(-QUARTER, robot.targets)), follower.turn_acceleration * 1.2)
+        # It passes +90 by about its braking distance and comes back; it never runs on to +148.
+        self.assertLess(max(robot.targets), QUARTER + math.radians(10.0))
+        self.assertEqual([event["event"] for event in robot.events], ["reached"])
+        robot.run(2.0)
+        self.assertEqual(follower.waist_target, QUARTER)
+
+    def test_number_key_on_the_current_angle_reports_reached(self):
+        follower = R1HeadWaistFollower(0.0, 0.0)
+        robot = Robot(follower)
+        self.assertEqual(follower.command_turn_to(WAIST_ANGLE_KEYS["3"]), 0.0)
+        robot.run(DT)
+        self.assertFalse(follower.turning)
+        self.assertEqual(follower.waist_target, 0.0)
+        self.assertEqual([event["event"] for event in robot.events], ["reached"])
+
+    def test_arrows_after_a_number_key_keep_the_start_heading_stops(self):
+        follower = R1HeadWaistFollower(0.0, 0.0)
+        robot = Robot(follower)
+        follower.command_turn_to(WAIST_ANGLE_KEYS["5"])
+        robot.run_until_idle(limit=15.0)
+        self.assertIsNone(follower.next_turn_stop(-1))  # -180 is outside the waist range
+        self.assertAlmostEqual(follower.next_turn_stop(1), -QUARTER)
+
+    def test_number_key_while_locked_holds_at_the_new_angle(self):
+        follower = R1HeadWaistFollower(0.0, 0.0)
+        follower.set_hand_locks((True, False), 0.0, 0.0)
+        robot = Robot(follower)
+        follower.command_turn_to(WAIST_ANGLE_KEYS["1"])
+        robot.run_until_idle(limit=15.0, head_yaw=0.7)
+        follower.reset(EDGE - 0.05, robot.now)
+        robot.run(2.0, head_yaw=0.7)
+        self.assertEqual(follower.waist_target, EDGE)
+
+    def test_goal_outside_the_range_is_refused(self):
+        follower = R1HeadWaistFollower(0.0, 0.0)
+        for goal in (float("nan"), 2.7, -2.7):
+            with self.assertRaises(ValueError):
+                follower.command_turn_to(goal)
+        self.assertFalse(follower.turning)
+
+    def test_policy_waist_hold_knows_the_number_key_angles(self):
+        from teleop.utils.act_runtime import WAIST_STOPS
+        for angle in WAIST_ANGLE_KEYS.values():
+            self.assertTrue(any(abs(stop - angle) < 1e-12 for stop in WAIST_STOPS), angle)
+
+
 class WaistHandLockTest(unittest.TestCase):
     def test_each_hand_locks_at_actual_angle_and_head_motion_does_not_change_it(self):
         for locks in ((True, False), (False, True)):
@@ -318,6 +430,7 @@ class WaistTurnTeleopTest(unittest.TestCase):
             "STOP": False, "RECORD_TOGGLE": False, "RECORD_OUTCOME": "unspecified",
             "RECORD_RUNNING": False, "RECORD_ENABLED": False, "DRY_RUN_MODE": False,
             "ARM_REQUEST_GENERATION": 0, "R1_A7_DEFERRED_REAL_MODE": False,
+            "WAIST_ANGLE_KEYS": WAIST_ANGLE_KEYS, "HAND_LOCK_KEYS": {},
         }
         module = ast.fix_missing_locations(ast.Module(body=nodes, type_ignores=[]))
         exec(compile(module, str(MAIN_PATH), "exec"), self.ns)
@@ -329,6 +442,38 @@ class WaistTurnTeleopTest(unittest.TestCase):
         self.ns["on_press"]("left")
         self.ns["on_press"]("right")
         self.assertEqual(self.ns["take_waist_turn_request"](), "right")
+
+    def test_number_keys_queue_like_arrows(self):
+        self.ns["on_press"]("1")
+        self.assertEqual(self.ns["take_waist_turn_request"](), "1")
+        self.ns["on_press"]("right")
+        self.ns["on_press"]("5")
+        self.assertEqual(self.ns["take_waist_turn_request"](), "5")
+        self.ns["on_press"]("6")
+        self.assertIsNone(self.ns["take_waist_turn_request"]())
+
+    def test_main_module_imports_the_number_key_angles(self):
+        tree = ast.parse(MAIN_PATH.read_text(encoding="utf-8"))
+        names = {alias.name for node in tree.body if isinstance(node, ast.ImportFrom)
+                 and node.module == "teleop.robot_control.r1_head_waist" for alias in node.names}
+        self.assertIn("WAIST_ANGLE_KEYS", names)
+
+    def test_start_turn_with_a_number_key_goes_to_its_joint_angle(self):
+        follower = R1HeadWaistFollower(0.1, 0.0)
+        torso = SimpleNamespace(waist_follow_compensation="torso")
+        self.assertAlmostEqual(self.ns["start_waist_turn"](follower, "1", torso), EDGE)
+        self.assertAlmostEqual(follower.turn_goal, EDGE)
+        self.assertIn("waist joint", self.logger.info.call_args.args[0])
+        world = SimpleNamespace(waist_follow_compensation="world")
+        other = R1HeadWaistFollower(0.0, 0.0)
+        self.assertIsNone(self.ns["start_waist_turn"](other, "1", world))
+        self.assertFalse(other.turning)
+
+    def test_unknown_key_reaching_start_turn_is_ignored(self):
+        follower = R1HeadWaistFollower(0.0, 0.0)
+        torso = SimpleNamespace(waist_follow_compensation="torso")
+        self.assertIsNone(self.ns["start_waist_turn"](follower, "7", torso))
+        self.assertFalse(follower.turning)
 
     def test_follower_from_args_uses_turn_settings_and_origin(self):
         args = SimpleNamespace(tracking_timeout=0.25, waist_turn_speed_deg=20.0, waist_turn_accel_deg=40.0)
@@ -401,6 +546,16 @@ class WaistTurnLoopTest(unittest.TestCase):
         follower = ns["waist_follower"]
         self.assertTrue(follower.turning)
         self.assertAlmostEqual(follower.turn_goal, 0.43 - QUARTER)
+        self.assertLess(follower.waist_target, 0.43)
+        self.assertEqual(self.turn_warnings(ns), [])
+
+    def test_number_key_starts_the_turn_in_the_control_loop(self):
+        ns = self.context("5")
+        ns["start_waist_turn"].__globals__["WAIST_ANGLE_KEYS"] = WAIST_ANGLE_KEYS
+        self.execute(self.case.control_nodes, ns, loop=True)
+        follower = ns["waist_follower"]
+        self.assertTrue(follower.turning)
+        self.assertAlmostEqual(follower.turn_goal, -EDGE)
         self.assertLess(follower.waist_target, 0.43)
         self.assertEqual(self.turn_warnings(ns), [])
 

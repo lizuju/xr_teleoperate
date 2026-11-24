@@ -83,7 +83,7 @@ def parse_args(argv=None):
     parser.add_argument("--max-start-approach-seconds", type=float, default=15.0,
                         help="Refuse a start-pose approach that would take longer than this")
     parser.add_argument("--waist-snap-deg", type=float, default=5.0,
-                        help="While the waist holds a teleop waist stop (0 or +-90 deg, as the arrow-key demos did), "
+                        help="While the waist holds a teleop waist stop (0, +-90 or +-148 deg, as the key-turn demos did), "
                              "command policy waist targets within this many degrees of it as exactly that stop. A "
                              "target further out ends the hold and passes unchanged, so turns start as the policy "
                              "begins them; the arm controller still slews the waist at its 40 deg/s limit. "
