@@ -5,16 +5,20 @@ import math
 from pathlib import Path
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock
 
 import numpy as np
 
 from teleop.robot_control.arm_target_shaper import ArmTargetShaper
+from teleop.robot_control.linker_o6_control_loop import LinkerO6ControlLoop
+from teleop.robot_control.r1_hand_lock import R1HandLocks
 from teleop.robot_control.r1_standard_pose import (
     DEFAULT_POSE_PATH, MAX_EXTRA_SECONDS, MIN_SECONDS, SETTLE_SECONDS, STANDARD_POSE_KEYS, R1StandardPose,
-    StandardPoseMove, load_standard_pose, standard_start_pose,
+    StandardPoseMove, load_standard_hands, load_standard_pose, standard_start_pose,
 )
+import test_linker_o6_control_loop as hand_fixture
 import test_r1_pause as pause_fixture
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -344,6 +348,194 @@ class LoopAndKeyTest(unittest.TestCase):
         self.state.pause()
         self.fixture.tick(1.0)
         self.assertGreaterEqual(self.ns["arm_ctrl"].hold_targets.call_count, 1)
+
+
+class FakeHands:
+    """A paired hand controller: the action is what it was last sent."""
+
+    def __init__(self, left, right):
+        self.actions = [np.asarray(left, dtype=float), np.asarray(right, dtype=float)]
+        self.updates = []
+
+    def get_action(self):
+        return tuple(action.copy() for action in self.actions)
+
+    def update(self, left, right, tracking_fresh=(True, True)):
+        self.actions = [np.asarray(left, dtype=float).copy(), np.asarray(right, dtype=float).copy()]
+        self.updates.append((self.get_action(), tracking_fresh))
+
+
+class StandardHandsTest(unittest.TestCase):
+    """With --policy, o also puts the hands on the file's recorded start (2026-11-24).
+
+    The first takeover began g with the Dex1-1 closed (4.28 rad) and the O6 half closed. The
+    policy spent 6 s opening the gripper and turned the waist 9 s later than in the standalone
+    runs, which start from these hands (--start-pose standard).
+    """
+
+    def setUp(self):
+        self.pose = {"arm_q": np.full(14, 0.5), "head_q": np.array([0.1, -0.03]), "source": "test"}
+        self.standard = (np.linspace(0.3, 0.6, 6), np.array([5.33]))
+        self.hand = FakeHands(np.full(6, 0.9), [4.28])
+        self.logger = Mock()
+
+    def control(self):
+        return R1StandardPose(self.pose, lambda q: GRAVITY.copy(), self.logger, hands=self.standard,
+                              hand_ctrl=self.hand)
+
+    def run_move(self, control, hand_locked=(False, False)):
+        arm = fake_arm(np.full(14, 0.2), [0.0, 0.0])
+        control.press()
+        now, driving = 1.0, []
+        while control.step(arm, 1, None, now, hand_locked=hand_locked):
+            driving.append(control.commanding_hands())
+            now += 0.025
+            self.assertLess(now, 30.0)
+        return driving
+
+    def test_the_shipped_hands_are_the_policy_start_hands(self):
+        left, right = load_standard_hands(DEFAULT_POSE_PATH)
+        pose, _ = standard_start_pose(DEFAULT_POSE_PATH)
+        np.testing.assert_array_equal(left, pose.left_q)
+        np.testing.assert_array_equal(right, pose.right_q)
+        self.assertTrue(5.0 < right[0] <= 5.4, "the demos start with the gripper open")
+
+    def test_bad_hand_files_are_refused(self):
+        good = json.loads(DEFAULT_POSE_PATH.read_text())
+        bad = [{k: v for k, v in good.items() if k != "right_hand_q"}, dict(good, left_hand_q=[0.3] * 5),
+               dict(good, left_hand_q=[-0.1] * 6), dict(good, end_effectors={"left": "linker_o6", "right": "linker_o6"})]
+        with tempfile.TemporaryDirectory() as directory:
+            for index, data in enumerate(bad):
+                path = Path(directory) / f"bad{index}.json"
+                path.write_text(json.dumps(data))
+                with self.assertRaises(ValueError, msg=index):
+                    load_standard_hands(path)
+
+    def test_o_moves_the_hands_from_where_they_are_to_the_standard_hands(self):
+        control = self.control()
+        driving = self.run_move(control)
+        first, last = self.hand.updates[0][0], self.hand.updates[-1][0]
+        np.testing.assert_allclose(first[0], np.full(6, 0.9))
+        np.testing.assert_allclose(first[1], [4.28])
+        np.testing.assert_allclose(last[0], self.standard[0])
+        np.testing.assert_allclose(last[1], self.standard[1])
+        self.assertTrue(all(fresh == (True, True) for _, fresh in self.hand.updates))
+        self.assertTrue(all(driving[:-1]), "the hand loop must stay out while the move drives the hands")
+        self.assertFalse(driving[-1], "the tick that arrives hands the hands back")
+        self.assertFalse(control.commanding_hands())
+        self.assertIn("hands 1.05", self.logger.info.call_args_list[0].args[0] % self.logger.info.call_args_list[0].args[1:])
+
+    def test_the_hands_can_set_the_pace(self):
+        move = StandardPoseMove(np.zeros(14), np.zeros(2), None, np.zeros(14), np.zeros(2), None, 0.0,
+                                start_hands=(np.zeros(6), [4.28]), hands=(np.zeros(6), [5.33]), hand_speed=0.3)
+        self.assertAlmostEqual(move.duration, 1.5 * 1.05 / 0.3)
+        times = np.linspace(0.0, move.duration, 2001)
+        grip = np.array([move.hands_at(t)[1][0] for t in times])
+        self.assertLessEqual(np.abs(np.diff(grip)).max() / (times[1] - times[0]), 0.3 * 1.001)
+        self.assertAlmostEqual(move.hands_at(move.duration)[1][0], 5.33)
+        default = StandardPoseMove(np.zeros(14), np.zeros(2), None, np.zeros(14), np.zeros(2), None, 0.0,
+                                   start_hands=(np.zeros(6), [4.28]), hands=(np.zeros(6), [5.33]))
+        self.assertEqual(default.duration, MIN_SECONDS)
+        self.assertIsNone(StandardPoseMove(np.zeros(14), np.zeros(2), None, np.zeros(14), np.zeros(2), None, 0.0)
+                          .hands_at(1.0))
+        with self.assertRaises(ValueError):
+            StandardPoseMove(np.zeros(14), np.zeros(2), None, np.zeros(14), np.zeros(2), None, 0.0,
+                             start_hands=(np.zeros(6), [4.28]))
+
+    def test_a_locked_hand_keeps_its_grip(self):
+        self.run_move(self.control(), hand_locked=(False, True))
+        for (left, right), _ in self.hand.updates:
+            np.testing.assert_allclose(right, [4.28])
+        np.testing.assert_allclose(self.hand.updates[-1][0][0], self.standard[0])
+
+    def test_o_again_hands_the_hands_back(self):
+        control = self.control()
+        arm = fake_arm(np.full(14, 0.2), [0.0, 0.0])
+        control.press()
+        self.assertTrue(control.step(arm, 1, None, 1.0))
+        self.assertTrue(control.commanding_hands())
+        control.press()
+        self.assertFalse(control.step(arm, 1, None, 1.1))
+        self.assertFalse(control.commanding_hands())
+
+    def test_without_policy_hands_o_leaves_the_hands_alone(self):
+        control = R1StandardPose(self.pose, lambda q: GRAVITY.copy(), self.logger)
+        self.assertFalse(any(self.run_move(control)))
+        self.assertEqual(self.hand.updates, [])
+        with self.assertRaises(ValueError):
+            R1StandardPose(self.pose, lambda q: GRAVITY.copy(), self.logger, hands=self.standard)
+
+
+class StandardHandsHandLoopTest(unittest.TestCase):
+    """The real hand loop yields during the o move, holds the standard hands, then hands over."""
+
+    def test_the_hand_loop_stays_out_then_holds_then_waits_for_the_operator(self):
+        controller = hand_fixture.FakeController()  # two 6-joint hands at 0
+        standard = (np.full(6, 0.5), np.full(6, 0.6))
+        control = R1StandardPose({"arm_q": np.full(14, 0.5), "head_q": np.zeros(2), "source": "test"},
+                                 lambda q: GRAVITY.copy(), Mock(), hands=standard, hand_ctrl=controller)
+        paused, log = [True], []
+        loop = LinkerO6ControlLoop(
+            hand_fixture.sample, SimpleNamespace(left=hand_fixture.FakeRetargeter(), right=hand_fixture.FakeRetargeter()),
+            controller, 30.0, 0.25, lambda: False, lambda state, action: None, should_pause=lambda: paused[0],
+            is_external=control.commanding_hands, takeover_tolerance=(0.2, 0.1), log=log.append,
+            external_label=lambda: "the standard pose" if control.commanding_hands() else "the policy's target")
+        arm = fake_arm(np.full(14, 0.2), np.zeros(2))
+        control.press()
+        loop.get_tele_data = Mock(side_effect=AssertionError("read XR while the o move drives the hands"))
+        now = 1.0
+        yielded = 0
+        while control.step(arm, 1, None, now):
+            if control.commanding_hands():
+                sent = len(controller.updates)
+                loop._step()
+                self.assertEqual(len(controller.updates), sent, "the hand loop sent during the o move")
+                yielded += 1
+            now += 0.025
+        self.assertGreater(yielded, 40)
+        loop._step()  # still paused: holds what the move left
+        np.testing.assert_allclose(controller.get_action()[0], standard[0])
+        np.testing.assert_allclose(controller.get_action()[1], standard[1])
+        paused[0] = False  # s or r: resume
+        loop.get_tele_data = lambda: hand_fixture.sample(value=0.2)
+        loop._step()
+        self.assertTrue(any("keeps the standard pose" in line for line in log), log)
+        np.testing.assert_allclose(controller.get_action()[0], standard[0])
+        loop.get_tele_data = lambda: hand_fixture.sample(value=0.45)
+        loop._step()
+        np.testing.assert_allclose(controller.get_action()[0], np.full(6, 0.45))
+        np.testing.assert_allclose(controller.get_action()[1], standard[1])
+
+
+class StandardHandsWiringTest(unittest.TestCase):
+    def test_teleop_moves_the_hands_only_with_policy_and_the_hand_loop_yields(self):
+        source = (ROOT / "teleop/teleop_hand_and_arm.py").read_text(encoding="utf-8")
+        self.assertIn("standard_hands = load_standard_hands(args.standard_pose) if args.policy is not None else None",
+                      source)
+        self.assertIn('globals()["STANDARD_POSE"].commanding_hands()),', source)
+        parse = source[source.index("args = parser.parse_args()"):source.index("if args.tracking_source == 'visionpro':")]
+        self.assertIn("if args.policy is not None:\n                load_standard_hands(args.standard_pose)", parse)
+
+    def test_the_loop_passes_the_hand_locks(self):
+        keys = LoopAndKeyTest()
+        keys.setUp()
+        hand = FakeHands(np.full(6, 0.9), [4.28])
+        keys.control = R1StandardPose(keys.pose, lambda q: GRAVITY.copy(), Mock(), hands=(np.full(6, 0.4), [5.33]),
+                                      hand_ctrl=hand)
+        locks = R1HandLocks()
+        locks.toggle("right")
+        keys.ns.update(STANDARD_POSE=keys.control, HAND_LOCKS=locks)
+        keys.ns["on_press"]("o")
+        now = 1.0
+        while True:
+            keys.fixture.tick(now)
+            if not keys.control.moving():
+                break
+            now += 0.1
+            self.assertLess(now, 20.0)
+        self.assertTrue(hand.updates)
+        np.testing.assert_allclose(hand.actions[0], np.full(6, 0.4))
+        np.testing.assert_allclose(hand.actions[1], [4.28])
 
 
 if __name__ == "__main__":
