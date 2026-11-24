@@ -8,9 +8,10 @@ without recording); following re-anchors there, at the operator's current hands,
 pause. The move runs in the control loop only while paused. o again, p, or an input-loss pause
 stops it where it is.
 
-With --policy (takeover), o also moves the hands to the file's recorded start hands, so o then g
-starts the policy from the same pose as run_r1_act_policy.py --start-pose standard. Without it the
-hands are left alone: they follow the operator's fingers again after the resume.
+On a left O6 + right Dex1-1 robot (the hands the file records), o also moves the hands to the
+file's recorded start hands, so every start is the same: a demo (o then s), a takeover (o then g)
+and run_r1_act_policy.py --start-pose standard. After the resume each hand stays on the standard
+pose until the operator's matches it.
 """
 import json
 import math
@@ -167,7 +168,7 @@ class R1StandardPose:
                  hands=None, hand_ctrl=None):
         self.pose, self.gravity, self.logger = pose, gravity, logger
         self.arm_speed, self.head_speed = float(arm_speed), float(head_speed)
-        # hands: (left, right) standard hand targets, moved through hand_ctrl (teleop --policy only).
+        # hands: (left, right) standard hand targets, moved through hand_ctrl (left O6 + right Dex1-1).
         if (hands is None) != (hand_ctrl is None):
             raise ValueError("give the standard hands and the hand controller together")
         self.hands = None if hands is None else tuple(np.asarray(side, dtype=float).reshape(-1) for side in hands)
