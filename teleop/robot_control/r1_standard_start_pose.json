@@ -1,0 +1,62 @@
+{
+  "description": "Standard start pose for ice-cream teleop recordings (o key): the mean commanded frame-0 arm and head pose of the 46 full-task train recordings of split-run2.json, the training set of icecream_act24_71_320x384_pause4 (round 2). The waist goes to the activation heading (the 0 deg stop).",
+  "created": "2026-11-23",
+  "source": {
+    "split": "autodl/icecream52-20261119/split-run2.json",
+    "train_recordings": 61,
+    "full_task_starts": 46,
+    "start_spread": "each start is 0.15-0.78 rad (max joint) from this mean; per-joint std up to 0.37 rad (right wrist roll)",
+    "wrist_cm_torso": {
+      "left": [
+        21.5,
+        16.0,
+        19.4
+      ],
+      "right": [
+        24.7,
+        -15.0,
+        16.8
+      ]
+    }
+  },
+  "arm_joint_names": [
+    "left_arm/kLeftShoulderPitch",
+    "left_arm/kLeftShoulderRoll",
+    "left_arm/kLeftShoulderYaw",
+    "left_arm/kLeftElbow",
+    "left_arm/kLeftWristRoll",
+    "left_arm/kLeftWristPitch",
+    "left_arm/kLeftWristyaw",
+    "right_arm/kRightShoulderPitch",
+    "right_arm/kRightShoulderRoll",
+    "right_arm/kRightShoulderYaw",
+    "right_arm/kRightElbow",
+    "right_arm/kRightWristRoll",
+    "right_arm/kRightWristPitch",
+    "right_arm/kRightWristYaw"
+  ],
+  "arm_q": [
+    -0.2186,
+    0.6742,
+    -0.1482,
+    -0.4145,
+    -0.2791,
+    -0.5887,
+    0.3282,
+    -0.1582,
+    -0.8445,
+    0.0887,
+    -0.6151,
+    0.911,
+    -0.1606,
+    -0.0292
+  ],
+  "head_joint_names": [
+    "body/head_pitch",
+    "body/head_yaw"
+  ],
+  "head_q": [
+    0.1074,
+    -0.0337
+  ]
+}

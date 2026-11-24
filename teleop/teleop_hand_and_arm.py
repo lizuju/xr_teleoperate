@@ -27,6 +27,7 @@ from teleop.robot_control.r1_hand_tracking import (
 from teleop.robot_control.r1_wrist_workspace import R1WristWorkspace
 from teleop.robot_control.r1_hand_lock import HAND_LOCK_KEYS, R1HandLocks
 from teleop.robot_control.r1_head_lock import HEAD_LOCK_KEYS, R1HeadLock
+from teleop.robot_control.r1_standard_pose import DEFAULT_POSE_PATH, STANDARD_POSE_KEYS
 from teleop.utils.gc_tuning import freeze_startup_heap
 from sshkeyboard import listen_keyboard, stop_listening
 
@@ -58,6 +59,9 @@ HAND_LOCKS = R1HandLocks()
 # Operator head lock: h holds the robot head's pitch/yaw target whatever the operator's
 # head does; h again lets it follow again, easing over at a limited speed.
 HEAD_LOCK = R1HeadLock()
+# Operator start pose: o pauses and eases the robot to the standard start pose between
+# recordings; s then starts the next episode there. Built with the pause control.
+STANDARD_POSE = None
 # After an unlock the Dex1-1 keeps its grip until the live pinch target is this close
 # to the held one (rad) or crosses it, so a relaxed hand does not drop the cup.
 DEX1_UNLOCK_PICKUP_RAD = 0.1
@@ -120,6 +124,20 @@ def on_press(key):
     elif key in globals().get("HEAD_LOCK_KEYS", ()):
         locked = globals()["HEAD_LOCK"].toggle()
         logger_mp.info(f"[R1 HEAD LOCK] head: {'lock' if locked else 'unlock'} requested.")
+    elif key in globals().get("STANDARD_POSE_KEYS", ()):
+        standard_pose = globals().get("STANDARD_POSE")
+        if standard_pose is None or R1_PAUSE is None:
+            logger_mp.warning("[R1 START POSE] o needs R1 hand teleop with the pause control; ignoring it.")
+        elif not START:
+            logger_mp.warning("[R1 START POSE] press r to start teleop first; ignoring o.")
+        elif RECORD_RUNNING:
+            logger_mp.warning("[R1 START POSE] an episode is recording; end it with y, n or x first.")
+        elif standard_pose.press() == "go":
+            R1_PAUSE.pause()
+            RECORD_TOGGLE = False
+            logger_mp.info("[R1 START POSE] paused; moving to the standard start pose.")
+        else:
+            logger_mp.info("[R1 START POSE] stop requested; the robot holds where it is.")
     else:
         logger_mp.warning(f"[on_press] {key} was pressed, but no action is defined for this key.")
 
@@ -581,6 +599,11 @@ if __name__ == '__main__':
     parser.add_argument('--waist-turn-accel-deg', type=float, default=60.0, help='R1_A7 with --waist-follow: acceleration and braking of the arrow-key '
                         'turns, in degrees per second squared. 30 deg/s at 60 deg/s^2 turns 90 deg in about 3.5 s. Must be positive.')
     parser.add_argument('--startup-wrist-align', action='store_true', help='R1_A7: align wrist orientation to the initial Vision Pro pose before following')
+    parser.add_argument('--standard-pose', type=str, default=str(DEFAULT_POSE_PATH), help='R1_A7 hand teleop: pose file (arm_q, head_q) '
+                        'that the o key moves to between recordings; the waist goes to the activation heading. "none" turns o off. '
+                        'Default: the mean start of the round 2 ice-cream training demos.')
+    parser.add_argument('--standard-pose-speed', type=float, default=0.3, help='R1_A7: peak arm and head speed of the o move in rad/s, '
+                        'at most 1; the waist turns at up to 20 deg/s. Default: 0.3')
     # record mode and task info
     parser.add_argument('--record', action = 'store_true', help = 'Enable data recording mode')
     parser.add_argument('--record-max-tracking-age-ms', type=float, default=100.0, help='Refuse to start an episode while any tracked XR hand is older than this many milliseconds. 0 disables the gate. Measured 2026-09-18: a bad Wi-Fi evening was left_age_ms p50=106 ms with 7%% of frames past 500 ms; a good morning was 24 ms.')
@@ -621,6 +644,14 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
     logger_mp.debug(f"args: {args}")
+    if not (math.isfinite(args.standard_pose_speed) and 0.0 < args.standard_pose_speed <= 1.0):
+        parser.error('--standard-pose-speed must be in (0, 1] rad/s')
+    if args.standard_pose != 'none':
+        from teleop.robot_control.r1_standard_pose import load_standard_pose
+        try:
+            load_standard_pose(args.standard_pose)
+        except (OSError, ValueError) as exc:
+            parser.error(f'--standard-pose {args.standard_pose}: {exc}')
     if args.tracking_source == 'visionpro':
         if not args.visionpro_ip:
             parser.error('--tracking-source visionpro requires --visionpro-ip')
@@ -1689,6 +1720,15 @@ if __name__ == '__main__':
             from teleop.robot_control.r1_pause import R1PauseState
             R1_PAUSE = R1PauseState()
             logger_mp.info("[R1 CONTROL] [p] pauses and holds; [r] realigns and resumes; when recording is enabled, [s] also starts the next episode after resume; [q] exits.")
+            if args.standard_pose != 'none':
+                from teleop.robot_control.r1_standard_pose import R1StandardPose, arm_gravity, load_standard_pose
+                STANDARD_POSE = R1StandardPose(
+                    load_standard_pose(args.standard_pose), arm_gravity(arm_ik), logger_mp,
+                    arm_speed=args.standard_pose_speed, head_speed=args.standard_pose_speed,
+                )
+                logger_mp.info("[R1 START POSE] [o] pauses and moves to the standard start pose (%s); then [s] starts "
+                               "the next episode there, [r] resumes without recording; [o] again stops the move.",
+                               args.standard_pose)
         if r1_independent_hands:
             logger_mp.info("[R1 HAND LOCK] [ locks/unlocks the left arm and O6, ] the right arm and its hand; "
                            "locking also holds the waist angle; arrow keys explicitly turn it to a new held angle.")
@@ -1860,8 +1900,17 @@ if __name__ == '__main__':
                 if r1_frozen_generation != pause_generation:
                     hold_r1_published_targets(arm_ctrl)
                     r1_frozen_generation = pause_generation
-                arm_ctrl.hold_targets()
-                resume_generation = R1_PAUSE.poll_resume(
+                # o eases the robot to the standard start pose while paused; resuming waits for
+                # the move to finish, then re-anchors there. The loop-slice tests may leave it out.
+                standard_pose = globals().get("STANDARD_POSE")
+                head_lock = globals().get("HEAD_LOCK")
+                standard_moving = standard_pose is not None and standard_pose.step(
+                    arm_ctrl, pause_generation, r1_waist_yaw_reference if args.waist_follow else None,
+                    time.monotonic(), head_locked=head_lock is not None and head_lock.locked(),
+                )
+                if not standard_moving:
+                    arm_ctrl.hold_targets()
+                resume_generation = None if standard_moving else R1_PAUSE.poll_resume(
                     tele_data, args.tracking_timeout, time.monotonic(),
                 )
                 if resume_generation is not None:
