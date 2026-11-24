@@ -1,5 +1,8 @@
+import argparse
+import ast
 import copy
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -12,7 +15,7 @@ import numpy as np
 
 from teleop.utils.camera_calibration import camera_calibration_metadata, load_camera_calibration
 from teleop.utils.episode_writer import EpisodeWriter
-from teleop.utils.r1_capture import R1Capture, capture_metadata
+from teleop.utils.r1_capture import R1Capture, capture_metadata, launch_arguments
 
 
 def calibration_document():
@@ -714,6 +717,78 @@ class HandTelemetryUnitsTest(unittest.TestCase):
     def test_hand_position_reports_the_same_register_width(self):
         self.assertIn("256 levels", self.units["hand_qpos"])
         self.assertEqual(self.units["hand_points"], "m")
+
+
+MAIN_PATH = Path(__file__).resolve().parents[1] / "teleop" / "teleop_hand_and_arm.py"
+
+
+def teleop_parser():
+    """The real teleop_hand_and_arm.py argument parser, built from its source."""
+    tree = ast.parse(MAIN_PATH.read_text(encoding="utf-8"))
+    main = next(node for node in tree.body
+                if isinstance(node, ast.If) and "__main__" in ast.unparse(node.test))
+    start = next(index for index, node in enumerate(main.body)
+                 if ast.unparse(node).startswith("parser = argparse.ArgumentParser"))
+    end = next(index for index, node in enumerate(main.body)
+               if ast.unparse(node).startswith("args = parser.parse_args"))
+    namespace = {"argparse": argparse, "Path": Path, "parent_dir": str(MAIN_PATH.parent),
+                 "DEFAULT_POSE_PATH": MAIN_PATH.parent / "robot_control" / "r1_standard_start_pose.json"}
+    exec(compile(ast.Module(body=main.body[start:end], type_ignores=[]), str(MAIN_PATH), "exec"), namespace)
+    return namespace["parser"]
+
+
+class LaunchArgumentTests(unittest.TestCase):
+    """Episodes store the launch command line in episode.json.
+
+    --policy-worker-python defaults to a Path, and on 2026-11-24 every recording
+    failed at its first s with "Object of type PosixPath is not JSON serializable".
+    """
+
+    def test_teleop_command_lines_are_stored_as_json(self):
+        parser = teleop_parser()
+        for argv in ([], ["--policy", "/tmp/best.pt"]):
+            with self.subTest(argv=argv):
+                args = parser.parse_args(argv)
+                stored = launch_arguments(args)
+                self.assertEqual(json.loads(json.dumps(stored, allow_nan=False)), stored)
+                self.assertEqual(stored["policy_worker_python"], os.fspath(args.policy_worker_python))
+        self.assertEqual(stored["policy"], "/tmp/best.pt")
+        self.assertIsInstance(args.policy, Path)
+
+    def test_paths_inside_lists_become_strings_and_other_values_stay(self):
+        args = SimpleNamespace(models=[Path("/a"), Path("/b")], frequency=40.0, record=True, policy=None)
+        self.assertEqual(launch_arguments(args),
+                         {"models": ["/a", "/b"], "frequency": 40.0, "record": True, "policy": None})
+
+    def test_capture_metadata_stores_path_options_as_strings(self):
+        hand = SimpleNamespace(urdf_path=Path(__file__).resolve().parents[1] / "assets" / "r1" / "r1_a7.urdf",
+                               hardware_joint_order=[f"joint_{index}" for index in range(6)],
+                               hardware_lower=np.zeros(6), hardware_upper=np.ones(6))
+        retargeter = SimpleNamespace(method="vector", mapping_name="o6", left=hand, right=hand)
+        camera_config = {"head_camera": {"binocular": True, "image_shape": [448, 1088], "fps": 30,
+                                         "enable_zmq": True}}
+        args = SimpleNamespace(frequency=40.0, camera_sync_tolerance_ms=25.0,
+                               policy=None, policy_worker_python=Path("/opt/train/bin/python"))
+        stored = capture_metadata(args, camera_config, retargeter)["launch_arguments"]
+        self.assertEqual(stored["policy_worker_python"], "/opt/train/bin/python")
+        json.dumps(stored, allow_nan=False)
+
+    def test_an_episode_with_the_teleop_defaults_is_recorded(self):
+        now = time.monotonic_ns()
+        arm, hand, loop, xr, image = build(now)
+        capture = R1Capture(arm, hand, loop, 0.25, (16, 32))
+        metadata = {"frequency": 30, "launch_arguments": launch_arguments(teleop_parser().parse_args([]))}
+        with tempfile.TemporaryDirectory() as directory:
+            writer = EpisodeWriter(directory, task_goal="launch argument fixture", image_size=(16, 16),
+                                   rerun_log=False, metadata=metadata)
+            self.assertTrue(writer.create_episode())
+            writer.add_item(**capture.frame(xr, image, "following"))
+            writer.save_episode(outcome="success")
+            writer.close()
+            manifest = json.loads((writer.episode_dir / "episode.json").read_text(encoding="utf-8"))
+        self.assertNotIn("error", manifest)
+        self.assertEqual(manifest["frame_count"], 1)
+        self.assertIsInstance(manifest["info"]["launch_arguments"]["policy_worker_python"], str)
 
 
 if __name__ == "__main__":

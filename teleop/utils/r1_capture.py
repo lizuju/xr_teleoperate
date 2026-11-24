@@ -1,5 +1,6 @@
 import hashlib
 import importlib.metadata
+import os
 from pathlib import Path
 import socket
 import sys
@@ -59,6 +60,22 @@ def color_image_specs(camera_config):
                                          "width": wrist_width, "height": wrist_height,
                                          "fps": wrist.get("fps")}
     return specs
+
+
+def launch_arguments(args):
+    """The parsed command line as JSON values for the episode manifest.
+
+    Options parsed with type=Path (--policy, --policy-worker-python) are stored as
+    strings; json.dump refuses a Path, and the manifest is written when an episode
+    starts, so a Path here failed every recording.
+    """
+    def plain(value):
+        if isinstance(value, os.PathLike):
+            return os.fspath(value)
+        if isinstance(value, (list, tuple)):
+            return type(value)(plain(item) for item in value)
+        return value
+    return {name: plain(value) for name, value in vars(args).items()}
 
 
 def capture_metadata(args, camera_config, retargeter, calibration=None, recording_tf=None):
@@ -212,7 +229,7 @@ def capture_metadata(args, camera_config, retargeter, calibration=None, recordin
             calibration, expected_cameras(camera_config),
             {spec["camera"]: (spec["width"], spec["height"]) for spec in images.values()}),
         "camera_config": camera_config,
-        "launch_arguments": vars(args).copy(),
+        "launch_arguments": launch_arguments(args),
         "versions": versions,
         "code_sha256": {str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest()
                         for path in code_paths},
