@@ -18,7 +18,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from teleop.utils.act_contract import validate_contract
-from teleop.utils.act_dataset import R1ACTDataset, BalancedBatchSampler
+from teleop.utils.act_dataset import R1ACTDataset, BalancedBatchSampler, add_qpos_noise, qpos_noise_scale
 from teleop.utils.act_policy import ACTPolicy, act_loss, augment_images, masked_l1, read_checkpoint, save_checkpoint
 from teleop.utils.icecream_task import CONTEXT_DIM
 
@@ -36,6 +36,10 @@ def parse_args(argv=None):
     p.add_argument('--max-pause-seconds', type=float, default=None,
                    help='Train less on standing still: in a still stretch longer than this, keep only the first and '
                         'last half as samples (train and val alike). At least twice the chunk horizon. Default: off')
+    p.add_argument('--qpos-noise', type=float, default=None,
+                   help='Add Gaussian noise with this standard deviation (rad) to the arm, waist and head joint inputs '
+                        'of each training sample, so the policy learns to steer back when its pose drifts. Targets, '
+                        'O6 and Dex1 inputs and validation stay exact. Default: off')
     p.add_argument('--lr', type=float, default=1e-4)
     p.add_argument('--lr-backbone', type=float, default=1e-5)
     p.add_argument('--weight-decay', type=float, default=1e-4)
@@ -59,6 +63,8 @@ def parse_args(argv=None):
             p.error(f'{key} must be positive')
     if args.max_pause_seconds is not None and not (math.isfinite(args.max_pause_seconds) and args.max_pause_seconds > 0):
         p.error('max_pause_seconds must be a positive number of seconds')
+    if args.qpos_noise is not None and not (math.isfinite(args.qpos_noise) and args.qpos_noise > 0):
+        p.error('qpos_noise must be a positive number of radians')
     return args
 
 
@@ -67,6 +73,8 @@ def training_settings(args):
     settings = {k: getattr(args, k) for k in ('batch_size', 'accumulate', 'chunk_size', 'conditioned', 'seed', 'no_augment', 'kl_weight')}
     if getattr(args, 'max_pause_seconds', None) is not None:
         settings['max_pause_seconds'] = args.max_pause_seconds
+    if getattr(args, 'qpos_noise', None) is not None:
+        settings['qpos_noise'] = args.qpos_noise
     return settings
 
 
@@ -134,6 +142,12 @@ def train(args):
         raise ValueError('Training requires separate nonempty train and validation source episodes')
     if args.conditioned and not (meta.get('phase_annotations') or {}).get('reviewed'):
         raise ValueError('Conditioned training requires reviewed within-episode phase annotations')
+    noise = None
+    if args.qpos_noise is not None:
+        scale = qpos_noise_scale(meta.get('joint_groups'), meta.get('units'), train_data.stats['qpos_std'], args.qpos_noise)
+        noise = torch.as_tensor(scale, device=device)
+        print(f"[TRAIN] qpos noise: sigma {args.qpos_noise:g} rad on {int((scale > 0).sum())} joint inputs "
+              "(arms, waist, head); O6, Dex1, targets and validation unchanged", flush=True)
     settings = training_settings(args)
     resume = read_checkpoint(args.output / 'latest.pt') if args.resume else None
     start = 0 if resume is None else resume['step']
@@ -197,6 +211,8 @@ def train(args):
                 images, qpos, actions, pad, context, complete = [x.to(device, non_blocking=True) for x in next(stream)]
                 if not args.no_augment:
                     images = augment_images(images)
+                if noise is not None:
+                    qpos = add_qpos_noise(qpos, noise)
                 with torch.autocast('cuda', dtype=torch.bfloat16, enabled=amp):
                     pred, mu, logvar, logits = model(images, qpos, actions, pad, context)
                     loss, l1, kl = act_loss(pred.float(), actions, pad, mu.float(), logvar.float(), args.kl_weight)
