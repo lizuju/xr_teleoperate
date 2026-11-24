@@ -57,10 +57,11 @@ def group_errors(difference):
     return {name: float(np.abs(difference[part]).max()) for name, part in GROUP_SLICES.items()}
 
 
-# Teleop turns the waist only with the arrow keys, between stops 90 deg apart (counted from the
-# activation heading, which the recordings keep within about 1 deg of 0). So every recorded waist
+# Teleop turns the waist only with keys: the arrows step between stops 90 deg apart (counted from
+# the activation heading, which the recordings keep within about 1 deg of 0), and the number keys
+# go straight to 0, +-90 or +-148 deg (r1_head_waist.WAIST_ANGLE_KEYS). So every recorded waist
 # action is a stop or part of a turn between two stops.
-WAIST_STOPS = (0.0, -math.pi / 2, math.pi / 2)
+WAIST_STOPS = (0.0, -math.pi / 2, math.pi / 2, -math.radians(148.0), math.radians(148.0))
 WAIST_INDEX = GROUP_SLICES["body"].start
 
 
