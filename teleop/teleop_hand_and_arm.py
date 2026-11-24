@@ -28,6 +28,7 @@ from teleop.robot_control.r1_wrist_workspace import R1WristWorkspace
 from teleop.robot_control.r1_hand_lock import HAND_LOCK_KEYS, R1HandLocks
 from teleop.robot_control.r1_head_lock import HEAD_LOCK_KEYS, R1HeadLock
 from teleop.robot_control.r1_standard_pose import DEFAULT_POSE_PATH, STANDARD_POSE_KEYS
+from teleop.utils.policy_takeover import POLICY_KEYS
 from teleop.utils.gc_tuning import freeze_startup_heap
 from sshkeyboard import listen_keyboard, stop_listening
 
@@ -62,6 +63,12 @@ HEAD_LOCK = R1HeadLock()
 # Operator start pose: o pauses and eases the robot to the standard start pose between
 # recordings; s then starts the next episode there. Built with the pause control.
 STANDARD_POSE = None
+# Human takeover of a running policy (HG-DAgger): with --policy, g lets the policy drive from the
+# held pose and s takes over and records the correction. Built with the pause control.
+POLICY = None
+# After s or r takes over from the policy, the left O6 keeps the policy's target until the
+# operator's hand is this close to it (normalized 0..1) or crosses it.
+O6_TAKEOVER_PICKUP = 0.2
 # After an unlock the Dex1-1 keeps its grip until the live pinch target is this close
 # to the held one (rad) or crosses it, so a relaxed hand does not drop the cup.
 DEX1_UNLOCK_PICKUP_RAD = 0.1
@@ -80,6 +87,9 @@ DEX1_UNLOCK_PICKUP_RAD = 0.1
 def on_press(key):
     global STOP, START, RECORD_TOGGLE, RECORD_OUTCOME, ARM_REQUEST_GENERATION, WAIST_TURN_REQUEST
     if key == 'r':
+        policy = globals().get("POLICY")
+        if policy is not None and policy.takeover():
+            logger_mp.info("[R1 POLICY] takeover without recording: the policy stops; keep both hands steady to realign.")
         if R1_PAUSE is not None and R1_PAUSE.paused:
             R1_PAUSE.request_resume()
             logger_mp.info("[R1 PAUSE] Resume requested; keep both hands stable to realign and continue.")
@@ -95,6 +105,9 @@ def on_press(key):
         STOP = True
         RECORD_TOGGLE = False
     elif key == 'p' and R1_PAUSE is not None:
+        policy = globals().get("POLICY")
+        if policy is not None:
+            policy.stop()
         R1_PAUSE.pause()
         if not RECORD_RUNNING:
             RECORD_TOGGLE = False
@@ -103,6 +116,10 @@ def on_press(key):
         RECORD_OUTCOME = {'y': 'success', 'n': 'failure', 'x': 'discarded'}[key]
         RECORD_TOGGLE = True
     elif key == 's' and RECORD_ENABLED and (START or (DRY_RUN_MODE and READY)):
+        policy = globals().get("POLICY")
+        if policy is not None and not RECORD_RUNNING and policy.takeover():
+            logger_mp.info("[R1 POLICY] takeover: the policy stops; keep both hands steady to realign, "
+                           "then recording starts.")
         if not RECORD_RUNNING and not RECORD_TOGGLE:
             if R1_PAUSE is not None and R1_PAUSE.paused:
                 R1_PAUSE.request_resume()
@@ -133,11 +150,36 @@ def on_press(key):
         elif RECORD_RUNNING:
             logger_mp.warning("[R1 START POSE] an episode is recording; end it with y, n or x first.")
         elif standard_pose.press() == "go":
+            policy = globals().get("POLICY")
+            if policy is not None:
+                policy.stop()
+                policy.forget()
             R1_PAUSE.pause()
             RECORD_TOGGLE = False
             logger_mp.info("[R1 START POSE] paused; moving to the standard start pose.")
         else:
             logger_mp.info("[R1 START POSE] stop requested; the robot holds where it is.")
+    elif key in globals().get("POLICY_KEYS", ()):
+        policy = globals().get("POLICY")
+        standard_pose = globals().get("STANDARD_POSE")
+        head_lock = globals().get("HEAD_LOCK")
+        if policy is None or R1_PAUSE is None:
+            logger_mp.warning("[R1 POLICY] g needs teleop started with --policy CHECKPOINT; ignoring it.")
+        elif not START:
+            logger_mp.warning("[R1 POLICY] press r to start teleop first; ignoring g.")
+        elif RECORD_RUNNING:
+            logger_mp.warning("[R1 POLICY] an episode is recording; end it with y, n or x first.")
+        elif standard_pose is not None and standard_pose.moving():
+            logger_mp.warning("[R1 POLICY] wait until the o move ends; ignoring g.")
+        elif any(HAND_LOCKS.snapshot()) or (head_lock is not None and head_lock.locked()):
+            logger_mp.warning("[R1 POLICY] unlock the arms ([ ]) and the head (h) before g; ignoring it.")
+        elif policy.press_go():
+            R1_PAUSE.pause()
+            RECORD_TOGGLE = False
+            logger_mp.info("[R1 POLICY] teleop paused; the policy drives from here. s takes over and records, "
+                           "r takes over, p stops and holds.")
+        else:
+            logger_mp.info("[R1 POLICY] the policy is already driving; s or r takes over, p stops it.")
     else:
         logger_mp.warning(f"[on_press] {key} was pressed, but no action is defined for this key.")
 
@@ -391,6 +433,13 @@ def rotation_error_rad(actual_rotation, target_rotation):
     cosine = (np.trace(actual_rotation.T @ target_rotation) - 1.0) / 2.0
     return float(np.arccos(np.clip(cosine, -1.0, 1.0)))
 
+def policy_episode_info():
+    """Episode info for a recording that corrects a policy run (takeover), else None."""
+    policy = globals().get("POLICY")
+    intervention = None if policy is None else policy.take_intervention_info()
+    return None if intervention is None else {"intervention": intervention}
+
+
 def hold_r1_published_targets(arm_ctrl):
     published = arm_ctrl.get_recording_snapshot()["published"]
     # Before the first successful publication there is nothing to replay, so the
@@ -604,6 +653,15 @@ if __name__ == '__main__':
                         'Default: the mean start of the round 2 ice-cream training demos.')
     parser.add_argument('--standard-pose-speed', type=float, default=0.3, help='R1_A7: peak arm and head speed of the o move in rad/s, '
                         'at most 1; the waist turns at up to 20 deg/s. Default: 0.3')
+    parser.add_argument('--policy', type=Path, default=None, help='R1_A7 hand teleop with --record, left O6 + right Dex1-1: '
+                        'an ACT checkpoint for human takeover (HG-DAgger). g lets it drive from the held pose (o first puts the '
+                        'robot on the standard start pose); s takes over and records the correction, marked info.intervention; '
+                        'r takes over without recording; p stops it and holds. Same guards as run_r1_act_policy.py --execute.')
+    parser.add_argument('--policy-max-seconds', type=float, default=120.0, help='Longest one g run may command before it holds. Default: 120')
+    parser.add_argument('--policy-blend-seconds', type=float, default=2.0, help='Blend from the held pose to the policy over this long. Default: 2')
+    parser.add_argument('--policy-device', default='auto', help='Inference device for --policy: auto, cuda or cpu')
+    parser.add_argument('--policy-worker-python', type=Path, default=Path(parent_dir).parent / '.venv-train/bin/python',
+                        help='Python with torch for the --policy inference worker')
     # record mode and task info
     parser.add_argument('--record', action = 'store_true', help = 'Enable data recording mode')
     parser.add_argument('--record-max-tracking-age-ms', type=float, default=100.0, help='Refuse to start an episode while any tracked XR hand is older than this many milliseconds. 0 disables the gate. Measured 2026-09-18: a bad Wi-Fi evening was left_age_ms p50=106 ms with 7%% of frames past 500 ms; a good morning was 24 ms.')
@@ -646,6 +704,18 @@ if __name__ == '__main__':
     logger_mp.debug(f"args: {args}")
     if not (math.isfinite(args.standard_pose_speed) and 0.0 < args.standard_pose_speed <= 1.0):
         parser.error('--standard-pose-speed must be in (0, 1] rad/s')
+    if args.policy is not None:
+        if not args.policy.is_file():
+            parser.error(f'--policy {args.policy}: no such checkpoint')
+        if not args.policy_worker_python.is_file():
+            parser.error(f'--policy-worker-python {args.policy_worker_python}: not found')
+        if (args.arm != 'R1_A7' or args.input_mode != 'hand' or args.ee != 'linker_o6'
+                or getattr(args, 'right_ee', None) != 'dex1' or not args.record):
+            parser.error('--policy takeover needs R1_A7 hand teleop with --record, a left O6 and a right Dex1-1')
+        if not (math.isfinite(args.policy_max_seconds) and args.policy_max_seconds > 0.0):
+            parser.error('--policy-max-seconds must be positive')
+        if not (math.isfinite(args.policy_blend_seconds) and args.policy_blend_seconds >= 0.0):
+            parser.error('--policy-blend-seconds must be at least 0')
     if args.standard_pose != 'none':
         from teleop.robot_control.r1_standard_pose import load_standard_pose
         try:
@@ -1729,6 +1799,14 @@ if __name__ == '__main__':
                 logger_mp.info("[R1 START POSE] [o] pauses and moves to the standard start pose (%s); then [s] starts "
                                "the next episode there, [r] resumes without recording; [o] again stops the move.",
                                args.standard_pose)
+            if args.policy is not None:
+                from teleop.robot_control.r1_standard_pose import arm_gravity
+                from teleop.utils.policy_takeover import create_policy_takeover
+                POLICY = create_policy_takeover(args, arm_ctrl, hand_ctrl, arm_gravity(arm_ik), camera_config,
+                                                logger_mp, Path(parent_dir).parent / "policy-runs")
+                logger_mp.info("[R1 POLICY] takeover ready (%s): [g] lets the policy drive from the held pose; [s] takes "
+                               "over and records, [r] takes over, [p] stops and holds. Log: %s",
+                               args.policy, POLICY.log_dir)
         if r1_independent_hands:
             logger_mp.info("[R1 HAND LOCK] [ locks/unlocks the left arm and O6, ] the right arm and its hand; "
                            "locking also holds the waist angle; arrow keys explicitly turn it to a new held angle.")
@@ -1766,6 +1844,9 @@ if __name__ == '__main__':
                 pickup_tolerance=(None, DEX1_UNLOCK_PICKUP_RAD
                                   if getattr(args, "right_ee", "linker_o6") == "dex1" else None),
                 log=logger_mp.info,
+                is_external=lambda: globals().get("POLICY") is not None and globals()["POLICY"].driving(),
+                takeover_tolerance=(O6_TAKEOVER_PICKUP, DEX1_UNLOCK_PICKUP_RAD
+                                    if getattr(args, "right_ee", "linker_o6") == "dex1" else O6_TAKEOVER_PICKUP),
             )
             linker_o6_loop.start()
 
@@ -1850,6 +1931,8 @@ if __name__ == '__main__':
                 # Keep the pairing history warm while not recording, so the first
                 # sample of an episode already has frames to choose between.
                 r1_capture.observe(head_img, {"left": left_wrist_img, "right": right_wrist_img})
+            if globals().get("POLICY") is not None:
+                globals()["POLICY"].set_frames(head_img, {"left": left_wrist_img, "right": right_wrist_img})
 
             # record mode
             if args.record:
@@ -1867,7 +1950,7 @@ if __name__ == '__main__':
                     )
                     if reason:
                         logger_mp.warning("[RECORD] not started: %s", reason)
-                    elif recorder.create_episode():
+                    elif recorder.create_episode(extra_info=globals().get("policy_episode_info", lambda: None)()):
                         RECORD_RUNNING = True
                         RECORD_OUTCOME = 'unspecified'
                         if r1_capture is not None:
@@ -1894,6 +1977,7 @@ if __name__ == '__main__':
             capture_mode = "following"
             run_motion = True
             standard_moving = False
+            policy_driving = False
             if R1_PAUSE is not None and R1_PAUSE.paused:
                 capture_mode = "paused"
                 run_motion = False
@@ -1901,17 +1985,20 @@ if __name__ == '__main__':
                 if r1_frozen_generation != pause_generation:
                     hold_r1_published_targets(arm_ctrl)
                     r1_frozen_generation = pause_generation
-                # o eases the robot to the standard start pose while paused; resuming waits for
-                # the move to finish, then re-anchors there. The loop-slice tests may leave it out.
+                # g lets the policy drive while paused (takeover), and o eases the robot to the
+                # standard start pose. Resuming waits until neither commands, then re-anchors at
+                # the pose they left. The loop-slice tests may leave both out.
+                policy = globals().get("POLICY")
+                policy_driving = policy is not None and policy.step(time.monotonic(), pause_generation)
                 standard_pose = globals().get("STANDARD_POSE")
                 head_lock = globals().get("HEAD_LOCK")
-                standard_moving = standard_pose is not None and standard_pose.step(
+                standard_moving = not policy_driving and standard_pose is not None and standard_pose.step(
                     arm_ctrl, pause_generation, r1_waist_yaw_reference if args.waist_follow else None,
                     time.monotonic(), head_locked=head_lock is not None and head_lock.locked(),
                 )
-                if not standard_moving:
+                if not (standard_moving or policy_driving):
                     arm_ctrl.hold_targets()
-                resume_generation = None if standard_moving else R1_PAUSE.poll_resume(
+                resume_generation = None if (standard_moving or policy_driving) else R1_PAUSE.poll_resume(
                     tele_data, args.tracking_timeout, time.monotonic(),
                 )
                 if resume_generation is not None:
@@ -2335,10 +2422,10 @@ if __name__ == '__main__':
                         else:
                             workspace.hold()
             else:
-                # While o moves the robot it sets this tick's targets itself. hold_targets()
-                # resets the arm target shaper, which then holds for a tick, so calling it
-                # every tick kept the arms still while the head moved (2026-11-23).
-                if not standard_moving:
+                # While o or the policy moves the robot it sets this tick's targets itself.
+                # hold_targets() resets the arm target shaper, which then holds for a tick, so
+                # calling it every tick kept the arms still while the head moved (2026-11-23).
+                if not (standard_moving or policy_driving):
                     arm_ctrl.hold_targets()
                 held = arm_ctrl.get_recording_snapshot()["requested"]
                 sol_q = np.array(held["arm_q"])
@@ -2725,6 +2812,11 @@ if __name__ == '__main__':
                 logger_mp.info(globals()["GC_MONITOR"].summary())
         except Exception as e:
             logger_mp.warning(f"Failed to write the garbage collection summary: {e}")
+        try:
+            if globals().get("POLICY") is not None:
+                globals()["POLICY"].close()
+        except Exception as e:
+            logger_mp.warning(f"Failed to close the takeover policy: {e}")
         try:
             if linker_o6_loop is not None:
                 linker_o6_loop.stop()
