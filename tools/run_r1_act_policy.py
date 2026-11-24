@@ -30,8 +30,9 @@ for path in (ROOT, ROOT / "tools"):
 
 from replay_r1_episode_on_robot import (NETWORK_INTERFACE, current_pose, hold_until_quit, send_pose, shutdown,
                                         stop_keyboard, teleop_pids)
-from teleop.utils.act_runtime import (ACTION_DIM, ActionEnsemble, GravityModel, ObservationBuilder, PolicyClient,
-                                      PolicyGuard, group_errors, join_action, split_action, summarize)
+from teleop.utils.act_runtime import (ACTION_DIM, WAIST_INDEX, ActionEnsemble, GravityModel, ObservationBuilder,
+                                      PolicyClient, PolicyGuard, WaistHold, group_errors, join_action, split_action,
+                                      summarize)
 from teleop.utils.frame_sync import CameraSynchronizer
 from teleop.utils.act_contract import validate_contract
 from teleop.utils.icecream_task import IcecreamTask, PHASES
@@ -76,6 +77,15 @@ def parse_args(argv=None):
     parser.add_argument("--start-speed", type=float, default=0.3, help="Arm and head speed of the start-pose approach (rad/s)")
     parser.add_argument("--max-start-approach-seconds", type=float, default=15.0,
                         help="Refuse a start-pose approach that would take longer than this")
+    parser.add_argument("--waist-snap-deg", type=float, default=5.0,
+                        help="While the waist holds a teleop waist stop (0 or +-90 deg, as the arrow-key demos did), "
+                             "command policy waist targets within this many degrees of it as exactly that stop. A "
+                             "target further out ends the hold and passes unchanged, so turns start as the policy "
+                             "begins them; the arm controller still slews the waist at its 40 deg/s limit. "
+                             "0 disables. Default: 5")
+    parser.add_argument("--waist-capture-deg", type=float, default=2.0,
+                        help="Start holding a waist stop when the policy waist target, or the waist at the start, "
+                             "comes within this many degrees of it. At most --waist-snap-deg. Default: 2")
     args = parser.parse_args(argv)
     if not (math.isfinite(args.start_speed) and 0.0 < args.start_speed <= 1.0):
         parser.error("--start-speed must be in (0, 1] rad/s")
@@ -83,6 +93,11 @@ def parse_args(argv=None):
         parser.error("--start-frame must be nonnegative")
     if not (math.isfinite(args.max_start_approach_seconds) and args.max_start_approach_seconds > 0.0):
         parser.error("--max-start-approach-seconds must be positive")
+    if not (math.isfinite(args.waist_snap_deg) and 0.0 <= args.waist_snap_deg < 45.0):
+        parser.error("--waist-snap-deg must be at least 0 and under 45")
+    if not (math.isfinite(args.waist_capture_deg) and args.waist_capture_deg >= 0.0
+            and (args.waist_snap_deg == 0.0 or args.waist_capture_deg <= args.waist_snap_deg)):
+        parser.error("--waist-capture-deg must be at least 0 and no more than --waist-snap-deg")
     for key in ("max_seconds", "max_chunk_age", "max_tracking_error"):
         if not math.isfinite(getattr(args,key)) or getattr(args,key) <= 0:
             parser.error(f"{key} must be finite and positive")
@@ -248,6 +263,9 @@ def execute_loop(run, arm, hand, guard, gravity, period, stop, args, initial_hol
     hold = live if initial_hold is None else initial_hold
     send_pose(arm, hand, hold)
     start_action = run.live_action(hold)
+    # A resumed run starts from the last command, so a stop it was holding is held again.
+    waist = WaistHold(math.radians(getattr(args, "waist_snap_deg", 0.0)),
+                      math.radians(getattr(args, "waist_capture_deg", 0.0)), start_action[WAIST_INDEX])
     if run.execution_deadline is None:
         run.execution_deadline = time.monotonic() + args.max_seconds
     # Activation blocks for a while, so anything already in flight saw an older pose.
@@ -280,7 +298,8 @@ def execute_loop(run, arm, hand, guard, gravity, period, stop, args, initial_hol
         guard.tripped = "first arm target too far from current pose"
         print(f"[POLICY] first arm target is {delta:.3f} rad from the live pose (limit {args.max_start_delta:.3f}); holding.", flush=True)
         return hold
-    print(f"[POLICY] commanding. Blend {args.blend_seconds:.1f}s, limit {args.max_seconds:.0f}s. "
+    print(f"[POLICY] commanding. Blend {args.blend_seconds:.1f}s, limit {args.max_seconds:.0f}s, "
+          f"waist hold {math.degrees(waist.release):g} deg (capture {math.degrees(waist.capture):g}). "
           "q exits and is not an e-stop; the hardware e-stop is the robot button.", flush=True)
     began = time.monotonic()
     while not stop[0] and time.monotonic() < run.execution_deadline:
@@ -315,7 +334,8 @@ def execute_loop(run, arm, hand, guard, gravity, period, stop, args, initial_hol
                 return hold
             target = run.task.apply(target)
         alpha = (started - began) / args.blend_seconds if blend and args.blend_seconds > 0 else 1.0
-        command = blended(start_action, guard.clamp(target), alpha)
+        # The log keeps the policy's own target; the command carries the held waist.
+        command = blended(start_action, guard.clamp(waist.apply(target)), alpha)
         hold = pose_from_action(command, gravity)
         send_pose(arm, hand, hold)
         run.write(t=started, tick=run.tick, mode="execute", target=target.tolist(), command=command.tolist(),

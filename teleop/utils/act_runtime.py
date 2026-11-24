@@ -57,6 +57,56 @@ def group_errors(difference):
     return {name: float(np.abs(difference[part]).max()) for name, part in GROUP_SLICES.items()}
 
 
+# Teleop turns the waist only with the arrow keys, between stops 90 deg apart (counted from the
+# activation heading, which the recordings keep within about 1 deg of 0). So every recorded waist
+# action is a stop or part of a turn between two stops.
+WAIST_STOPS = (0.0, -math.pi / 2, math.pi / 2)
+WAIST_INDEX = GROUP_SLICES["body"].start
+
+
+def nearest_waist_stop(waist, window):
+    """The waist stop within window radians of waist, or None."""
+    stop = min(WAIST_STOPS, key=lambda value: abs(waist - value))
+    return stop if abs(waist - stop) <= window else None
+
+
+class WaistHold:
+    """Holds the commanded waist on a waist stop (0 or +-90 deg) until the policy turns away.
+
+    ACT reproduces the stops with a few degrees of drift (-86 deg instead of -90 while pulling the
+    lever). While a stop is held, a policy target within release radians of it is commanded as
+    exactly the stop. A target further out ends the hold and passes unchanged: the policy begins a
+    turn by creeping off the stop (-2, -4, -6 deg) and commits to it only once it sees the waist
+    move, so holding until the turn was further along kept the robot facing forward. A target
+    within capture radians of a stop starts a new hold, and so does a starting waist that close.
+    release 0 disables the hold.
+    """
+
+    def __init__(self, release, capture, waist):
+        if not (math.isfinite(release) and 0.0 <= release < math.pi / 4):
+            raise ValueError("waist hold release must be at least 0 and under 45 deg")
+        if not (math.isfinite(capture) and capture >= 0.0 and (release == 0.0 or capture <= release)):
+            raise ValueError("waist hold capture must be at least 0 and no more than release")
+        self.release, self.capture = release, capture
+        self.stop = nearest_waist_stop(float(waist), capture) if release > 0.0 else None
+
+    def apply(self, action):
+        """A copy of action with its waist target on the held stop, if any. Nothing else changes."""
+        action = np.array(action, dtype=np.float64)
+        if action.shape != (ACTION_DIM,):
+            raise ValueError(f"expected {ACTION_DIM} action values, got {action.shape}")
+        if self.release == 0.0:
+            return action
+        waist = float(action[WAIST_INDEX])
+        if self.stop is not None and abs(waist - self.stop) > self.release:
+            self.stop = None
+        if self.stop is None:
+            self.stop = nearest_waist_stop(waist, self.capture)
+        if self.stop is not None:
+            action[WAIST_INDEX] = self.stop
+        return action
+
+
 class ActionEnsemble:
     """ACT temporal ensembling: every chunk covering a tick votes, older chunks weigh more."""
 
