@@ -1,7 +1,9 @@
 import ast
+import importlib.util
 import json
 import math
 from pathlib import Path
+import sys
 import tempfile
 import unittest
 from unittest.mock import Mock
@@ -10,9 +12,12 @@ import numpy as np
 
 from teleop.robot_control.r1_standard_pose import (
     DEFAULT_POSE_PATH, MIN_SECONDS, SETTLE_SECONDS, STANDARD_POSE_KEYS, R1StandardPose, StandardPoseMove,
-    load_standard_pose,
+    load_standard_pose, standard_start_pose,
 )
 import test_r1_pause as pause_fixture
+
+ROOT = Path(__file__).resolve().parents[1]
+HAS_SDK = importlib.util.find_spec("unitree_sdk2py") is not None and importlib.util.find_spec("sshkeyboard") is not None
 
 GRAVITY = np.linspace(-1.0, 1.0, 14)
 
@@ -50,6 +55,48 @@ class PoseFileTest(unittest.TestCase):
                 path.write_text(json.dumps(data))
                 with self.assertRaises(ValueError, msg=index):
                     load_standard_pose(path)
+
+
+class PolicyStartTest(unittest.TestCase):
+    def test_the_policy_start_is_the_teleop_pose_with_the_waist_at_0_and_the_mean_hands(self):
+        pose, sides = standard_start_pose(DEFAULT_POSE_PATH)
+        teleop = load_standard_pose(DEFAULT_POSE_PATH)
+        np.testing.assert_array_equal(pose.arm_q, teleop["arm_q"])
+        np.testing.assert_array_equal(pose.head_q, teleop["head_q"])
+        self.assertEqual(pose.waist_q, 0.0)
+        self.assertEqual(pose.left_q.shape, (6,))
+        self.assertEqual(pose.right_q.shape, (1,))
+        self.assertTrue(4.28 < pose.right_q[0] <= 5.4)
+        np.testing.assert_array_equal(pose.arm_tau, np.zeros(14))
+        self.assertEqual((pose.left_mode, pose.right_mode), (1, 1))
+        self.assertEqual(sides, {"left": "linker_o6", "right": "dex1_1"})
+
+    def test_a_file_without_usable_hands_is_refused_for_policy_starts(self):
+        good = json.loads(DEFAULT_POSE_PATH.read_text())
+        bad = [{k: v for k, v in good.items() if k != "left_hand_q"}, dict(good, right_hand_q=[5.3, 5.3]),
+               dict(good, left_hand_q=[1.2] * 6), dict(good, end_effectors={"left": "linker_o6", "right": "linker_o6"})]
+        with tempfile.TemporaryDirectory() as directory:
+            for index, data in enumerate(bad):
+                path = Path(directory) / f"bad{index}.json"
+                path.write_text(json.dumps(data))
+                load_standard_pose(path)  # teleop o needs only arms and head
+                with self.assertRaises(ValueError, msg=index):
+                    standard_start_pose(path)
+
+    @unittest.skipUnless(HAS_SDK, "needs the robot SDK environment")
+    def test_runner_takes_standard_and_refuses_a_frame_with_it(self):
+        sys.path.insert(0, str(ROOT / "tools"))
+        import run_r1_act_policy as runner
+        self.assertEqual(runner.parse_args(["policy.pt", "--start-pose", "standard"]).start_pose, DEFAULT_POSE_PATH)
+        self.assertEqual(runner.parse_args(["policy.pt", "--start-pose", str(DEFAULT_POSE_PATH)]).start_pose,
+                         DEFAULT_POSE_PATH)
+        self.assertEqual(runner.parse_args(["policy.pt", "--start-pose", "/tmp/episode_0096", "--start-frame", "3"])
+                         .start_frame, 3)
+        with self.assertRaises(SystemExit):
+            runner.parse_args(["policy.pt", "--start-pose", "standard", "--start-frame", "2"])
+        source = (ROOT / "tools/run_r1_act_policy.py").read_text(encoding="utf-8")
+        self.assertLess(source.index("standard_start_pose(args.start_pose)"),
+                        source.index("refusing --start-pose: it is outside the training range"))
 
 
 class MoveTest(unittest.TestCase):
