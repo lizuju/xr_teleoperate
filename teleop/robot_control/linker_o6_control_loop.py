@@ -13,7 +13,8 @@ SIDES = ("left", "right")
 class LinkerO6ControlLoop:
     def __init__(self, get_tele_data, retargeter, controller, frequency, tracking_timeout,
                  should_stop, on_update, should_pause=lambda: False, is_locked=lambda index: False,
-                 pickup_tolerance=(None, None), log=lambda message: None):
+                 pickup_tolerance=(None, None), log=lambda message: None, is_external=lambda: False,
+                 takeover_tolerance=(None, None)):
         # is_locked(index): the operator locked that side ([ or ]). Its target is held and
         # still sent and recorded as a deliberate command. A side with a pickup tolerance
         # (the Dex1-1 gripper) keeps holding after the unlock until the live target comes
@@ -21,6 +22,13 @@ class LinkerO6ControlLoop:
         # dropped because the operator's hand relaxed while it was locked.
         self.is_locked = is_locked
         self.pickup_tolerance = tuple(pickup_tolerance)
+        # is_external(): a policy drives the hands (teleop takeover, g), so this loop sends
+        # nothing. When the operator takes over, a side with a takeover tolerance keeps the
+        # policy's target, as after an unlock, until the operator's hand is that close to it or
+        # crosses it, so a gripped cup or a pulled lever is not let go at the handover.
+        self.is_external = is_external
+        self.takeover_tolerance = tuple(takeover_tolerance)
+        self.handover = False
         self.log = log
         self.locked = [False, False]
         self.pickup = [None, None]
@@ -63,6 +71,9 @@ class LinkerO6ControlLoop:
     def _step(self):
         if self.stop_event.is_set() or self.should_stop():
             return
+        if self.is_external():
+            self._yield_to_external()
+            return
         if self.should_pause():
             self._hold_paused_targets()
             return
@@ -71,6 +82,8 @@ class LinkerO6ControlLoop:
                 retargeter.reset()
             self.timestamps = [None, None]
             self.was_paused = False
+        if self.handover:
+            self._arm_takeover_pickup()
         # Pull the latest XR state directly; there is no queue behind the arm IK.
         sample = self.get_tele_data()
         fresh = hand_tracking_freshness(sample, self.tracking_timeout, time.monotonic())
@@ -114,6 +127,9 @@ class LinkerO6ControlLoop:
         ))
         if self.stop_event.is_set() or self.should_stop():
             return
+        if self.is_external():
+            self._yield_to_external()
+            return
         if self.should_pause():
             self._hold_paused_targets()
             return
@@ -135,12 +151,31 @@ class LinkerO6ControlLoop:
         sign = np.sign(difference)
         previous = self.pickup[side]["sign"]
         crossed = previous is not None and bool(np.any(sign * previous < 0))
-        if float(np.max(np.abs(difference))) <= self.pickup_tolerance[side] or crossed:
+        tolerance = self.pickup[side].get("tolerance", self.pickup_tolerance[side])
+        if float(np.max(np.abs(difference))) <= tolerance or crossed:
+            message = self.pickup[side].get(
+                "released", f"[R1 HAND LOCK] {SIDES[side]} gripper follows your pinch again.")
             self.pickup[side] = None
-            self.log(f"[R1 HAND LOCK] {SIDES[side]} gripper follows your pinch again.")
+            self.log(message)
             return True
         self.pickup[side]["sign"] = sign
         return False
+
+    def _yield_to_external(self):
+        self.was_paused = True
+        self.handover = True
+        self.targets = list(self.controller.get_action())
+        self._cache_recording_sample()
+        self.on_update(self.controller.get_state(), self.controller.get_action())
+
+    def _arm_takeover_pickup(self):
+        self.handover = False
+        for side, tolerance in enumerate(self.takeover_tolerance):
+            if tolerance is None:
+                continue
+            self.pickup[side] = {"sign": None, "tolerance": tolerance,
+                                 "released": f"[R1 TAKEOVER] {SIDES[side]} hand follows you again."}
+            self.log(f"[R1 TAKEOVER] {SIDES[side]} hand keeps the policy's target until yours matches it.")
 
     def _hold_paused_targets(self):
         self.was_paused = True

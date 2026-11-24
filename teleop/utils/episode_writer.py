@@ -53,6 +53,7 @@ class EpisodeWriter:
         self._lock = Lock()
         self._state = "idle"
         self._create_pending = False
+        self._episode_info = {}
         self._closed = False
         self._error = None
         self.quality_report = quality_report
@@ -103,13 +104,15 @@ class EpisodeWriter:
                 "error": str(self._error) if self._error is not None else None,
             }
 
-    def create_episode(self):
+    def create_episode(self, extra_info=None):
+        """Start an episode. extra_info is merged into this episode's info only (e.g. intervention)."""
         self.raise_if_failed()
         with self._lock:
             if self._closed or self._state != "idle":
                 return False
             self._state = "recording"
             self._create_pending = True
+            self._episode_info = deepcopy(extra_info or {})
             self._outcome = "unspecified"
             self._started_at = datetime.datetime.now().astimezone()
             self._saved_at = None
@@ -176,6 +179,8 @@ class EpisodeWriter:
         episode_dir.mkdir()
         self.episode_dir = episode_dir
         self.info = deepcopy(self._base_info)
+        with self._lock:
+            self.info.update(deepcopy(self._episode_info))
         self.info["date"] = self._started_at.date().isoformat()
         self._frame_count = 0
         self._image_paths = {}
