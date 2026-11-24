@@ -47,6 +47,39 @@ def still_rows(times_ns, actions, limits, window_s=PAUSE_WINDOW_S):
     return (dt >= window_s / 2) & np.all(rate < limits, axis=1)
 
 
+def qpos_noise_scale(joint_groups, units, qpos_std, sigma):
+    """Per-input noise standard deviation in normalized qpos units for --qpos-noise (sigma in rad).
+
+    Arm, waist and head joint inputs (groups not ending in _ee) get sigma radians. The O6 hand
+    and Dex1 gripper inputs stay exact: the policy reads them to decide when to grasp and release.
+    """
+    if not joint_groups or not units:
+        raise ValueError("qpos noise needs joint_groups and units in dataset.json")
+    if not (math.isfinite(sigma) and sigma > 0):
+        raise ValueError("qpos noise sigma must be a positive number of radians")
+    qpos_std = np.asarray(qpos_std, dtype=np.float64)
+    scale, index = [], 0
+    for group, size in joint_groups.items():
+        for _ in range(size):
+            if index >= len(units) or index >= len(qpos_std):
+                raise ValueError("joint_groups, units and qpos_std disagree on the state size")
+            if group.endswith("_ee"):
+                scale.append(0.0)
+            elif units[index] != "rad":
+                raise ValueError(f"qpos noise expects radians for {group}, found {units[index]}")
+            else:
+                scale.append(sigma / qpos_std[index])
+            index += 1
+    if index != len(units) or index != len(qpos_std):
+        raise ValueError("joint_groups, units and qpos_std disagree on the state size")
+    return np.asarray(scale, dtype=np.float32)
+
+
+def add_qpos_noise(qpos, scale):
+    """qpos (normalized, batch x 24) plus Gaussian noise with per-input standard deviation scale."""
+    return qpos + torch.randn_like(qpos) * scale.to(qpos.dtype)
+
+
 def pause_trim_rows(times_ns, actions, limits, max_pause_s, window_s=PAUSE_WINDOW_S):
     """Rows deep inside still stretches longer than max_pause_s (True = drop as a training sample).
 
