@@ -89,6 +89,11 @@ PY
 
 训练输出 `run.json`（配置、源码和数据哈希）、`metrics.jsonl`、`best.pt`、`latest.pt`。模型只用验证集选优。验证连续 10 次不改善时早停。checkpoint 原子写入，包含模型、归一化、硬件约定；`latest.pt` 额外保留优化器、随机数和采样位置。
 
+两个可选训练参数，默认都关闭：
+
+- `--max-pause-seconds S`：静止超过 S 秒的片段只保留开头和结尾各 S/2 秒作为样本（训练集和验证集相同），减少等待接料时的静止帧。S 至少为动作块时长的两倍。第 2 轮用 4 秒。
+- `--qpos-noise SIGMA`：训练时给手臂、腰、头的关节输入加标准差 SIGMA（rad）的高斯噪声，让策略学会在姿态偏离时拉回。目标动作、O6/Dex1 输入和验证集不加噪声。第 3 轮的 0.05 偏大。
+
 恢复时重复原命令并加 `--resume`。数据哈希、batch、累计次数、上下文、增强、seed、KL 权重必须一致。每个微批次有确定性的采样种子；Ctrl+C 在梯度累计中途不会把不完整优化步骤覆盖成恢复点，恢复从最近一次完整保存继续。浮点运算不承诺跨 GPU／驱动逐位一致。
 
 ```bash
@@ -159,6 +164,10 @@ annotations='/home/hnh/unitree_r1_dev/work/icecream-il24-20261116/reviewed_phase
 
 第一次 `r` 以 `--start-speed`（默认 0.3 rad/s；腰最快 20°/s）把手臂、头、腰和手移到该录制第 `--start-frame` 帧（默认 0）的实测姿态并保持；第二次 `r` 再检查训练范围，然后开始策略。起始姿态超出训练范围，或移过去需要超过 `--max-start-approach-seconds`（默认 15 秒）时拒绝。
 
+`--start-pose standard`（或一个标准姿态 .json）使用遥操 `o` 键的同一个标准起始姿态：第 2 轮示教起点的平均手臂和头部姿态，腰 0°，手为文件里记录的首帧平均值。用 .json 时不能再加 `--start-frame`。
+
+腰部保持：按键转身的示教里腰正好停在 0°、±90°、±148° 档位，而策略输出的腰目标会在档位附近漂几度。策略腰目标或起始腰角离档位 `--waist-capture-deg`（默认 2°）以内时开始保持在档位；离开超过 `--waist-snap-deg`（默认 5°）时松开，按策略原值转身。`--waist-snap-deg 0` 关闭。`ticks.jsonl` 的 `target` 是策略原值，`command` 是实际发送值。
+
 - `r`：开始或从手动暂停恢复；先检查起始关节范围和首个目标差。
 - `p`：保持当前命令目标并暂停。
 - `n`：阶段模型人工确认下一阶段；基础模型无阶段切换。
@@ -182,7 +191,11 @@ annotations='/home/hnh/unitree_r1_dev/work/icecream-il24-20261116/reviewed_phase
   --outcome failure --failure-phase dispense --reason "拉杆没有拉到位"
 ```
 
-需要纠错时先退出策略进程，再使用原有遥操采集脚本录一条人类示教；不能让两个进程同时写电机。成功示教完成后可通过 `--correction /path/to/episode` 关联到该次 intervention。这里只记录人工反馈和示教来源，**没有实现无缝同时接管，也不会把模型自己输出的动作自动当成人类真值**。
+需要纠错时有两种方式。
+
+**遥操中接管（HG-DAgger，2026-11-23 起）**：在 `teleop/run_r1_a7_visionpro_capture.sh` 的参数后面加 `--policy /path/to/best.pt`（需要录制、左 O6、右 Dex1-1）。模型在遥操进程里运行，机器人始终只有一个控制来源。按 `r` 激活 → `o` 到标准起始姿态 → `g` 让模型从当前保持的姿态开始控制；快要出错时按 `s` 接管并录制纠正，`r` 接管但不录制，`p` 停止模型并保持。`r` 之前、录制中、`o` 移动中或有手／头锁定时 `g` 会被拒绝。保护条件与 `run_r1_act_policy.py --execute` 相同，单次 `g` 最长 `--policy-max-seconds`（默认 120 秒）。接管后的录制在 `info.intervention` 里记下 checkpoint、模型运行时长和结束原因，模型运行的 tick 写到 `policy-runs/<时间>_takeover/`。录进数据的只有接管后人的动作，模型自己的输出不会当成示教。接管后每只手先停在模型最后的目标，等操作者的手对上（O6 0.2 rad，Dex1 0.1 rad）再跟随。导出和训练还没有对接管录制单独加权，它们和普通分段录制一样导出。
+
+**单独录一条示教**：先退出策略进程，再使用原有遥操采集脚本录一条人类示教；不能让两个进程同时写电机。成功示教完成后可通过 `--correction /path/to/episode` 关联到该次 intervention。
 
 ```bash
 "$R1_DEV_ROOT/.venv-train/bin/python" tools/report_r1_il.py \
