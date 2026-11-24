@@ -168,6 +168,39 @@ class R1PauseControlIntegrationTest(unittest.TestCase):
         self.sample.motion_data_timestamp = now
         execute(self.nodes, self.ns, loop=True)
 
+    def resume_at_turned_waist(self, compensation):
+        args = self.ns["args"]
+        args.waist_follow, args.waist_follow_compensation = True, compensation
+        self.ns["r1_waist_yaw_reference"] = 0.0
+        self.ns["arm_ctrl"].get_current_waist_yaw.return_value = -np.pi / 2  # e.g. a policy turned it
+        self.state.pause()
+        self.tick(1.0)
+        self.state.request_resume(1.0)
+        now = 1.0
+        while self.state.paused:
+            now += 0.1
+            self.tick(now)
+            self.assertLess(now, 3.0)
+        return now
+
+    def test_a_resume_at_a_turned_waist_keeps_the_operator_direction_in_torso_mode(self):
+        """The 2026-11-24 takeover resumed at -88 deg; the arm then moved 91 deg off the operator's direction."""
+        now = self.resume_at_turned_waist("torso")
+        np.testing.assert_allclose(self.ns["r1_waist_to_root"], np.eye(3), atol=1e-12)
+        self.tick(now + 0.1)
+        before = self.ns["arm_ik"].solve_ik.call_args.args[0][:3, 3].copy()
+        moved = self.sample.left_wrist_pose.copy()
+        moved[0, 3] += 0.02  # the operator's hand moves 2 cm forward, relative to their torso
+        self.sample.left_wrist_pose = moved
+        self.tick(now + 0.2)
+        after = self.ns["arm_ik"].solve_ik.call_args.args[0][:3, 3]
+        np.testing.assert_allclose(after - before, [0.02, 0.0, 0.0], atol=1e-9)
+
+    def test_world_mode_still_maps_through_the_live_waist_after_a_resume(self):
+        self.resume_at_turned_waist("world")
+        expected = np.array([[0.0, 1.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 0.0, 1.0]])
+        np.testing.assert_allclose(self.ns["r1_waist_to_root"], expected, atol=1e-12)
+
     def test_native_head_loss_automatically_realigns_at_held_pose_without_jump(self):
         source = SimpleNamespace(needs_realign=True, get_hold_reason=Mock(return_value="head_untracked"),
                                  clear_hold_reason=Mock())
