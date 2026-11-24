@@ -25,6 +25,10 @@ MAX_SECONDS = 20.0
 # After the timed move the last target is sent a little longer, so the arm target shaper
 # reaches it exactly before the pause holds it.
 SETTLE_SECONDS = 0.5
+# The move ends once the controller's own arm target is this close to the pose, or, if it
+# never gets there, this long after the settle time, with a warning saying how far off it is.
+CONVERGED_RAD = 0.01
+MAX_EXTRA_SECONDS = 2.0
 # The controller clips head targets to these (pitch, yaw) limits.
 HEAD_LOWER = np.array([-0.62832, -2.0071])
 HEAD_UPPER = np.array([0.62832, 2.0071])
@@ -191,6 +195,14 @@ class R1StandardPose:
         arm, head, waist, finished = self._move.at(now)
         arm_ctrl.ctrl_dual_arm_and_head(arm, self.gravity(arm), head, waist_yaw_target=waist)
         if finished:
-            self._finish("[R1 START POSE] at the standard start pose and holding. s starts the next episode; "
-                         "r resumes without recording. Following re-anchors at your hands.")
+            # Judge arrival by the target the controller actually holds, which passes the arm
+            # target shaper, not by what was sent.
+            requested = np.asarray(arm_ctrl.get_recording_snapshot()["requested"]["arm_q"], dtype=float)
+            residual = float(np.abs(requested - self._move.arm).max())
+            if residual <= CONVERGED_RAD:
+                self._finish("[R1 START POSE] at the standard start pose and holding. s starts the next episode; "
+                             "r resumes without recording. Following re-anchors at your hands.")
+            elif float(now) - self._move.started >= self._move.duration + SETTLE_SECONDS + MAX_EXTRA_SECONDS:
+                self._finish(f"[R1 START POSE] the arm target stayed {residual:.3f} rad from the standard pose; "
+                             "holding where it is. Press o to try again.", "warning")
         return True

@@ -10,9 +10,10 @@ from unittest.mock import Mock
 
 import numpy as np
 
+from teleop.robot_control.arm_target_shaper import ArmTargetShaper
 from teleop.robot_control.r1_standard_pose import (
-    DEFAULT_POSE_PATH, MIN_SECONDS, SETTLE_SECONDS, STANDARD_POSE_KEYS, R1StandardPose, StandardPoseMove,
-    load_standard_pose, standard_start_pose,
+    DEFAULT_POSE_PATH, MAX_EXTRA_SECONDS, MIN_SECONDS, SETTLE_SECONDS, STANDARD_POSE_KEYS, R1StandardPose,
+    StandardPoseMove, load_standard_pose, standard_start_pose,
 )
 import test_r1_pause as pause_fixture
 
@@ -210,6 +211,18 @@ class ControlTest(unittest.TestCase):
             self.assertFalse(self.control.moving())
             self.assertIn("stopped", self.logger.warning.call_args.args[0])
 
+    def test_it_reports_arrival_only_when_the_controller_target_is_there(self):
+        arm = fake_arm(np.full(14, 0.2), [0.0, 0.0])
+        arm.ctrl_dual_arm_and_head.side_effect = None  # the controller target never moves
+        self.control.press()
+        calls = self.run_move(arm)
+        self.assertFalse(self.control.moving())
+        message = self.logger.warning.call_args.args[0]
+        self.assertIn("stayed 0.300 rad", message)
+        move_time = 0.025 * (len(calls) - 1)
+        self.assertGreaterEqual(move_time, MIN_SECONDS + SETTLE_SECONDS + MAX_EXTRA_SECONDS - 0.05)
+        self.assertNotIn("at the standard start pose", str(self.logger.info.call_args_list[-1]))
+
     def test_a_move_that_would_take_too_long_is_refused_and_o_works_again(self):
         control = R1StandardPose(self.pose, lambda q: GRAVITY.copy(), self.logger, arm_speed=0.01)
         arm = fake_arm(np.full(14, 0.2), [0.0, 0.0])
@@ -264,6 +277,45 @@ class LoopAndKeyTest(unittest.TestCase):
         self.assertFalse(self.state.paused)
         np.testing.assert_allclose(self.ns["arm_ik"].reset_smoothing.call_args.kwargs["reference_q"], self.pose["arm_q"])
         np.testing.assert_allclose(self.ns["arm_ik"].forward_wrist_poses.call_args.args[0], self.pose["arm_q"])
+
+    def test_the_loop_does_not_hold_targets_while_the_move_commands(self):
+        hold = self.ns["arm_ctrl"].hold_targets
+        self.ns["on_press"]("o")
+        now = 1.0
+        self.fixture.tick(now)
+        before = hold.call_count
+        while self.control.moving():
+            now += 0.1
+            self.fixture.tick(now)
+        self.assertEqual(hold.call_count, before, "a hold during the move resets the arm target shaper")
+        self.fixture.tick(now + 0.1)
+        self.assertGreater(hold.call_count, before)
+
+    def test_arms_reach_the_pose_through_the_real_arm_target_shaper(self):
+        """The 2026-11-23 robot test: the head arrived, the arms never moved."""
+        shaper = ArmTargetShaper(velocity_limit=6.0, accel_limit=40.0)
+        requested = self.fixture.requested
+        shaper.reset(np.array(requested["arm_q"]))
+        start = list(requested["arm_q"])
+
+        def send(q, tau, head, **kwargs):  # as R1_A7_ArmController: the arm target is shaped, the head is not
+            requested.update(arm_q=shaper.shape(q, now=self.fixture.now).tolist(), arm_tau=list(tau),
+                             head_q=list(head))
+
+        self.ns["arm_ctrl"].ctrl_dual_arm_and_head.side_effect = send
+        self.ns["arm_ctrl"].hold_targets.side_effect = lambda: shaper.reset(np.array(requested["arm_q"]))
+        self.ns["on_press"]("o")
+        now = 1.0
+        while True:
+            self.fixture.tick(now)
+            if not self.control.moving():
+                break
+            now += 0.025
+            self.assertLess(now, 20.0)
+        np.testing.assert_allclose(requested["arm_q"], self.pose["arm_q"], atol=0.01)
+        np.testing.assert_allclose(requested["head_q"], self.pose["head_q"])
+        self.assertGreater(np.abs(np.array(start) - self.pose["arm_q"]).max(), 0.3)
+        self.control.logger.warning.assert_not_called()
 
     def test_o_is_refused_before_start_and_during_an_episode(self):
         for name, value in (("START", False), ("RECORD_RUNNING", True)):

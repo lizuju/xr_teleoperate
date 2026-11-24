@@ -1893,6 +1893,7 @@ if __name__ == '__main__':
                                   else 'Manual pause remains active; press r/s to resume.')
             capture_mode = "following"
             run_motion = True
+            standard_moving = False
             if R1_PAUSE is not None and R1_PAUSE.paused:
                 capture_mode = "paused"
                 run_motion = False
@@ -2334,7 +2335,11 @@ if __name__ == '__main__':
                         else:
                             workspace.hold()
             else:
-                arm_ctrl.hold_targets()
+                # While o moves the robot it sets this tick's targets itself. hold_targets()
+                # resets the arm target shaper, which then holds for a tick, so calling it
+                # every tick kept the arms still while the head moved (2026-11-23).
+                if not standard_moving:
+                    arm_ctrl.hold_targets()
                 held = arm_ctrl.get_recording_snapshot()["requested"]
                 sol_q = np.array(held["arm_q"])
                 sol_tauff = np.array(held["arm_tau"])
