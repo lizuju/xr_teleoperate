@@ -668,7 +668,8 @@ if __name__ == '__main__':
     parser.add_argument('--startup-wrist-align', action='store_true', help='R1_A7: align wrist orientation to the initial Vision Pro pose before following')
     parser.add_argument('--standard-pose', type=str, default=str(DEFAULT_POSE_PATH), help='R1_A7 hand teleop: pose file (arm_q, head_q) '
                         'that the o key moves to between recordings; the waist goes to the activation heading. "none" turns o off. '
-                        'Default: the mean start of the round 2 ice-cream training demos.')
+                        'With --policy, o also moves the hands to left_hand_q/right_hand_q in the file, the start of '
+                        'run_r1_act_policy.py --start-pose standard. Default: the mean start of the round 2 ice-cream training demos.')
     parser.add_argument('--standard-pose-speed', type=float, default=0.3, help='R1_A7: peak arm and head speed of the o move in rad/s, '
                         'at most 1; the waist turns at up to 20 deg/s. Default: 0.3')
     parser.add_argument('--policy', type=Path, default=None, help='R1_A7 hand teleop with --record, left O6 + right Dex1-1: '
@@ -735,9 +736,11 @@ if __name__ == '__main__':
         if not (math.isfinite(args.policy_blend_seconds) and args.policy_blend_seconds >= 0.0):
             parser.error('--policy-blend-seconds must be at least 0')
     if args.standard_pose != 'none':
-        from teleop.robot_control.r1_standard_pose import load_standard_pose
+        from teleop.robot_control.r1_standard_pose import load_standard_hands, load_standard_pose
         try:
             load_standard_pose(args.standard_pose)
+            if args.policy is not None:
+                load_standard_hands(args.standard_pose)
         except (OSError, ValueError) as exc:
             parser.error(f'--standard-pose {args.standard_pose}: {exc}')
     if args.tracking_source == 'visionpro':
@@ -1811,14 +1814,20 @@ if __name__ == '__main__':
             R1_PAUSE = R1PauseState()
             logger_mp.info("[R1 CONTROL] [p] pauses and holds; [r] realigns and resumes; when recording is enabled, [s] also starts the next episode after resume; [q] exits.")
             if args.standard_pose != 'none':
-                from teleop.robot_control.r1_standard_pose import R1StandardPose, arm_gravity, load_standard_pose
+                from teleop.robot_control.r1_standard_pose import (
+                    R1StandardPose, arm_gravity, load_standard_hands, load_standard_pose,
+                )
+                # With --policy, o also puts the hands on the pose's recorded start: the first takeover
+                # (2026-11-24) began g with the gripper closed and the policy lost 15 s getting going.
+                standard_hands = load_standard_hands(args.standard_pose) if args.policy is not None else None
                 STANDARD_POSE = R1StandardPose(
                     load_standard_pose(args.standard_pose), arm_gravity(arm_ik), logger_mp,
                     arm_speed=args.standard_pose_speed, head_speed=args.standard_pose_speed,
+                    hands=standard_hands, hand_ctrl=hand_ctrl if standard_hands is not None else None,
                 )
-                logger_mp.info("[R1 START POSE] [o] pauses and moves to the standard start pose (%s); then [s] starts "
+                logger_mp.info("[R1 START POSE] [o] pauses and moves to the standard start pose (%s)%s; then [s] starts "
                                "the next episode there, [r] resumes without recording; [o] again stops the move.",
-                               args.standard_pose)
+                               args.standard_pose, ", hands included (--policy)" if standard_hands is not None else "")
             if args.policy is not None:
                 from teleop.robot_control.r1_standard_pose import arm_gravity
                 from teleop.utils.policy_takeover import create_policy_takeover
@@ -1864,7 +1873,12 @@ if __name__ == '__main__':
                 pickup_tolerance=(None, DEX1_UNLOCK_PICKUP_RAD
                                   if getattr(args, "right_ee", "linker_o6") == "dex1" else None),
                 log=logger_mp.info,
-                is_external=lambda: globals().get("POLICY") is not None and globals()["POLICY"].driving(),
+                # The hands are driven from the main loop while the policy runs or, with --policy, while
+                # the o move puts them on the standard pose; this loop then sends nothing.
+                is_external=lambda: (globals().get("POLICY") is not None and globals()["POLICY"].driving())
+                or (globals().get("STANDARD_POSE") is not None and globals()["STANDARD_POSE"].commanding_hands()),
+                external_label=lambda: "the standard pose" if globals().get("STANDARD_POSE") is not None
+                and globals()["STANDARD_POSE"].commanding_hands() else "the policy's target",
                 takeover_tolerance=(O6_TAKEOVER_PICKUP, DEX1_UNLOCK_PICKUP_RAD
                                     if getattr(args, "right_ee", "linker_o6") == "dex1" else O6_TAKEOVER_PICKUP),
             )
@@ -2015,6 +2029,8 @@ if __name__ == '__main__':
                 standard_moving = not policy_driving and standard_pose is not None and standard_pose.step(
                     arm_ctrl, pause_generation, r1_waist_yaw_reference if args.waist_follow else None,
                     time.monotonic(), head_locked=head_lock is not None and head_lock.locked(),
+                    hand_locked=globals()["HAND_LOCKS"].snapshot() if globals().get("HAND_LOCKS") is not None
+                    else (False, False),
                 )
                 if not (standard_moving or policy_driving):
                     arm_ctrl.hold_targets()

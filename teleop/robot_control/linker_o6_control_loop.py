@@ -14,7 +14,7 @@ class LinkerO6ControlLoop:
     def __init__(self, get_tele_data, retargeter, controller, frequency, tracking_timeout,
                  should_stop, on_update, should_pause=lambda: False, is_locked=lambda index: False,
                  pickup_tolerance=(None, None), log=lambda message: None, is_external=lambda: False,
-                 takeover_tolerance=(None, None)):
+                 takeover_tolerance=(None, None), external_label=lambda: "the policy's target"):
         # is_locked(index): the operator locked that side ([ or ]). Its target is held and
         # still sent and recorded as a deliberate command. A side with a pickup tolerance
         # (the Dex1-1 gripper) keeps holding after the unlock until the live target comes
@@ -28,6 +28,9 @@ class LinkerO6ControlLoop:
         # crosses it, so a gripped cup or a pulled lever is not let go at the handover.
         self.is_external = is_external
         self.takeover_tolerance = tuple(takeover_tolerance)
+        # What drove the hands last (the policy, or the o move with --policy), for the handover log.
+        self.external_label = external_label
+        self.handover_label = "the policy's target"
         self.handover = False
         self.log = log
         self.locked = [False, False]
@@ -164,6 +167,7 @@ class LinkerO6ControlLoop:
     def _yield_to_external(self):
         self.was_paused = True
         self.handover = True
+        self.handover_label = self.external_label()
         self.targets = list(self.controller.get_action())
         self._cache_recording_sample()
         self.on_update(self.controller.get_state(), self.controller.get_action())
@@ -175,7 +179,7 @@ class LinkerO6ControlLoop:
                 continue
             self.pickup[side] = {"sign": None, "tolerance": tolerance,
                                  "released": f"[R1 TAKEOVER] {SIDES[side]} hand follows you again."}
-            self.log(f"[R1 TAKEOVER] {SIDES[side]} hand keeps the policy's target until yours matches it.")
+            self.log(f"[R1 TAKEOVER] {SIDES[side]} hand keeps {self.handover_label} until yours matches it.")
 
     def _hold_paused_targets(self):
         self.was_paused = True
