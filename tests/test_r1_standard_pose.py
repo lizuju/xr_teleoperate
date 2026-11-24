@@ -366,7 +366,7 @@ class FakeHands:
 
 
 class StandardHandsTest(unittest.TestCase):
-    """With --policy, o also puts the hands on the file's recorded start (2026-11-24).
+    """o also puts the hands on the file's recorded start, for demos and takeovers alike (2026-11-24).
 
     The first takeover began g with the Dex1-1 closed (4.28 rad) and the O6 half closed. The
     policy spent 6 s opening the gripper and turned the waist 9 s later than in the standalone
@@ -458,7 +458,7 @@ class StandardHandsTest(unittest.TestCase):
         self.assertFalse(control.step(arm, 1, None, 1.1))
         self.assertFalse(control.commanding_hands())
 
-    def test_without_policy_hands_o_leaves_the_hands_alone(self):
+    def test_without_standard_hands_o_leaves_the_hands_alone(self):  # e.g. two O6 hands
         control = R1StandardPose(self.pose, lambda q: GRAVITY.copy(), self.logger)
         self.assertFalse(any(self.run_move(control)))
         self.assertEqual(self.hand.updates, [])
@@ -508,13 +508,15 @@ class StandardHandsHandLoopTest(unittest.TestCase):
 
 
 class StandardHandsWiringTest(unittest.TestCase):
-    def test_teleop_moves_the_hands_only_with_policy_and_the_hand_loop_yields(self):
+    def test_teleop_moves_the_hands_on_every_o6_dex1_run_and_the_hand_loop_yields(self):
         source = (ROOT / "teleop/teleop_hand_and_arm.py").read_text(encoding="utf-8")
-        self.assertIn("standard_hands = load_standard_hands(args.standard_pose) if args.policy is not None else None",
-                      source)
+        o6_dex1 = "args.ee == 'linker_o6' and getattr(args, 'right_ee', None) == 'dex1'"
+        self.assertIn("standard_hands = (load_standard_hands(args.standard_pose)\n"
+                      f"                                  if {o6_dex1} else None)", source)
+        self.assertNotIn("load_standard_hands(args.standard_pose) if args.policy is not None", source)
         self.assertIn('globals()["STANDARD_POSE"].commanding_hands()),', source)
         parse = source[source.index("args = parser.parse_args()"):source.index("if args.tracking_source == 'visionpro':")]
-        self.assertIn("if args.policy is not None:\n                load_standard_hands(args.standard_pose)", parse)
+        self.assertIn(f"if {o6_dex1}:\n                load_standard_hands(args.standard_pose)", parse)
 
     def test_the_loop_passes_the_hand_locks(self):
         keys = LoopAndKeyTest()
