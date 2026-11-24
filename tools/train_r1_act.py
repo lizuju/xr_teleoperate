@@ -3,6 +3,7 @@
 import argparse
 import hashlib
 import json
+import math
 from pathlib import Path
 import random
 import sys
@@ -32,6 +33,9 @@ def parse_args(argv=None):
     p.add_argument('--accumulate', type=int, default=4)
     p.add_argument('--chunk-size', type=int, default=40)
     p.add_argument('--conditioned', action='store_true', help='Use reviewed phase labels and learn phase completion')
+    p.add_argument('--max-pause-seconds', type=float, default=None,
+                   help='Train less on standing still: in a still stretch longer than this, keep only the first and '
+                        'last half as samples (train and val alike). At least twice the chunk horizon. Default: off')
     p.add_argument('--lr', type=float, default=1e-4)
     p.add_argument('--lr-backbone', type=float, default=1e-5)
     p.add_argument('--weight-decay', type=float, default=1e-4)
@@ -53,7 +57,17 @@ def parse_args(argv=None):
     for key in ('steps', 'batch_size', 'accumulate', 'chunk_size', 'eval_every', 'save_every', 'log_every', 'patience'):
         if getattr(args, key) < 1:
             p.error(f'{key} must be positive')
+    if args.max_pause_seconds is not None and not (math.isfinite(args.max_pause_seconds) and args.max_pause_seconds > 0):
+        p.error('max_pause_seconds must be a positive number of seconds')
     return args
+
+
+def training_settings(args):
+    """Settings a resumed run must share. Pause trimming joins only when used, so older runs still resume."""
+    settings = {k: getattr(args, k) for k in ('batch_size', 'accumulate', 'chunk_size', 'conditioned', 'seed', 'no_augment', 'kl_weight')}
+    if getattr(args, 'max_pause_seconds', None) is not None:
+        settings['max_pause_seconds'] = args.max_pause_seconds
+    return settings
 
 
 def dataset_info(root, metadata, train_loader, val_loader):
@@ -112,15 +126,15 @@ def train(args):
         raise ValueError('Output exists; choose a new run or use --resume')
     random.seed(args.seed); np.random.seed(args.seed); torch.manual_seed(args.seed)
     torch.backends.cudnn.benchmark = False
-    train_data = R1ACTDataset(args.dataset, 'train', args.chunk_size)
-    val_data = R1ACTDataset(args.dataset, 'val', args.chunk_size)
+    train_data = R1ACTDataset(args.dataset, 'train', args.chunk_size, args.max_pause_seconds)
+    val_data = R1ACTDataset(args.dataset, 'val', args.chunk_size, args.max_pause_seconds)
     meta = train_data.metadata
     validate_contract(meta)
     if not len(train_data) or not len(val_data):
         raise ValueError('Training requires separate nonempty train and validation source episodes')
     if args.conditioned and not (meta.get('phase_annotations') or {}).get('reviewed'):
         raise ValueError('Conditioned training requires reviewed within-episode phase annotations')
-    settings = {k: getattr(args, k) for k in ('batch_size', 'accumulate', 'chunk_size', 'conditioned', 'seed', 'no_augment', 'kl_weight')}
+    settings = training_settings(args)
     resume = read_checkpoint(args.output / 'latest.pt') if args.resume else None
     start = 0 if resume is None else resume['step']
     sampler = BalancedBatchSampler(train_data, args.batch_size, start * args.accumulate,
@@ -130,6 +144,11 @@ def train(args):
     train_loader = DataLoader(train_data, batch_sampler=sampler, **options)
     val_loader = DataLoader(val_data, batch_size=args.batch_size, shuffle=False, **options)
     info = dataset_info(args.dataset, meta, train_loader, val_loader)
+    if args.max_pause_seconds is not None:
+        info['pause_trim'] = {'train': train_data.pause_trim, 'val': val_data.pause_trim}
+        for split, trim in info['pause_trim'].items():
+            print(f"[TRAIN] pause trim {split}: {trim['dropped']} of {trim['observations']} samples dropped from "
+                  f"{trim['stretches']} still stretches longer than {trim['max_pause_s']:g} s", flush=True)
     hashes = {split: {source['frames_sha256'] for source in sources}
               for split, sources in info['source_splits'].items()}
     if any(hashes[a] & hashes[b] for a, b in (('train', 'val'), ('train', 'test'), ('val', 'test'))):
