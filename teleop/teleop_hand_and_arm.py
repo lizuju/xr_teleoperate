@@ -2142,7 +2142,13 @@ if __name__ == '__main__':
                         workspace.hold()
                 if args.waist_follow:
                     if any(hand_lost):
-                        arm_ctrl.hold_waist()
+                        # The waist belongs to the policy or the o move while they command the robot.
+                        # Holding it here for an operator hand out of view pinned the waist where it
+                        # was until both hands came back: on 2026-11-25 a takeover run commanded
+                        # -27 deg for 7 s while the waist stayed at -3.5 deg, and the next run never
+                        # turned at all.
+                        if not (policy_driving or standard_moving):
+                            arm_ctrl.hold_waist()
                     elif tracking_hold_active:
                         waist_follower.reset(arm_ctrl.get_current_waist_yaw(), time.monotonic())
                 tracking_hold_active = any(hand_lost)

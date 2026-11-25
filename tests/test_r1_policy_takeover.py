@@ -412,6 +412,31 @@ class LoopTest(unittest.TestCase):
                                    self.fixture.requested["arm_q"])
         self.assertEqual(set(self.calls), {self.state.generation})
 
+    def hold_waist_calls_with_hands_out_of_view(self, policy_drives, standard_moves):
+        self.ns["args"].waist_follow = True
+        self.remaining = 10 if policy_drives else 0
+        self.standard.step.return_value = standard_moves
+        hold_waist = self.ns["arm_ctrl"].hold_waist
+        self.state.pause()
+        now = 1.0
+        self.fixture.tick(now)
+        before = hold_waist.call_count
+        for _ in range(4):
+            now += 0.1
+            self.fixture.tick(now, tracked=False)  # the operator watches with their hands down
+        self.assertTrue(self.state.paused)
+        return hold_waist.call_count - before
+
+    def test_a_lost_hand_does_not_hold_the_waist_while_the_policy_drives(self):
+        """2026-11-25: the waist stayed at -3.5 deg for 7 s while the policy commanded -27 deg."""
+        self.assertEqual(self.hold_waist_calls_with_hands_out_of_view(True, False), 0)
+
+    def test_a_lost_hand_does_not_hold_the_waist_during_the_o_move(self):
+        self.assertEqual(self.hold_waist_calls_with_hands_out_of_view(False, True), 0)
+
+    def test_a_lost_hand_still_holds_the_waist_in_a_plain_pause(self):
+        self.assertGreater(self.hold_waist_calls_with_hands_out_of_view(False, False), 0)
+
 
 if __name__ == "__main__":
     unittest.main()
