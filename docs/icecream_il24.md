@@ -257,3 +257,14 @@ annotations='/home/hnh/unitree_r1_dev/work/icecream-il24-20261116/reviewed_phase
 随后按用户选择，将全部 23 条原始录制的 24,121 张右腕 JPEG 解码后交换红蓝通道，写为无损 PNG，逐张读回核对像素一致后删除旧 JPEG；完整 36,636 帧的非图像内容不变，其他三路共 74,629 张图像哈希不变。颜色版本标记已写入每条原始 episode，后续导出不再重复交换。抽查全部 211 个训练片段的 633 个观测，与修正原图经训练预处理后的像素一致。未额外保留旧颜色副本。PNG 占用更多空间，清理及修正后磁盘剩余约 22.07 GiB。
 
 用户中断的 `training-runs/icecream_act24_baseline_rgb_v2` 测试运行已删除，当时只有配置及日志，尚未保存 checkpoint；可直接用本文命令在同一路径重新开始训练。
+
+## 2026-11-25～27：flow 动作头、执行方式与第 12 轮基准
+
+- **flow 动作头**：`--head flow` 用 rectified flow 代替 CVAE + L1 解码器，推理时从固定噪声做 10 步 Euler 积分，同一观测总是得到同一段动作。第 10 轮起使用动作块 80（2 秒）。
+- **分段桥接**：导出时把只缺一帧手臂发布记录的断点接起来（72 条录制从 599 段变为 254 段），长动作块受益最大。
+- **执行方式**：默认仍是 ACT 时间平均。`--ensemble-window` 只平均最近几秒；`--executor chunk` 每 0.25 秒换最新一块，块内平滑、换块淡入；`--executor rtc` 再加实时分块引导。离线时 chunk 更快更平滑，但实机上 flow 策略失去旧计划的"惯性"，在杯子前停住，所以默认不变。
+- **推理速度**：推理进程不要冻结权重（`requires_grad_(False)`），否则自动混合精度每次都重新转换权重，推理慢 3 ms，往返超过一个 25 ms 控制周期。
+- **训练新参数**：`--ema-decay`、`--lr-schedule cosine`、`--warmup-steps`、`--min-lr-ratio`、`--image-shift`、`--snapshot-every`，默认都关闭。
+- **第 12 轮基准**：第 10 轮数据加 2026-11-26 的 4 条示范和 6 条 DAgger 纠正，EMA 0.9995、预热 1000 步后余弦衰减到 10%、图像随机平移 12 像素、40,000 步。实机 5/5 完成，46–52 秒松杯，比第 10 轮快约 20 秒。训练命令见 `tools/cloud_training/README.md`。
+- **阶段条件（第 13 轮，未成功）**：自动阶段标注（`tools/cloud_training/label_phases_r13.py`）允许跳过开头阶段。实机 0/3：停在抓杯阶段，夹爪只合到一半。原因是训练时动作块在阶段边界被截断（`act_dataset.py` 中 `is_pad |= phase_ids[indices] != phase_ids[row]`），抓杯阶段的样本里看不到"完全合拢再抬起"，运行时的时间平均又混入了未训练的块尾。
+- **Vision Pro**：连接头显时忽略终端里的 `http(s)_proxy`。
