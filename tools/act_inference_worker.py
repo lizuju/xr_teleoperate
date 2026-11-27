@@ -37,8 +37,8 @@ def main():
     if args.rtc and not args.rtc_beta > 0:
         print("[ACT WORKER] --rtc-beta must be positive", file=sys.stderr, flush=True)
         return 2
-    # Guidance differentiates through the model's inputs only.
-    model.requires_grad_(False)
+    # Keep the weights' requires_grad: autocast caches their bf16 copies only then, and freezing them made every
+    # pass about 3 ms slower (18 vs 15 ms on the 4060), enough to push the round trip past one 25 ms tick.
     predict = ChunkPredictor(model, data["normalization"], device)
     image_hw = tuple(dataset["image_size_hw"])
     state_dim, cameras = config["state_dim"], config["num_cameras"]
