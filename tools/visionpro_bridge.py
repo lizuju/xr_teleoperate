@@ -12,6 +12,11 @@ import grpc
 
 from visionpro_protocol import handtracking_pb2
 
+# The headset is always on the local network. Without enable_http_proxy=0, gRPC would tunnel the connection through
+# any http(s)_proxy exported in the launching terminal (for example the Hugging Face upload proxy) and never reach
+# the headset, so teleop stopped with FutureTimeoutError (2026-11-26).
+CHANNEL_OPTIONS = (("grpc.use_local_subchannel_pool", 1), ("grpc.enable_http_proxy", 0))
+
 
 def matrix(message):
     return [[getattr(message, f"m{row}{column}") for column in range(4)] for row in range(4)]
@@ -204,7 +209,7 @@ def receive(host, port, pending, stopping=None):
         recovered = threading.Event()
         call = None
         try:
-            with grpc.insecure_channel(f"{host}:{port}", options=(("grpc.use_local_subchannel_pool", 1),)) as channel:
+            with grpc.insecure_channel(f"{host}:{port}", options=CHANNEL_OPTIONS) as channel:
                 ready = grpc.channel_ready_future(channel)
                 deadline = time.monotonic() + 8.
                 try:
