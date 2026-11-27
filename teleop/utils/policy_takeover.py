@@ -44,10 +44,11 @@ class R1PolicyTakeover:
 
     def __init__(self, client, arm, hand, gravity, camera_config, log_dir, logger, *, checkpoint,
                  blend_seconds=2.0, max_seconds=120.0, max_start_delta=0.35, max_chunk_age=0.5,
-                 max_tracking_error=0.5, ensemble_k=0.01, waist_hold_deg=5.0, waist_capture_deg=2.0,
+                 max_tracking_error=0.5, ensemble_k=0.01, ensemble_window=0.0, waist_hold_deg=5.0, waist_capture_deg=2.0,
                  tools=None):
         self.runner, self.replay = tools or policy_tools()
-        from teleop.utils.act_runtime import ActionEnsemble, ObservationBuilder, PolicyGuard, WaistHold, split_action
+        from teleop.utils.act_runtime import (ActionEnsemble, ObservationBuilder, PolicyGuard, WaistHold, ensemble_window_ticks,
+                                              split_action)
         from teleop.utils.frame_sync import CameraSynchronizer
 
         meta = client.meta
@@ -57,7 +58,8 @@ class R1PolicyTakeover:
             raise RuntimeError(f"takeover needs a policy for {O6_DEX1}, not {meta['dataset'].get('end_effectors')}")
         if meta.get("context_dim"):
             raise RuntimeError("takeover does not run phase-conditioned policies")
-        for name, value in (("blend_seconds", blend_seconds), ("max_start_delta", max_start_delta)):
+        for name, value in (("blend_seconds", blend_seconds), ("max_start_delta", max_start_delta),
+                            ("ensemble_window", ensemble_window)):
             if not (math.isfinite(value) and value >= 0.0):
                 raise ValueError(f"{name} must be finite and nonnegative")
         for name, value in (("max_seconds", max_seconds), ("max_chunk_age", max_chunk_age),
@@ -80,14 +82,16 @@ class R1PolicyTakeover:
             "dataset": meta["dataset"], "started_at": time.time(),
             "args": {"checkpoint": str(self.checkpoint), "blend_seconds": blend_seconds, "max_seconds": max_seconds,
                      "max_start_delta": max_start_delta, "max_chunk_age": max_chunk_age,
-                     "max_tracking_error": max_tracking_error, "ensemble_k": ensemble_k,
+                     "max_tracking_error": max_tracking_error, "ensemble_k": ensemble_k, "ensemble_window": ensemble_window,
                      "waist_snap_deg": waist_hold_deg, "waist_capture_deg": waist_capture_deg},
         }, indent=2, ensure_ascii=False) + "\n")
         self._frames = (None, {"left": None, "right": None})
         builder = ObservationBuilder(arm, hand, CameraSynchronizer(["head", "left_wrist", "right_wrist"], anchor="head"),
                                      image_hw=tuple(meta["dataset"]["image_size_hw"]))
         self.run = self.runner.PolicyRun(arm, hand, lambda: self._frames, client, builder,
-                                         ActionEnsemble(client.chunk_size, ensemble_k), self.new_guard(),
+                                         ActionEnsemble(client.chunk_size, ensemble_k,
+                                                        ensemble_window_ticks(ensemble_window, float(meta["dataset"]["fps"]))),
+                                         self.new_guard(),
                                          self.log_dir / "ticks.jsonl")
         self.run.fps = float(meta["dataset"]["fps"])
         self._lock = threading.Lock()
@@ -281,7 +285,8 @@ def create_policy_takeover(args, arm, hand, gravity, camera_config, logger, log_
         return R1PolicyTakeover(client, arm, hand, gravity, camera_config,
                                 Path(log_root) / (time.strftime("%Y%m%d_%H%M%S") + "_takeover"), logger,
                                 checkpoint=args.policy, blend_seconds=args.policy_blend_seconds,
-                                max_seconds=args.policy_max_seconds, tools=(runner, replay))
+                                max_seconds=args.policy_max_seconds,
+                                ensemble_window=getattr(args, "policy_ensemble_window", 0.0), tools=(runner, replay))
     except Exception:
         client.close()
         raise

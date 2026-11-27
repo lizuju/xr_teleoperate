@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tools"))
 
-from teleop.utils.act_runtime import (ActionEnsemble, GravityModel, ObservationBuilder, PolicyClient, PolicyGuard,
+from teleop.utils.act_runtime import (ActionEnsemble, GravityModel, ensemble_window_ticks, ObservationBuilder, PolicyClient, PolicyGuard,
                                       decode_request, decode_response, encode_request, encode_response, group_errors,
                                       join_action, prepare_training_image, request_size, response_size, split_action)
 from teleop.utils.frame_sync import CameraSynchronizer
@@ -48,6 +48,28 @@ class EnsembleTests(unittest.TestCase):
         ensemble = ActionEnsemble(2)
         ensemble.add(5, np.array([[9.0], [9.0]]))
         self.assertIsNone(ensemble.get(4))
+
+    def test_a_window_lets_only_recent_chunks_vote(self):
+        chunks = ((0, 1.0), (2, 2.0), (4, 3.0), (5, 4.0))
+        everyone, recent = ActionEnsemble(8, k=0.0), ActionEnsemble(8, k=0.0, window=3)
+        for start, value in chunks:
+            everyone.add(start, np.full((8, 1), value))
+            recent.add(start, np.full((8, 1), value))
+        self.assertAlmostEqual(everyone.get(6)[0], 2.5)
+        self.assertAlmostEqual(recent.get(6)[0], 3.5)  # started at ticks 4 and 5, within 3 ticks of 6
+
+    def test_the_newest_chunk_votes_when_none_is_inside_the_window(self):
+        ensemble = ActionEnsemble(8, k=0.0, window=2)
+        ensemble.add(0, np.full((8, 1), 1.0))
+        ensemble.add(1, np.full((8, 1), 2.0))
+        self.assertEqual(ensemble.get(6)[0], 2.0)
+        self.assertIsNone(ensemble.get(9))  # the window never stretches a chunk past its horizon
+
+    def test_a_window_is_whole_ticks_from_seconds(self):
+        for bad in (-1, 1.5, True):
+            with self.assertRaises(ValueError):
+                ActionEnsemble(4, window=bad)
+        self.assertEqual([ensemble_window_ticks(s, 40.0) for s in (0.0, 0.001, 0.25, 0.5)], [0, 1, 10, 20])
 
 
 class ActionLayoutTests(unittest.TestCase):
@@ -303,6 +325,13 @@ class RunnerSafetyTests(unittest.TestCase):
         args = self.load().parse_args(["policy.pt"])
         self.assertEqual((args.arm_target_velocity_limit, args.arm_target_accel_limit, args.arm_dq_limit), (6.0, 40.0, 6.0))
         self.assertFalse(args.execute)
+
+    def test_the_ensemble_window_is_off_by_default_and_never_negative(self):
+        runner = self.load()
+        self.assertEqual(runner.parse_args(["policy.pt"]).ensemble_window, 0.0)
+        self.assertEqual(runner.parse_args(["policy.pt", "--ensemble-window", "0.5"]).ensemble_window, 0.5)
+        with self.assertRaises(SystemExit):
+            runner.parse_args(["policy.pt", "--ensemble-window", "-0.1"])
 
     def test_policy_trained_on_other_head_images_is_refused(self):
         runner = self.load()

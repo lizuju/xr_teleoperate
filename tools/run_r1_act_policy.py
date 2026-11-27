@@ -33,7 +33,7 @@ for path in (ROOT, ROOT / "tools"):
 from replay_r1_episode_on_robot import (NETWORK_INTERFACE, current_pose, hold_until_quit, send_pose, shutdown,
                                         stop_keyboard, teleop_pids)
 from teleop.robot_control.r1_standard_pose import DEFAULT_POSE_PATH, standard_start_pose
-from teleop.utils.act_runtime import (ACTION_DIM, WAIST_INDEX, ActionEnsemble, GravityModel, ObservationBuilder,
+from teleop.utils.act_runtime import (ACTION_DIM, WAIST_INDEX, ActionEnsemble, GravityModel, ObservationBuilder, ensemble_window_ticks,
                                       PolicyClient, PolicyGuard, WaistHold, group_errors, join_action, split_action,
                                       summarize)
 from teleop.utils.frame_sync import CameraSynchronizer
@@ -59,7 +59,11 @@ def parse_args(argv=None):
     parser.add_argument("--allow-out-of-range-start", action="store_true", help="Start even if the live pose is outside the training range")
     parser.add_argument("--max-tracking-error", type=float, default=0.5, help="Hold if arm error stays above this (rad)")
     parser.add_argument("--max-chunk-age", type=float, default=0.5, help="Hold if the policy has been silent this long, and drop results older than this (s)")
-    parser.add_argument("--ensemble-k", type=float, default=0.01)
+    parser.add_argument("--ensemble-k", type=float, default=0.01,
+                        help="Ensemble weights exp(-k*i), i=0 the oldest chunk: a larger k weighs older chunks more")
+    parser.add_argument("--ensemble-window", type=float, default=0.0,
+                        help="Average only the chunks predicted in the last this many seconds (the newest always votes). "
+                             "0 = every chunk covering the tick, ACT's default; at chunk 80 that is about 2 s of plans")
     # Teleop's shaper settings, which the training actions already went through. 0 disables the shaper.
     parser.add_argument("--arm-target-velocity-limit", type=float, default=6.0)
     parser.add_argument("--arm-target-accel-limit", type=float, default=40.0)
@@ -110,7 +114,7 @@ def parse_args(argv=None):
     for key in ("max_seconds", "max_chunk_age", "max_tracking_error"):
         if not math.isfinite(getattr(args,key)) or getattr(args,key) <= 0:
             parser.error(f"{key} must be finite and positive")
-    for key in ("blend_seconds", "max_start_delta", "ensemble_k", "dispense_min_phase_seconds",
+    for key in ("blend_seconds", "max_start_delta", "ensemble_k", "ensemble_window", "dispense_min_phase_seconds",
                 "arm_target_velocity_limit", "arm_target_accel_limit", "arm_velocity_limit", "arm_dq_limit"):
         if not math.isfinite(getattr(args,key)) or getattr(args,key) < 0:
             parser.error(f"{key} must be finite and nonnegative")
@@ -443,8 +447,12 @@ def main(argv=None):
         sync = CameraSynchronizer(["head", "left_wrist", "right_wrist"], anchor="head")
         guard = PolicyGuard(meta["normalization"], max_tracking_error=args.max_tracking_error,
                             max_chunk_age_s=args.max_chunk_age, gripper_limits=(gripper_low, gripper_high))
+        window_ticks = ensemble_window_ticks(args.ensemble_window, fps)
+        if window_ticks:
+            print(f"[POLICY] ensemble window {args.ensemble_window:g} s = {window_ticks} ticks (chunk {client.chunk_size})",
+                  flush=True)
         run = PolicyRun(arm, hand, cameras, client, ObservationBuilder(arm, hand, sync, image_hw=tuple(meta["dataset"]["image_size_hw"])),
-                        ActionEnsemble(client.chunk_size, args.ensemble_k), guard, log_dir / "ticks.jsonl")
+                        ActionEnsemble(client.chunk_size, args.ensemble_k, window_ticks), guard, log_dir / "ticks.jsonl")
         run.fps = fps
         if meta.get("context_dim"):
             run.task = IcecreamTask((gripper_low, gripper_high), args.auto_stage, args.dispense_min_phase_seconds)

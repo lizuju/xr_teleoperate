@@ -679,6 +679,8 @@ if __name__ == '__main__':
                         'r takes over without recording; p stops it and holds. Same guards as run_r1_act_policy.py --execute.')
     parser.add_argument('--policy-max-seconds', type=float, default=120.0, help='Longest one g run may command before it holds. Default: 120')
     parser.add_argument('--policy-blend-seconds', type=float, default=2.0, help='Blend from the held pose to the policy over this long. Default: 2')
+    parser.add_argument('--policy-ensemble-window', type=float, default=0.0, help='Average only the policy chunks predicted in the '
+                        'last this many seconds, like run_r1_act_policy.py --ensemble-window. Default: 0 (every covering chunk)')
     parser.add_argument('--policy-device', default='auto', help='Inference device for --policy: auto, cuda or cpu')
     parser.add_argument('--policy-worker-python', type=Path, default=Path(parent_dir).parent / '.venv-train/bin/python',
                         help='Python with torch for the --policy inference worker')
@@ -736,6 +738,8 @@ if __name__ == '__main__':
             parser.error('--policy-max-seconds must be positive')
         if not (math.isfinite(args.policy_blend_seconds) and args.policy_blend_seconds >= 0.0):
             parser.error('--policy-blend-seconds must be at least 0')
+        if not (math.isfinite(args.policy_ensemble_window) and args.policy_ensemble_window >= 0.0):
+            parser.error('--policy-ensemble-window must be at least 0')
     if args.standard_pose != 'none':
         from teleop.robot_control.r1_standard_pose import load_standard_hands, load_standard_pose
         try:
