@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
+import os
 from pathlib import Path
 import socket
 import sys
@@ -198,6 +199,19 @@ class RecoveryGrpcTest(unittest.TestCase):
         self.assertNotEqual(self.peers[0], self.peers[1])
         self.assertTrue(all(("grpc.use_local_subchannel_pool", 1) in options
                             for options in self.channel_options))
+
+    def test_an_exported_proxy_is_not_used_for_the_headset(self):
+        dead = socket.socket()
+        dead.bind(("127.0.0.1", 0))
+        proxy = f"http://127.0.0.1:{dead.getsockname()[1]}"
+        dead.close()
+        with patch.dict(os.environ, {"https_proxy": proxy, "http_proxy": proxy, "grpc_proxy": proxy}):
+            self.start("steady")
+            self.wait_for(lambda: self.pending.latest is not None)
+        latest, packet = self.pending.take()
+        self.assertIsNotNone(latest)
+        self.assertEqual(self.connections, 1)
+        self.assertTrue(all(("grpc.enable_http_proxy", 0) in options for options in self.channel_options))
 
     def test_continuous_stale_samples_trigger_recovery(self):
         self.start("stale")
