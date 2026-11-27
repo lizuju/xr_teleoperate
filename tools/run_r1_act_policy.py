@@ -9,11 +9,17 @@ With --start-pose EPISODE, --execute first eases the robot to that recording's s
 (first r), holds it, and starts the policy only on the second r. --start-pose standard (or a
 standard pose .json) uses the teleop o-key start pose instead, so policy runs and new
 recordings start from the same place.
+
+--executor chunk replaces ACT's temporal ensemble: the robot follows the newest chunk alone,
+smoothed along its own time axis, a new one is requested every --chunk-interval seconds, and
+each switch crossfades over --chunk-fade seconds. --executor rtc (flow policies only) adds
+real-time chunking guidance: each request asks the policy to continue the chunk being executed.
 """
 
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import hashlib
 import json
 import math
@@ -33,9 +39,9 @@ for path in (ROOT, ROOT / "tools"):
 from replay_r1_episode_on_robot import (NETWORK_INTERFACE, current_pose, hold_until_quit, send_pose, shutdown,
                                         stop_keyboard, teleop_pids)
 from teleop.robot_control.r1_standard_pose import DEFAULT_POSE_PATH, standard_start_pose
-from teleop.utils.act_runtime import (ACTION_DIM, WAIST_INDEX, ActionEnsemble, GravityModel, ObservationBuilder, ensemble_window_ticks,
-                                      PolicyClient, PolicyGuard, WaistHold, group_errors, join_action, split_action,
-                                      summarize)
+from teleop.utils.act_runtime import (ACTION_DIM, WAIST_INDEX, ActionEnsemble, ChunkExecutor, GravityModel, ObservationBuilder,
+                                      ensemble_window_ticks, odd_ticks, PolicyClient, PolicyGuard, WaistHold, group_errors,
+                                      join_action, split_action, summarize)
 from teleop.utils.frame_sync import CameraSynchronizer
 from teleop.utils.act_contract import validate_contract
 from teleop.utils.icecream_task import IcecreamTask, PHASES
@@ -64,6 +70,20 @@ def parse_args(argv=None):
     parser.add_argument("--ensemble-window", type=float, default=0.0,
                         help="Average only the chunks predicted in the last this many seconds (the newest always votes). "
                              "0 = every chunk covering the tick, ACT's default; at chunk 80 that is about 2 s of plans")
+    parser.add_argument("--executor", choices=("ensemble", "chunk", "rtc"), default="ensemble",
+                        help="ensemble: ACT temporal ensembling of every chunk (default). chunk: follow the newest "
+                             "chunk, smoothed, with a crossfade at each switch. rtc: chunk plus real-time chunking "
+                             "guidance, flow policies only. --ensemble-k and --ensemble-window apply to ensemble only")
+    parser.add_argument("--chunk-interval", type=float, default=0.25,
+                        help="chunk/rtc: seconds of each chunk executed before the next is requested")
+    parser.add_argument("--chunk-smooth", type=float, default=0.375,
+                        help="chunk/rtc: centered moving average along each chunk, seconds (odd ticks; 0 = off)")
+    parser.add_argument("--chunk-fade", type=float, default=0.25,
+                        help="chunk/rtc: crossfade from the old chunk to the new one over this many seconds (0 = off)")
+    parser.add_argument("--rtc-beta", type=float, default=5.0,
+                        help="rtc: largest guidance weight pulling a new chunk onto the current one")
+    parser.add_argument("--rtc-guide", type=float, default=0.25,
+                        help="rtc: seconds after the frozen delay over which the new chunk is guided onto the current one")
     # Teleop's shaper settings, which the training actions already went through. 0 disables the shaper.
     parser.add_argument("--arm-target-velocity-limit", type=float, default=6.0)
     parser.add_argument("--arm-target-accel-limit", type=float, default=40.0)
@@ -111,10 +131,11 @@ def parse_args(argv=None):
     if not (math.isfinite(args.waist_capture_deg) and args.waist_capture_deg >= 0.0
             and (args.waist_snap_deg == 0.0 or args.waist_capture_deg <= args.waist_snap_deg)):
         parser.error("--waist-capture-deg must be at least 0 and no more than --waist-snap-deg")
-    for key in ("max_seconds", "max_chunk_age", "max_tracking_error"):
+    for key in ("max_seconds", "max_chunk_age", "max_tracking_error", "chunk_interval", "rtc_beta"):
         if not math.isfinite(getattr(args,key)) or getattr(args,key) <= 0:
             parser.error(f"{key} must be finite and positive")
     for key in ("blend_seconds", "max_start_delta", "ensemble_k", "ensemble_window", "dispense_min_phase_seconds",
+                "chunk_smooth", "chunk_fade", "rtc_guide",
                 "arm_target_velocity_limit", "arm_target_accel_limit", "arm_velocity_limit", "arm_dq_limit"):
         if not math.isfinite(getattr(args,key)) or getattr(args,key) < 0:
             parser.error(f"{key} must be finite and nonnegative")
@@ -142,6 +163,9 @@ class PolicyRun:
         self.stale_chunks = 0
         self.sent = 0
         self.inference_ms, self.round_trip_ms = [], []
+        # Ticks from a request to the tick its chunk was first used (the real-time chunking freeze).
+        self.delays = deque(maxlen=20)
+        self.guided_requests = 0
         self.target_error = {name: [] for name in ("left_arm", "right_arm", "left_ee", "right_ee", "body")}
         self.log = log_path.open("a", encoding="utf-8")
 
@@ -161,17 +185,24 @@ class PolicyRun:
                 # Age counts from the request: a late result still comes from the old observation.
                 if now - sent_at <= self.guard.max_chunk_age_s:
                     self.ensemble.add(tick, chunk)
+                    self.delays.append(self.tick - tick)
                     self.last_chunk_at = sent_at
                     self.completion = completion
                 else:
                     self.stale_chunks += 1
             self.inference_ms.append(inference_ms)
             self.round_trip_ms.append((now - sent_at) * 1e3)
-        if self.client.idle:
+        if self.client.idle and (not self.chunked or self.ensemble.due(self.tick)):
             qpos, images, reason = self.builder.build(time.monotonic_ns())
             if reason is None:
+                guide = None
+                if self.chunked:
+                    self.ensemble.sent(self.tick)
+                if self.rtc:
+                    guide = self.ensemble.guide(self.tick, self.rtc_delay())
+                    self.guided_requests += bool(guide[1].any())
                 self.client.send(self.tick, time.monotonic(), qpos, images,
-                                 None if self.task is None else self.task.context(time.monotonic()))
+                                 None if self.task is None else self.task.context(time.monotonic()), guide)
                 self.sent += 1
             else:
                 self.observation_failures[reason] = self.observation_failures.get(reason, 0) + 1
@@ -183,6 +214,18 @@ class PolicyRun:
                 self.target_error[name].append(value)
         self.tick += 1
         return target, pose
+
+    @property
+    def chunked(self):
+        return isinstance(self.ensemble, ChunkExecutor)
+
+    @property
+    def rtc(self):
+        return self.chunked and self.ensemble.guided
+
+    def rtc_delay(self):
+        """Ticks the next chunk is expected to take: the longest of the recent ones, at least 1."""
+        return max(self.delays, default=1)
 
     def reset_predictions(self):
         self.ensemble.reset()
@@ -200,6 +243,10 @@ class PolicyRun:
         return {"ticks": self.tick, "requests": self.sent, "observation_failures": self.observation_failures,
                 "stale_chunks": self.stale_chunks,
                 "inference_ms": summarize(self.inference_ms), "round_trip_ms": summarize(self.round_trip_ms),
+                "executor": "rtc" if self.rtc else "chunk" if self.chunked else "ensemble",
+                **({"interval_ticks": self.ensemble.interval, "smooth_ticks": self.ensemble.smooth,
+                    "fade_ticks": self.ensemble.fade, "delay_ticks": summarize(list(self.delays))} if self.chunked else {}),
+                **({"guide_ticks": self.ensemble.guide_steps, "guided_requests": self.guided_requests} if self.rtc else {}),
                 "target_minus_live_max": {name: summarize(values) for name, values in self.target_error.items()},
                 "clamped_ticks": self.guard.clamped_ticks,
                 "task_events": [] if self.task is None else self.task.events,
@@ -227,7 +274,9 @@ def run_shadow(run, period, stop, seconds=None, until=lambda: False, phase_previ
         if run.client.failed:
             raise RuntimeError(f"inference worker failed: {run.client.failed}")
         if target is not None:
-            run.write(t=started, tick=run.tick, mode="shadow", target=target.tolist(), live=run.live_action(pose).tolist())
+            extra = {"source": run.ensemble.source} if run.chunked else {}
+            run.write(t=started, tick=run.tick, mode="shadow", target=target.tolist(), live=run.live_action(pose).tolist(),
+                      **extra)
         if started >= report_at:
             report_at = started + 1.0
             latest = run.inference_ms[-1] if run.inference_ms else None
@@ -351,8 +400,9 @@ def execute_loop(run, arm, hand, guard, gravity, period, stop, args, initial_hol
         command = blended(start_action, guard.clamp(waist.apply(target)), alpha)
         hold = pose_from_action(command, gravity)
         send_pose(arm, hand, hold)
+        extra = {"source": run.ensemble.source} if run.chunked else {}
         run.write(t=started, tick=run.tick, mode="execute", target=target.tolist(), command=command.tolist(),
-                  live=run.live_action(pose).tolist(), tracking=tracking)
+                  live=run.live_action(pose).tolist(), tracking=tracking, **extra)
         pace(started, period)
     run.finished = True
     print("[POLICY] time limit reached." if not stop[0] else "[POLICY] stop requested.", flush=True)
@@ -390,8 +440,10 @@ def main(argv=None):
         return 2
     log_dir = args.log_dir or DEFAULT_LOG_ROOT / time.strftime("%Y%m%d_%H%M%S")
     log_dir.mkdir(parents=True, exist_ok=True)
+    rtc = args.executor == "rtc"
     client = PolicyClient([str(args.worker_python), str(ROOT / "tools/act_inference_worker.py"),
-                           str(args.checkpoint), "--device", args.device])
+                           str(args.checkpoint), "--device", args.device]
+                          + (["--rtc", "--rtc-beta", repr(args.rtc_beta)] if rtc else []))
     arm = hand = img_client = listener = tty_snapshot = None
     run = None
     try:
@@ -416,6 +468,13 @@ def main(argv=None):
             raise ValueError("--auto-stage requires a phase-conditioned model")
         fps = float(meta["dataset"]["fps"])
         period = 1.0 / fps
+        if rtc and not meta.get("rtc"):
+            raise RuntimeError("the inference worker did not start in real-time chunking mode")
+        chunked = args.executor in ("chunk", "rtc")
+        interval_ticks = max(1, int(round(args.chunk_interval * fps)))
+        if chunked and interval_ticks >= client.chunk_size:
+            raise ValueError(f"--chunk-interval {args.chunk_interval:g} s is {interval_ticks} ticks, "
+                             f"not shorter than the {client.chunk_size}-tick chunk")
         print(f"[POLICY] mode={'EXECUTE' if args.execute else 'shadow'} device={meta['device']} step={meta['step']} "
               f"task={meta['dataset'].get('task')} fps={fps:g}", flush=True)
 
@@ -445,14 +504,27 @@ def main(argv=None):
                                                  "right": correct_palm_frame(img_client.get_right_wrist_frame(), "dex1_1")}
 
         sync = CameraSynchronizer(["head", "left_wrist", "right_wrist"], anchor="head")
+        # Chunk execution requests only every interval, so silence is allowed that much longer.
+        max_chunk_age = args.max_chunk_age + (interval_ticks * period if chunked else 0.0)
         guard = PolicyGuard(meta["normalization"], max_tracking_error=args.max_tracking_error,
-                            max_chunk_age_s=args.max_chunk_age, gripper_limits=(gripper_low, gripper_high))
-        window_ticks = ensemble_window_ticks(args.ensemble_window, fps)
-        if window_ticks:
-            print(f"[POLICY] ensemble window {args.ensemble_window:g} s = {window_ticks} ticks (chunk {client.chunk_size})",
-                  flush=True)
+                            max_chunk_age_s=max_chunk_age, gripper_limits=(gripper_low, gripper_high))
+        if chunked:
+            smooth = odd_ticks(args.chunk_smooth, fps)
+            fade = min(int(round(args.chunk_fade * fps)), client.chunk_size - 1)
+            guide_steps = int(round(args.rtc_guide * fps)) if rtc else None
+            executor = ChunkExecutor(client.chunk_size, interval_ticks, client.action_dim, smooth, fade, guide_steps)
+            print(f"[POLICY] {args.executor} execution: a new chunk every {interval_ticks} ticks ({interval_ticks * period:.3f} s), "
+                  f"smoothing {smooth} ticks, crossfade {fade} ticks"
+                  + (f", guidance up to {args.rtc_beta:g} over the delay + {guide_steps} ticks" if rtc else "")
+                  + f"; chunk {client.chunk_size}; hold after {max_chunk_age:.2f} s without a chunk", flush=True)
+        else:
+            window_ticks = ensemble_window_ticks(args.ensemble_window, fps)
+            if window_ticks:
+                print(f"[POLICY] ensemble window {args.ensemble_window:g} s = {window_ticks} ticks (chunk {client.chunk_size})",
+                      flush=True)
+            executor = ActionEnsemble(client.chunk_size, args.ensemble_k, window_ticks)
         run = PolicyRun(arm, hand, cameras, client, ObservationBuilder(arm, hand, sync, image_hw=tuple(meta["dataset"]["image_size_hw"])),
-                        ActionEnsemble(client.chunk_size, args.ensemble_k, window_ticks), guard, log_dir / "ticks.jsonl")
+                        executor, guard, log_dir / "ticks.jsonl")
         run.fps = fps
         if meta.get("context_dim"):
             run.task = IcecreamTask((gripper_low, gripper_high), args.auto_stage, args.dispense_min_phase_seconds)
