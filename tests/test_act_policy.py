@@ -528,6 +528,107 @@ class ModelTests(unittest.TestCase):
             losses.append(float(loss))
         self.assertLess(losses[-1], losses[0] * 0.8)
 
+    def test_an_act_config_does_not_name_a_head(self):
+        """ACT checkpoints keep their exact config, so code that predates the flow head still loads them."""
+        self.assertNotIn("head", self.model.config)
+        self.assertEqual(self.model.head, "act")
+
+
+@unittest.skipUnless(HAS_TORCHVISION, "needs .venv-train")
+class FlowModelTests(unittest.TestCase):
+    """The flow-matching head (run 7, 2026-11-25)."""
+
+    def setUp(self):
+        import torch
+        from teleop.utils.act_policy import ACTPolicy
+        self.torch = torch
+        torch.manual_seed(0)
+        self.model = ACTPolicy(24, 24, 4, chunk_size=5, hidden_dim=32, nheads=2, dim_feedforward=32, encoder_layers=1,
+                               decoder_layers=2, dropout=0.0, pretrained=False, head="flow", flow_steps=4)
+        self.images = torch.rand(2, 4, 3, 48, 64)
+        self.qpos = torch.rand(2, 24)
+        self.actions = torch.rand(2, 5, 24)
+        self.is_pad = torch.tensor([[False] * 3 + [True] * 2, [False] * 5])
+
+    def test_config_names_the_head_and_there_is_no_style_encoder(self):
+        self.assertEqual((self.model.config["head"], self.model.config["flow_steps"]), ("flow", 4))
+        names = [name for name, _ in self.model.named_parameters()]
+        self.assertFalse(any(name.startswith(("vae_", "latent_proj")) for name in names))
+        self.assertNotIn("flow_noise", self.model.state_dict())
+
+    def test_training_and_sampling_passes_have_the_expected_shapes(self):
+        velocity, target, complete = self.model.flow_targets(self.images, self.qpos, self.actions, self.is_pad)
+        self.assertEqual((tuple(velocity.shape), tuple(target.shape)), ((2, 5, 24), (2, 5, 24)))
+        self.assertIsNone(complete)
+        pred, mu, logvar, complete = self.model(self.images, self.qpos)
+        self.assertEqual(tuple(pred.shape), (2, 5, 24))
+        self.assertIsNone(mu)
+        with self.assertRaises(ValueError):
+            self.model(self.images, self.qpos, self.actions, self.is_pad)
+
+    def test_sampling_starts_from_fixed_noise_so_it_is_deterministic(self):
+        self.model.eval()
+        first = self.model(self.images, self.qpos)[0]
+        self.torch.manual_seed(123)
+        self.torch.testing.assert_close(first, self.model(self.images, self.qpos)[0])
+        other = self.model(self.images, self.qpos, noise=self.torch.randn(2, 5, 24))[0]
+        self.assertFalse(self.torch.allclose(first, other))
+
+    def test_euler_integration_reaches_the_end_of_a_straight_flow(self):
+        """With the exact straight-line velocity (chunk - noise), the Euler steps land on the chunk."""
+        noise = self.torch.randn(2, 5, 24)
+        self.model.velocity = lambda memory, x, t: self.actions - noise
+        memory = self.torch.zeros(2, 3, 32)
+        self.torch.testing.assert_close(self.model.sample(memory, noise), self.actions)
+
+    def test_padded_steps_do_not_count_toward_the_flow_loss(self):
+        from teleop.utils.act_policy import masked_mse
+        pred = self.torch.zeros(1, 3, 2)
+        target = self.torch.tensor([[[1.0, 1.0], [2.0, 2.0], [99.0, 99.0]]])
+        self.assertEqual(float(masked_mse(pred, target, self.torch.tensor([[False, False, True]]))), 2.5)
+
+    def test_checkpoint_round_trip_rebuilds_the_flow_head_and_its_noise(self):
+        from teleop.utils.act_policy import ChunkPredictor, load_policy, save_checkpoint
+        normalization = {"qpos_mean": [0.0] * 24, "qpos_std": [1.0] * 24, "action_mean": [5.0] * 24, "action_std": [2.0] * 24}
+        self.model.eval()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "f.pt"
+            save_checkpoint(path, self.model, normalization, {"fps": 40}, 3, metrics={"best": 1.0})
+            model, data = load_policy(path)
+        self.assertEqual((model.head, model.flow_steps), ("flow", 4))
+        self.torch.testing.assert_close(model.flow_noise, self.model.flow_noise)
+        chunk, complete = ChunkPredictor(model, normalization, "cpu")(
+            np.zeros((4, 48, 64, 3), dtype=np.uint8), np.zeros(24, dtype=np.float32))
+        raw = self.model(self.torch.zeros(1, 4, 3, 48, 64), self.torch.zeros(1, 24))[0][0].detach().numpy()
+        np.testing.assert_allclose(chunk, raw * 2 + 5, atol=1e-4)
+
+    def test_training_on_one_batch_brings_the_sampled_chunk_to_it(self):
+        from teleop.utils.act_policy import masked_l1, masked_mse
+        self.model.eval()
+        before = float(masked_l1(self.model(self.images, self.qpos)[0], self.actions, self.is_pad))
+        self.model.train()
+        optimizer = self.torch.optim.AdamW(self.model.parameter_groups(3e-3, 1e-4))
+        for _ in range(300):
+            velocity, target, _ = self.model.flow_targets(self.images, self.qpos, self.actions, self.is_pad)
+            loss = masked_mse(velocity, target, self.is_pad)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+        self.model.eval()
+        after = float(masked_l1(self.model(self.images, self.qpos)[0], self.actions, self.is_pad))
+        self.assertLess(after, before * 0.5)
+
+    def test_train_options_default_to_act_and_flow_gets_more_decoder_layers(self):
+        import train_r1_act
+        act = train_r1_act.parse_args(["data", "--output", "run"])
+        flow = train_r1_act.parse_args(["data", "--output", "run", "--head", "flow"])
+        self.assertEqual((act.head, act.decoder_layers), ("act", 1))
+        self.assertEqual((flow.head, flow.decoder_layers, flow.flow_steps), ("flow", 4, 10))
+        self.assertNotIn("head", train_r1_act.training_settings(act))
+        self.assertEqual(train_r1_act.training_settings(flow)["head"], "flow")
+        with self.assertRaises(SystemExit):
+            train_r1_act.parse_args(["data", "--output", "run", "--head", "flow", "--flow-steps", "0"])
+
 
 if __name__ == "__main__":
     unittest.main()
