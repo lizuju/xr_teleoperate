@@ -119,3 +119,22 @@ cd ~/unitree_r1_dev/xr_teleoperate
 
 - 影子模式只读机器人状态和相机、只记录模型的预测，不发送任何动作。
 - 离线评估和影子模式都通过后，才由操作者在现场用 `--execute` 实际运行（见 `docs/icecream_il24.md`）。
+
+## 第 9–13 轮：合并数据与第 12 轮基准（2026-11-25～27）
+
+在 GPU 机器上，用已有导出加新录制，不必全部重新导出：
+
+- `finalize_r9.py EXPORT R6 DST 3 corrections.txt`：用新的分段规则重新导出的同一批录制，沿用第 6 轮的 train/val/test 划分和归一化，验证分数可直接对比。
+- `make_merged_dataset.py OLD HR NEW DST 3 corrections.txt`：把只含新录制的导出用符号链接并入已有数据集，新录制全部进训练集。注意：采样器先等概率选录制再选帧，所以 DAgger 纠正"复制 3 份"实际不改变采样权重；短纠正本身就已按帧加权。
+- `label_phases_r13.py NAMES.txt RECORDINGS OUT.json`：按关节反馈自动标 5 个阶段（抓杯、转身送杯、接冰淇淋、松杆收手、转回放杯），与运行时阶段机一致；中途接管的纠正录制从对应阶段开始。供 `export_r1_training_dataset.py --annotations` 和 `--conditioned` 使用。
+
+**第 12 轮（当前基准，实机 5/5 完成，46–52 秒松杯）** 的训练参数：
+
+```bash
+python tools/train_r1_act.py DATASET --output RUN --steps 40000 --patience 1000 \
+  --batch-size 2 --accumulate 4 --chunk-size 80 --max-pause-seconds 4 --head flow \
+  --ema-decay 0.9995 --lr-schedule cosine --warmup-steps 1000 --min-lr-ratio 0.1 \
+  --image-shift 12 --snapshot-every 5000
+```
+
+在 4090 上约每秒 5–6 步（多个训练同时跑时更慢），40,000 步约 2–4 小时。上机用 `stepN.pt`（EMA 权重）。
