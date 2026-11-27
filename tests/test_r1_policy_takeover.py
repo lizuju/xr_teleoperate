@@ -108,6 +108,16 @@ class DriverTest(unittest.TestCase):
         self.client.queued.append(chunk(arm))
         return self.driver.step(time.monotonic(), 1)
 
+    def test_the_ensemble_window_reaches_the_ensemble_in_ticks(self):
+        self.assertEqual(self.driver.run.ensemble.window, 0)
+        driver = self.make(ensemble_window=0.5)
+        self.addCleanup(driver.run.log.close)
+        self.assertEqual(driver.run.ensemble.window, 20)  # 0.5 s at the checkpoint's 40 fps
+        logged = json.loads((Path(self.directory.name) / "log/run.json").read_text())
+        self.assertEqual(logged["args"]["ensemble_window"], 0.5)
+        with self.assertRaises(ValueError):
+            self.make(ensemble_window=-1.0)
+
     def test_it_holds_then_commands_the_policy_and_a_takeover_marks_the_next_episode(self):
         self.assertTrue(self.start_commanding(0.1))
         np.testing.assert_allclose(self.requested["arm_q"], 0.1)

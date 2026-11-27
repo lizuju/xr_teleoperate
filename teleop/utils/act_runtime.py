@@ -108,11 +108,22 @@ class WaistHold:
         return action
 
 
-class ActionEnsemble:
-    """ACT temporal ensembling: every chunk covering a tick votes, older chunks weigh more."""
+def ensemble_window_ticks(seconds, fps):
+    """An ensemble window in seconds as control ticks: 0 stays off, any positive window keeps at least one tick."""
+    return 0 if seconds <= 0 else max(1, int(round(seconds * fps)))
 
-    def __init__(self, chunk_size, k=0.01):
-        self.chunk_size, self.k = chunk_size, k
+
+class ActionEnsemble:
+    """ACT temporal ensembling: every chunk covering a tick votes, older chunks weigh more.
+
+    window > 0 lets only the chunks started in the last `window` ticks vote (the newest covering chunk always does),
+    so a change of plan reaches the target within that window instead of being averaged against a whole chunk
+    length of older plans. 0 keeps every covering chunk, the ACT default."""
+
+    def __init__(self, chunk_size, k=0.01, window=0):
+        if isinstance(window, bool) or not isinstance(window, int) or window < 0:
+            raise ValueError(f"window must be a whole number of ticks, at least 0, not {window!r}")
+        self.chunk_size, self.k, self.window = chunk_size, k, window
         self.chunks = deque()
 
     def reset(self):
@@ -126,7 +137,10 @@ class ActionEnsemble:
     def get(self, tick):
         while self.chunks and self.chunks[0][0] + self.chunk_size <= tick:
             self.chunks.popleft()
-        votes = [chunk[tick - start] for start, chunk in self.chunks if 0 <= tick - start]
+        covering = [(start, chunk) for start, chunk in self.chunks if 0 <= tick - start]
+        if self.window:
+            covering = [(start, chunk) for start, chunk in covering if tick - start < self.window] or covering[-1:]
+        votes = [chunk[tick - start] for start, chunk in covering]
         if not votes:
             return None
         weights = np.exp(-self.k * np.arange(len(votes)))
