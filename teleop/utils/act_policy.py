@@ -1,5 +1,12 @@
 """ACT (Zhao et al. 2023) for the R1_A7 + left O6 + right Dex1 dataset: four cameras and joints in, joint chunks out.
 
+Two action heads share the cameras and the transformer encoder:
+- "act": the CVAE style encoder and an L1-trained decoder (the original ACT).
+- "flow": a rectified-flow (flow matching) decoder. Training regresses the velocity that carries Gaussian
+  noise to the demonstrated chunk at a random flow time; inference integrates it in flow_steps Euler steps
+  from one fixed noise draw, so a given observation always yields the same chunk and the deployed
+  temporal ensembling sees consistent chunks instead of averaging different samples.
+
 Training and inference only; nothing here talks to DDS, cameras or the robot.
 Needs torchvision, so it runs in .venv-train, not in the teleop environment.
 """
@@ -19,6 +26,10 @@ from torchvision.ops.misc import FrozenBatchNorm2d
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 CHECKPOINT_SCHEMA = "r1_act_checkpoint_v2"
+HEADS = ("act", "flow")
+# The fixed inference noise of a flow policy is drawn from this seed on the CPU, so training validation,
+# offline evaluation and the robot all integrate from the same starting point.
+FLOW_NOISE_SEED = 0
 
 
 def sine_position(height, width, dim, device):
@@ -37,13 +48,22 @@ def sine_position(height, width, dim, device):
 class ACTPolicy(nn.Module):
     def __init__(self, state_dim, action_dim, num_cameras, chunk_size=40, hidden_dim=512, nheads=8,
                  dim_feedforward=3200, encoder_layers=4, decoder_layers=1, vae_encoder_layers=4,
-                 latent_dim=32, dropout=0.1, pretrained=True, context_dim=0):
+                 latent_dim=32, dropout=0.1, pretrained=True, context_dim=0, head="act", flow_steps=10):
         super().__init__()
+        if head not in HEADS:
+            raise ValueError(f"head must be one of {HEADS}")
+        if head == "flow" and (int(flow_steps) != flow_steps or flow_steps < 1):
+            raise ValueError("flow_steps must be a positive integer")
         self.config = dict(state_dim=state_dim, action_dim=action_dim, num_cameras=num_cameras,
                            chunk_size=chunk_size, hidden_dim=hidden_dim, nheads=nheads,
                            dim_feedforward=dim_feedforward, encoder_layers=encoder_layers,
                            decoder_layers=decoder_layers, vae_encoder_layers=vae_encoder_layers,
                            latent_dim=latent_dim, dropout=dropout, context_dim=context_dim)
+        if head != "act":
+            # Only a flow policy records its head, so ACT configs and checkpoints stay exactly as before.
+            self.config.update(head=head, flow_steps=int(flow_steps))
+        self.head = head
+        self.flow_steps = int(flow_steps)
         self.latent_dim = latent_dim
         self.chunk_size = chunk_size
         backbone = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1 if pretrained else None,
@@ -58,26 +78,37 @@ class ACTPolicy(nn.Module):
             layer = nn.TransformerEncoderLayer(hidden_dim, nheads, dim_feedforward, dropout, batch_first=True)
             return nn.TransformerEncoder(layer, layers, enable_nested_tensor=False)
 
-        # Style encoder: only used while training, to summarise the demonstrated chunk.
-        self.vae_cls = nn.Parameter(torch.zeros(1, 1, hidden_dim))
-        self.vae_state = nn.Linear(state_dim, hidden_dim)
-        self.vae_action = nn.Linear(action_dim, hidden_dim)
-        self.vae_position = nn.Parameter(torch.zeros(1, chunk_size + 2, hidden_dim))
-        self.vae_encoder = encoder(vae_encoder_layers)
-        self.vae_output = nn.Linear(hidden_dim, latent_dim * 2)
-
-        self.latent_proj = nn.Linear(latent_dim, hidden_dim)
+        if head == "act":
+            # Style encoder: only used while training, to summarise the demonstrated chunk.
+            self.vae_cls = nn.Parameter(torch.zeros(1, 1, hidden_dim))
+            self.vae_state = nn.Linear(state_dim, hidden_dim)
+            self.vae_action = nn.Linear(action_dim, hidden_dim)
+            self.vae_position = nn.Parameter(torch.zeros(1, chunk_size + 2, hidden_dim))
+            self.vae_encoder = encoder(vae_encoder_layers)
+            self.vae_output = nn.Linear(hidden_dim, latent_dim * 2)
+            self.latent_proj = nn.Linear(latent_dim, hidden_dim)
+        else:
+            # Flow head: the decoder reads the noisy chunk and the flow time instead of a style latent.
+            self.action_in = nn.Linear(action_dim, hidden_dim)
+            self.time_mlp = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, hidden_dim))
+            generator = torch.Generator().manual_seed(FLOW_NOISE_SEED)
+            self.register_buffer("flow_noise", torch.randn(1, chunk_size, action_dim, generator=generator),
+                                 persistent=False)
         self.state_proj = nn.Linear(state_dim, hidden_dim)
         self.context_proj = nn.Linear(context_dim, hidden_dim) if context_dim else None
         self.completion_head = nn.Sequential(nn.LayerNorm(hidden_dim), nn.Linear(hidden_dim, hidden_dim),
                                              nn.GELU(), nn.Linear(hidden_dim, 1)) if context_dim else None
-        self.token_position = nn.Parameter(torch.zeros(1, 2, hidden_dim))
+        # ACT: [style latent, state]; flow: [state].
+        self.token_position = nn.Parameter(torch.zeros(1, 2 if head == "act" else 1, hidden_dim))
         self.encoder = encoder(encoder_layers)
         self.queries = nn.Parameter(torch.zeros(1, chunk_size, hidden_dim))
         layer = nn.TransformerDecoderLayer(hidden_dim, nheads, dim_feedforward, dropout, batch_first=True)
         self.decoder = nn.TransformerDecoder(layer, decoder_layers)
         self.action_head = nn.Linear(hidden_dim, action_dim)
-        for parameter in (self.camera_embed, self.vae_cls, self.vae_position, self.token_position, self.queries):
+        initialised = [self.camera_embed, self.token_position, self.queries]
+        if head == "act":
+            initialised += [self.vae_cls, self.vae_position]
+        for parameter in initialised:
             nn.init.normal_(parameter, std=0.02)
 
     def encode_images(self, images):
@@ -97,26 +128,80 @@ class ACTPolicy(nn.Module):
         mu, logvar = self.vae_output(self.vae_encoder(tokens, src_key_padding_mask=padding)[:, 0]).chunk(2, dim=-1)
         return mu, logvar
 
-    def forward(self, images, qpos, actions=None, is_pad=None, context=None):
-        """Return actions, style statistics and optional completion from current observations."""
+    def encode_memory(self, images, qpos, context=None, latent=None):
+        """Encoder output for the current observation (and, for ACT, a style latent), plus completion logits."""
+        state = self.state_proj(qpos)
+        if self.head == "act":
+            tokens = torch.stack((self.latent_proj(latent), state), dim=1) + self.token_position
+        else:
+            tokens = state[:, None] + self.token_position
+        if self.context_proj is not None:
+            if context is None or context.shape[-1] != self.config["context_dim"]:
+                raise ValueError("Phase-conditioned policy requires its task context")
+            tokens = tokens + self.context_proj(context)[:, None]
+        image_tokens = self.encode_images(images)
+        # Completion reads the state token, never the ACT style latent, which encodes future demonstration actions.
+        complete = None if self.completion_head is None else self.completion_head(
+            tokens[:, -1] + image_tokens.mean(dim=1)).squeeze(-1)
+        return self.encoder(torch.cat((tokens, image_tokens), dim=1)), complete
+
+    def forward(self, images, qpos, actions=None, is_pad=None, context=None, noise=None):
+        """Return actions, style statistics and optional completion from current observations.
+
+        A flow policy samples its chunk here (actions must be None; train it through flow_targets()).
+        noise overrides the fixed starting noise of the flow integration.
+        """
+        if self.head == "flow":
+            if actions is not None:
+                raise ValueError("A flow policy trains through flow_targets(); forward() only samples")
+            memory, complete = self.encode_memory(images, qpos, context)
+            return self.sample(memory, noise), None, None, complete
         if actions is None:
             mu = logvar = None
             latent = torch.zeros(qpos.shape[0], self.latent_dim, device=qpos.device, dtype=qpos.dtype)
         else:
             mu, logvar = self.encode_style(qpos, actions, is_pad)
             latent = mu + torch.randn_like(mu) * (0.5 * logvar).exp()
-        tokens = torch.stack((self.latent_proj(latent), self.state_proj(qpos)), dim=1) + self.token_position
-        if self.context_proj is not None:
-            if context is None or context.shape[-1] != self.config["context_dim"]:
-                raise ValueError("Phase-conditioned policy requires its task context")
-            tokens = tokens + self.context_proj(context)[:, None]
-        image_tokens = self.encode_images(images)
-        # Completion cannot see the VAE latent, which encodes future demonstration actions.
-        complete = None if self.completion_head is None else self.completion_head(
-            tokens[:, 1] + image_tokens.mean(dim=1)).squeeze(-1)
-        memory = self.encoder(torch.cat((tokens, image_tokens), dim=1))
+        memory, complete = self.encode_memory(images, qpos, context, latent)
         decoded = self.decoder(self.queries.expand(qpos.shape[0], -1, -1), memory)
         return self.action_head(decoded), mu, logvar, complete
+
+    def flow_time_embedding(self, t):
+        """Sinusoidal embedding of the flow time in [0, 1] (scaled like a diffusion step), through an MLP."""
+        half = self.config["hidden_dim"] // 2
+        frequency = torch.exp(-math.log(10000.0) * torch.arange(half, device=t.device, dtype=torch.float32) / half)
+        angle = t.float()[:, None] * 1000.0 * frequency[None]
+        return self.time_mlp(torch.cat((angle.sin(), angle.cos()), dim=1))
+
+    def velocity(self, memory, x, t):
+        """Predicted flow velocity for noisy chunks x (batch, chunk, action) at flow times t (batch,)."""
+        queries = self.queries + self.action_in(x) + self.flow_time_embedding(t)[:, None]
+        return self.action_head(self.decoder(queries, memory))
+
+    def sample(self, memory, noise=None, steps=None):
+        """Euler-integrate the velocity from noise (t = 0) to a chunk (t = 1), in float32."""
+        batch = memory.shape[0]
+        x = (self.flow_noise.expand(batch, -1, -1) if noise is None else noise).float()
+        steps = self.flow_steps if steps is None else int(steps)
+        for k in range(steps):
+            t = torch.full((batch,), k / steps, device=x.device)
+            x = x + self.velocity(memory, x, t).float() / steps
+        return x
+
+    def flow_targets(self, images, qpos, actions, is_pad=None, context=None):
+        """One rectified-flow training pass: predicted velocity, target velocity and completion logits.
+
+        The chunk is blended with fresh Gaussian noise at a logit-normal flow time t (x = (1 - t) noise + t chunk);
+        the target velocity is chunk - noise. Padded steps carry zeros and are masked out of the loss.
+        """
+        if self.head != "flow":
+            raise ValueError("flow_targets() needs a flow policy")
+        memory, complete = self.encode_memory(images, qpos, context)
+        noise = torch.randn_like(actions)
+        t = torch.sigmoid(torch.randn(actions.shape[0], device=actions.device))
+        blend = t[:, None, None].to(actions.dtype)
+        x = (1 - blend) * noise + blend * actions
+        return self.velocity(memory, x, t), actions - noise, complete
 
     def parameter_groups(self, lr, lr_backbone):
         backbone = [p for p in self.backbone.parameters() if p.requires_grad]
@@ -128,6 +213,11 @@ class ACTPolicy(nn.Module):
 def masked_l1(pred, target, is_pad):
     mask = (~is_pad)[..., None]
     return ((pred - target).abs() * mask).sum() / (mask.sum() * pred.shape[-1]).clamp(min=1)
+
+
+def masked_mse(pred, target, is_pad):
+    mask = (~is_pad)[..., None]
+    return ((pred - target).pow(2) * mask).sum() / (mask.sum() * pred.shape[-1]).clamp(min=1)
 
 
 def act_loss(pred, target, is_pad, mu, logvar, kl_weight):

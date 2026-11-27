@@ -19,7 +19,8 @@ if str(ROOT) not in sys.path:
 
 from teleop.utils.act_contract import validate_contract
 from teleop.utils.act_dataset import R1ACTDataset, BalancedBatchSampler, add_qpos_noise, qpos_noise_scale
-from teleop.utils.act_policy import ACTPolicy, act_loss, augment_images, masked_l1, read_checkpoint, save_checkpoint
+from teleop.utils.act_policy import (ACTPolicy, act_loss, augment_images, masked_l1, masked_mse, read_checkpoint,
+                                     save_checkpoint)
 from teleop.utils.icecream_task import CONTEXT_DIM
 
 
@@ -44,6 +45,11 @@ def parse_args(argv=None):
     p.add_argument('--lr-backbone', type=float, default=1e-5)
     p.add_argument('--weight-decay', type=float, default=1e-4)
     p.add_argument('--kl-weight', type=float, default=10.0)
+    p.add_argument('--head', choices=('act', 'flow'), default='act',
+                   help='act: CVAE + L1 decoder (default). flow: rectified-flow (flow matching) decoder, sampled '
+                        'with --flow-steps Euler steps from a fixed noise draw at inference')
+    p.add_argument('--decoder-layers', type=int, default=None, help='Decoder layers (default: 1 for act, 4 for flow)')
+    p.add_argument('--flow-steps', type=int, default=10, help='Euler steps of a flow policy at inference')
     p.add_argument('--hidden-dim', type=int, default=512)
     p.add_argument('--dim-feedforward', type=int, default=3200)
     p.add_argument('--encoder-layers', type=int, default=4)
@@ -58,9 +64,14 @@ def parse_args(argv=None):
     p.add_argument('--seed', type=int, default=42)
     p.add_argument('--device', default='auto')
     args = p.parse_args(argv)
-    for key in ('steps', 'batch_size', 'accumulate', 'chunk_size', 'eval_every', 'save_every', 'log_every', 'patience'):
+    for key in ('steps', 'batch_size', 'accumulate', 'chunk_size', 'eval_every', 'save_every', 'log_every', 'patience',
+                'flow_steps'):
         if getattr(args, key) < 1:
             p.error(f'{key} must be positive')
+    if args.decoder_layers is None:
+        args.decoder_layers = 4 if args.head == 'flow' else 1
+    elif args.decoder_layers < 1:
+        p.error('decoder_layers must be positive')
     if args.max_pause_seconds is not None and not (math.isfinite(args.max_pause_seconds) and args.max_pause_seconds > 0):
         p.error('max_pause_seconds must be a positive number of seconds')
     if args.qpos_noise is not None and not (math.isfinite(args.qpos_noise) and args.qpos_noise > 0):
@@ -75,6 +86,8 @@ def training_settings(args):
         settings['max_pause_seconds'] = args.max_pause_seconds
     if getattr(args, 'qpos_noise', None) is not None:
         settings['qpos_noise'] = args.qpos_noise
+    if getattr(args, 'head', 'act') != 'act':
+        settings['head'] = args.head
     return settings
 
 
@@ -177,8 +190,9 @@ def train(args):
     else:
         model = ACTPolicy(24, 24, 4, chunk_size=args.chunk_size, hidden_dim=args.hidden_dim,
                           dim_feedforward=args.dim_feedforward, encoder_layers=args.encoder_layers,
-                          dropout=args.dropout, pretrained=not args.no_pretrained,
-                          context_dim=CONTEXT_DIM if args.conditioned else 0)
+                          decoder_layers=args.decoder_layers, dropout=args.dropout, pretrained=not args.no_pretrained,
+                          context_dim=CONTEXT_DIM if args.conditioned else 0, head=args.head,
+                          flow_steps=args.flow_steps)
     model.to(device).train()
     optimizer = torch.optim.AdamW(model.parameter_groups(args.lr, args.lr_backbone), weight_decay=args.weight_decay)
     best = float('inf') if resume is None else resume['metrics']['best']
@@ -199,7 +213,10 @@ def train(args):
         state = {'settings': settings, 'rng': rng_state(), 'bad_checks': bad_checks}
         save_checkpoint(args.output / name, model, meta['normalization'], info, step,
                         optimizer if optimizer_state else None, {'best': best}, state)
-    print(f'[TRAIN] {device} 24D train={len(train_data)} val={len(val_data)} effective_batch={args.batch_size * args.accumulate}', flush=True)
+    flow = model.head == 'flow'
+    names = ('loss', 'flow_mse', 'kl', 'phase_bce') if flow else ('loss', 'l1', 'kl', 'phase_bce')
+    print(f'[TRAIN] {device} 24D head={model.head} train={len(train_data)} val={len(val_data)} '
+          f'effective_batch={args.batch_size * args.accumulate}', flush=True)
     stream, step = iter(train_loader), start
     began = time.monotonic()
     log = (args.output / 'metrics.jsonl').open('a')
@@ -214,8 +231,13 @@ def train(args):
                 if noise is not None:
                     qpos = add_qpos_noise(qpos, noise)
                 with torch.autocast('cuda', dtype=torch.bfloat16, enabled=amp):
-                    pred, mu, logvar, logits = model(images, qpos, actions, pad, context)
-                    loss, l1, kl = act_loss(pred.float(), actions, pad, mu.float(), logvar.float(), args.kl_weight)
+                    if flow:
+                        velocity, target, logits = model.flow_targets(images, qpos, actions, pad, context)
+                        l1 = masked_mse(velocity.float(), target.float(), pad)
+                        loss, kl = l1, l1.new_tensor(0.)
+                    else:
+                        pred, mu, logvar, logits = model(images, qpos, actions, pad, context)
+                        loss, l1, kl = act_loss(pred.float(), actions, pad, mu.float(), logvar.float(), args.kl_weight)
                     phase_loss = loss.new_tensor(0.) if logits is None else torch.nn.functional.binary_cross_entropy_with_logits(
                         logits.float(), complete, pos_weight=loss.new_tensor(10.))
                     loss = loss + phase_loss
@@ -227,7 +249,7 @@ def train(args):
             optimizer.step(); step += 1
             evaluate = step % args.eval_every == 0 or step == args.steps
             if step % args.log_every == 0 or evaluate:
-                entry = dict(zip(('loss', 'l1', 'kl', 'phase_bce'), np.mean(losses, axis=0).tolist()))
+                entry = dict(zip(names, np.mean(losses, axis=0).tolist()))
                 entry.update(step=step, steps_per_s=(step-start) / max(time.monotonic()-began, 1e-6))
                 if amp:
                     entry['peak_gpu_mb'] = torch.cuda.max_memory_allocated() / 2**20
