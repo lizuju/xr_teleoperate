@@ -256,6 +256,55 @@ def sample_interval_limit_ns(frequency, sequence, previous_sequence):
     return periods * 1e9 / frequency
 
 
+UNPUBLISHED_ARM_RECORD_REASONS = frozenset(("command_inactive", "arm_request_unmatched"))
+
+
+def unpublished_arm_request(frame, rejections):
+    """The arm request of a frame whose only action problem is that its arm publication was not recorded yet.
+
+    The capture can sample a tick after the main loop made its arm request but before the publisher
+    thread wrote the publication record. Such a frame reports command_inactive + arm_request_unmatched
+    although the robot motion is continuous. Returns (sequence, arm_q) when that is the frame's only
+    action-level problem and its action is usable; otherwise None.
+    """
+    if set(rejections) - TRAINING_OBSERVATION_REASONS != UNPUBLISHED_ARM_RECORD_REASONS:
+        return None
+    sample = frame.get("sample") if isinstance(frame, dict) else None
+    if not isinstance(sample, dict):
+        return None
+    commands = training_commands(sample)
+    arm = commands.get("arm") if isinstance(commands, dict) else None
+    hands = (commands.get("hands") or {}).get("published") if isinstance(commands, dict) else None
+    now = sample.get("monotonic_ns")
+    if not isinstance(arm, dict) or arm.get("published") is not None or type(now) is not int:
+        return None
+    if not isinstance(hands, dict) or not all(
+            isinstance(hands.get(side), dict) and hands[side].get("mode") == 1
+            and type(hands[side].get("monotonic_ns")) is int and 0 <= now - hands[side]["monotonic_ns"] <= 250_000_000
+            for side in ("left", "right")):
+        return None
+    request = arm.get("requested")
+    if not isinstance(request, dict) or type(request.get("sequence")) is not int or request["sequence"] <= 0 \
+            or not isinstance(request.get("arm_q"), list):
+        return None
+    try:
+        action = training_action(frame)
+        values = [value for group in action.values() for value in group]
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return None
+    if not values or not all(isinstance(v, (int, float)) and math.isfinite(v) for v in values):
+        return None
+    return request["sequence"], request["arm_q"]
+
+
+def publishes_request(frame, request):
+    """Whether this frame's arm publication is the given (sequence, arm_q) request."""
+    sample = frame.get("sample") if isinstance(frame, dict) else None
+    commands = training_commands(sample) if isinstance(sample, dict) else {}
+    published = ((commands.get("arm") or {}).get("published") if isinstance(commands, dict) else None) or {}
+    return published.get("request_sequence") == request[0] and published.get("arm_q") == request[1]
+
+
 def lock_exempt_sources(hand_locks, sources):
     """Tracking sources that a hand lock exempts from the freshness checks of one frame.
 
@@ -462,7 +511,7 @@ def validate_episode(path, min_segment_frames=DEFAULT_MIN_SEGMENT_FRAMES):
                                   "min_segment_frames": min_segment_frames, "action_segments": [],
                                   "longest_segment_frames": 0, "exportable_segments": 0,
                                   "exportable_frames": 0, "short_segment_frames": 0,
-                                  "sampling_gap_boundaries": 0,
+                                  "sampling_gap_boundaries": 0, "bridged_unpublished_arm_frames": 0,
                                   "sample_interval_periods": {
                                       "default": TRAINING_SAMPLE_INTERVAL_PERIODS,
                                       "consecutive_arm_ticks": TRAINING_CONSECUTIVE_TICK_INTERVAL_PERIODS}}}
@@ -659,6 +708,8 @@ def validate_episode(path, min_segment_frames=DEFAULT_MIN_SEGMENT_FRAMES):
     action_previous_ns = None
     action_previous_idx = None
     action_previous_seq = None
+    # A frame held in the current action segment until the next frame confirms its arm publication.
+    pending_bridge = None
     with stream:
         for line_number, line in enumerate(stream, 1):
             label = f"line {line_number}"
@@ -1274,18 +1325,37 @@ def validate_episode(path, min_segment_frames=DEFAULT_MIN_SEGMENT_FRAMES):
             else:
                 training_previous_idx = training_previous_ns = training_previous_seq = None
             # An exportable segment is a run of usable actions; its usable observations are the anchors.
-            if not set(rejections) - TRAINING_OBSERVATION_REASONS and type(idx) is int:
-                if (action_previous_idx is not None and idx == action_previous_idx + 1 and frequency is not None
-                        and 0 < stamp - action_previous_ns
-                        <= sample_interval_limit_ns(frequency, tick, action_previous_seq)):
+            usable_action = not set(rejections) - TRAINING_OBSERVATION_REASONS and type(idx) is int
+            continues = (action_previous_idx is not None and type(idx) is int and idx == action_previous_idx + 1
+                         and frequency is not None and type(stamp) is int
+                         and 0 < stamp - action_previous_ns
+                         <= sample_interval_limit_ns(frequency, tick, action_previous_seq))
+            if pending_bridge is not None:
+                # The previous frame lacked only its arm publication record. It stays in the segment
+                # (as an action row, never an anchor) when this frame publishes that very request.
+                if usable_action and continues and publishes_request(frame, pending_bridge[1]):
+                    training["bridged_unpublished_arm_frames"] += 1
+                else:
+                    training["action_segments"][-1]["stop_idx"] = pending_bridge[0]
+                    action_previous_idx = action_previous_ns = action_previous_seq = None
+                    continues = False
+                pending_bridge = None
+            if usable_action:
+                if continues:
                     training["action_segments"][-1]["stop_idx"] = idx + 1
                     training["action_segments"][-1]["anchors"] += not rejections
                 else:
                     training["action_segments"].append({"start_idx": idx, "stop_idx": idx + 1, "anchors": int(not rejections)})
                 action_previous_idx, action_previous_ns, action_previous_seq = idx, stamp, tick
+            elif continues and (request := unpublished_arm_request(frame, rejections)) is not None:
+                training["action_segments"][-1]["stop_idx"] = idx + 1
+                pending_bridge = (idx, request)
+                action_previous_idx, action_previous_ns, action_previous_seq = idx, stamp, tick
             else:
                 action_previous_idx = action_previous_ns = action_previous_seq = None
 
+    if pending_bridge is not None:
+        report["training_no_imu"]["action_segments"][-1]["stop_idx"] = pending_bridge[0]
     if report["frames_checked"] == 0:
         error("frames.jsonl: episode has no frames")
     # Colour files no sample references are leftovers: the writer only creates a

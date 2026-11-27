@@ -722,6 +722,54 @@ class TrainingExportTests(unittest.TestCase):
                 self.assertEqual([(s["start_idx"], s["stop_idx"]) for s in training["action_segments"]],
                                  [(0, 4), (4, 8)])
 
+    def unrecorded_arm_publication(self, gap, confirm=True, count=8, hand_mode=1):
+        """Frame `gap` was sampled after its arm request but before the publisher recorded it."""
+        directory, manifest, rows = self.episode(count=count)
+        self.add_action_alignment(rows)
+        arm = rows[gap]["sample"]["action_alignment"]["arm"]
+        request = copy.deepcopy(arm["requested"])
+        arm["published"] = None
+        rows[gap]["sample"]["commands"]["arm"]["published"] = None
+        rows[gap]["sample"]["action_alignment"]["hands"]["published"]["left"]["mode"] = hand_mode
+        if gap + 1 < count:
+            following = rows[gap + 1]["sample"]["action_alignment"]["arm"]
+            following["requested"] = copy.deepcopy(request)
+            following["published"]["request_sequence"] = request["sequence"]
+            following["published"]["arm_q"] = list(request["arm_q"])
+            if not confirm:
+                following["published"]["arm_q"] = [value + .01 for value in request["arm_q"]]
+        self.write(directory, manifest, rows)
+        report = validate_episode(directory, min_segment_frames=2)
+        self.assertTrue(report["valid"], report["errors"])
+        return report["training_no_imu"]
+
+    def test_an_unrecorded_arm_publication_keeps_the_action_segment(self):
+        training = self.unrecorded_arm_publication(4)
+        self.assertEqual(training["action_segments"], [{"start_idx": 0, "stop_idx": 8, "anchors": 7}])
+        self.assertEqual(training["bridged_unpublished_arm_frames"], 1)
+        self.assertEqual(training["excluded_counts"].get("arm_request_unmatched"), 1)
+        dataset = export_dataset(self.source, self.output, min_frames=2)
+        self.assertEqual([(e["frames"], e["anchors"]) for e in dataset["episodes"]], [(8, 7)])
+        with h5py.File(self.output / "episode_0.hdf5") as h:
+            self.assertEqual(h["source/anchor_index"][:].tolist(), [0, 1, 2, 3, 5, 6, 7])
+            self.assertTrue(np.isfinite(h["action"][:]).all())
+        loader = R1ACTDataset(self.output, chunk_size=4)
+        self.assertEqual(loader[2][3].tolist(), [False, False, False, False])
+
+    def test_an_unconfirmed_arm_publication_still_splits_the_segment(self):
+        training = self.unrecorded_arm_publication(4, confirm=False)
+        self.assertEqual([(s["start_idx"], s["stop_idx"]) for s in training["action_segments"]], [(0, 4), (5, 8)])
+        self.assertEqual(training["bridged_unpublished_arm_frames"], 0)
+
+    def test_a_gap_frame_with_another_command_problem_still_splits_the_segment(self):
+        training = self.unrecorded_arm_publication(4, hand_mode=0)
+        self.assertEqual([(s["start_idx"], s["stop_idx"]) for s in training["action_segments"]], [(0, 4), (5, 8)])
+
+    def test_a_recording_that_ends_on_an_unrecorded_publication_drops_that_frame(self):
+        training = self.unrecorded_arm_publication(7)
+        self.assertEqual([(s["start_idx"], s["stop_idx"]) for s in training["action_segments"]], [(0, 7)])
+        self.assertEqual(training["bridged_unpublished_arm_frames"], 0)
+
     def test_new_sensor_recording_with_zero_imu_exports_real_joint_and_image_inputs(self):
         _, manifest, _ = self.episode()
         info = manifest["info"]
