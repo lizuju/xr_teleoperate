@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Train the 24D left-O6/right-Dex1 policy offline in .venv-train."""
 import argparse
+import copy
 import hashlib
 import json
 import math
@@ -61,6 +62,20 @@ def parse_args(argv=None):
     p.add_argument('--save-every', type=int, default=1000)
     p.add_argument('--log-every', type=int, default=50)
     p.add_argument('--patience', type=int, default=10, help='Stop after this many validation checks without improvement')
+    p.add_argument('--ema-decay', type=float, default=None,
+                   help='Keep an exponential moving average of the weights with this decay per optimizer step (for '
+                        'example 0.9995). Validation, best.pt and the snapshots then use the averaged weights, and '
+                        'snapshots also keep the raw weights as stepNNNNN_raw.pt. Default: off')
+    p.add_argument('--lr-schedule', choices=('constant', 'cosine'), default='constant',
+                   help='constant (default), or cosine: decay from the base rates to --min-lr-ratio of them at --steps')
+    p.add_argument('--warmup-steps', type=int, default=0,
+                   help='Ramp the learning rates up linearly over this many optimizer steps first. Default: 0')
+    p.add_argument('--min-lr-ratio', type=float, default=0.1, help='Cosine schedule: final fraction of the base rates')
+    p.add_argument('--image-shift', type=int, default=0,
+                   help='Shift each training image by up to this many pixels in x and y (border padding), on top of '
+                        'the brightness/contrast jitter. Default: 0')
+    p.add_argument('--snapshot-every', type=int, default=0,
+                   help='Also save model-only stepNNNNN.pt every this many steps (0 = off). Does not change training')
     p.add_argument('--seed', type=int, default=42)
     p.add_argument('--device', default='auto')
     args = p.parse_args(argv)
@@ -76,7 +91,39 @@ def parse_args(argv=None):
         p.error('max_pause_seconds must be a positive number of seconds')
     if args.qpos_noise is not None and not (math.isfinite(args.qpos_noise) and args.qpos_noise > 0):
         p.error('qpos_noise must be a positive number of radians')
+    if args.ema_decay is not None and not (math.isfinite(args.ema_decay) and 0 < args.ema_decay < 1):
+        p.error('ema_decay must be between 0 and 1')
+    if not 0 <= args.warmup_steps < args.steps:
+        p.error('warmup_steps must be at least 0 and fewer than steps')
+    if not (math.isfinite(args.min_lr_ratio) and 0 <= args.min_lr_ratio <= 1):
+        p.error('min_lr_ratio must be between 0 and 1')
+    for key in ('image_shift', 'snapshot_every'):
+        if getattr(args, key) < 0:
+            p.error(f'{key} must be at least 0')
     return args
+
+
+def lr_factor(step, total, schedule='constant', warmup=0, min_ratio=0.1):
+    """Learning-rate multiplier for the optimizer step after `step` completed ones, out of `total`. It depends on the
+    step alone, so a resumed run continues the same schedule."""
+    if warmup and step < warmup:
+        return (step + 1) / warmup
+    if schedule == 'constant':
+        return 1.0
+    progress = min(max((step - warmup) / max(total - warmup, 1), 0.0), 1.0)
+    return min_ratio + (1 - min_ratio) * 0.5 * (1 + math.cos(math.pi * progress))
+
+
+@torch.no_grad()
+def ema_update(ema, model, decay, step):
+    """ema = d ema + (1 - d) model after optimizer step `step` (1-based). d ramps up as (1 + step) / (10 + step) to
+    `decay`, so the average is not anchored to the starting weights. Buffers are copied."""
+    d = min(decay, (1 + step) / (10 + step))
+    for averaged, current in zip(ema.parameters(), model.parameters()):
+        averaged.mul_(d).add_(current.detach(), alpha=1 - d)
+    for averaged, current in zip(ema.buffers(), model.buffers()):
+        averaged.copy_(current)
+    return d
 
 
 def training_settings(args):
@@ -88,6 +135,14 @@ def training_settings(args):
         settings['qpos_noise'] = args.qpos_noise
     if getattr(args, 'head', 'act') != 'act':
         settings['head'] = args.head
+    # Run 12 options join only when used, so runs 1-11 still resume.
+    if getattr(args, 'ema_decay', None) is not None:
+        settings['ema_decay'] = args.ema_decay
+    if getattr(args, 'lr_schedule', 'constant') != 'constant' or getattr(args, 'warmup_steps', 0):
+        settings['lr_schedule'] = {'schedule': args.lr_schedule, 'warmup_steps': args.warmup_steps,
+                                   'min_lr_ratio': args.min_lr_ratio, 'steps': args.steps}
+    if getattr(args, 'image_shift', 0):
+        settings['image_shift'] = args.image_shift
     return settings
 
 
@@ -195,6 +250,13 @@ def train(args):
                           flow_steps=args.flow_steps)
     model.to(device).train()
     optimizer = torch.optim.AdamW(model.parameter_groups(args.lr, args.lr_backbone), weight_decay=args.weight_decay)
+    base_lrs = [group['lr'] for group in optimizer.param_groups]
+    ema_model = None
+    if args.ema_decay is not None:
+        ema_model = copy.deepcopy(model).eval()
+        ema_model.requires_grad_(False)
+        if resume is not None:
+            ema_model.load_state_dict(resume['training_state']['ema'])
     best = float('inf') if resume is None else resume['metrics']['best']
     bad_checks = 0 if resume is None else resume['training_state']['bad_checks']
     if resume is not None:
@@ -209,10 +271,15 @@ def train(args):
                   'gpu': torch.cuda.get_device_name() if amp else None,
                   'code_sha256': {f: hashlib.sha256((ROOT / f).read_bytes()).hexdigest() for f in sources}}
         (args.output / 'run.json').write_text(json.dumps(record, indent=2, ensure_ascii=False) + '\n')
-    def checkpoint(name, step, optimizer_state):
+    def checkpoint(name, step, optimizer_state, weights=None):
         state = {'settings': settings, 'rng': rng_state(), 'bad_checks': bad_checks}
-        save_checkpoint(args.output / name, model, meta['normalization'], info, step,
-                        optimizer if optimizer_state else None, {'best': best}, state)
+        if ema_model is not None and optimizer_state:
+            state['ema'] = {key: value.detach().cpu() for key, value in ema_model.state_dict().items()}
+        metrics = {'best': best}
+        if weights is not None and weights is ema_model:
+            metrics['weights'] = f'ema {args.ema_decay:g}'
+        save_checkpoint(args.output / name, model if weights is None else weights, meta['normalization'], info, step,
+                        optimizer if optimizer_state else None, metrics, state)
     flow = model.head == 'flow'
     names = ('loss', 'flow_mse', 'kl', 'phase_bce') if flow else ('loss', 'l1', 'kl', 'phase_bce')
     print(f'[TRAIN] {device} 24D head={model.head} train={len(train_data)} val={len(val_data)} '
@@ -223,11 +290,14 @@ def train(args):
     try:
         while step < args.steps:
             optimizer.zero_grad(set_to_none=True)
+            factor = lr_factor(step, args.steps, args.lr_schedule, args.warmup_steps, args.min_lr_ratio)
+            for group, base_lr in zip(optimizer.param_groups, base_lrs):
+                group['lr'] = base_lr * factor
             losses = []
             for _ in range(args.accumulate):
                 images, qpos, actions, pad, context, complete = [x.to(device, non_blocking=True) for x in next(stream)]
                 if not args.no_augment:
-                    images = augment_images(images)
+                    images = augment_images(images, max_shift=args.image_shift)
                 if noise is not None:
                     qpos = add_qpos_noise(qpos, noise)
                 with torch.autocast('cuda', dtype=torch.bfloat16, enabled=amp):
@@ -247,22 +317,32 @@ def train(args):
                 losses.append([float(loss), float(l1), float(kl), float(phase_loss)])
             torch.nn.utils.clip_grad_norm_(model.parameters(), 10.)
             optimizer.step(); step += 1
+            if ema_model is not None:
+                ema_update(ema_model, model, args.ema_decay, step)
             evaluate = step % args.eval_every == 0 or step == args.steps
             if step % args.log_every == 0 or evaluate:
                 entry = dict(zip(names, np.mean(losses, axis=0).tolist()))
-                entry.update(step=step, steps_per_s=(step-start) / max(time.monotonic()-began, 1e-6))
+                entry.update(step=step, steps_per_s=(step-start) / max(time.monotonic()-began, 1e-6),
+                             lr=optimizer.param_groups[0]['lr'])
                 if amp:
                     entry['peak_gpu_mb'] = torch.cuda.max_memory_allocated() / 2**20
                 if evaluate:
-                    entry['val_l1'], entry['val_phase_bce'] = validation_l1(model, val_loader, device, amp)
+                    scored = model if ema_model is None else ema_model
+                    entry['val_l1'], entry['val_phase_bce'] = validation_l1(scored, val_loader, device, amp)
+                    if ema_model is not None:
+                        ema_model.eval()
                     score = entry['val_l1'] + (entry['val_phase_bce'] * .1 if args.conditioned else 0.)
                     if score < best:
                         best, bad_checks = score, 0
-                        checkpoint('best.pt', step, False)
+                        checkpoint('best.pt', step, False, ema_model)
                     else:
                         bad_checks += 1
                 log.write(json.dumps(entry) + '\n'); log.flush()
                 print('[TRAIN] ' + json.dumps(entry), flush=True)
+            if args.snapshot_every and step % args.snapshot_every == 0:
+                checkpoint(f'step{step}.pt', step, False, ema_model)
+                if ema_model is not None:
+                    checkpoint(f'step{step}_raw.pt', step, False)
             if step % args.save_every == 0 or step == args.steps or bad_checks >= args.patience:
                 checkpoint('latest.pt', step, True)
             if bad_checks >= args.patience:

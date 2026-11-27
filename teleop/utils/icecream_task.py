@@ -28,10 +28,12 @@ def validate_annotation(annotation, directory, count, require_review=True):
     if annotation.get("frames_sha256") != source_digest(directory / "frames.jsonl"):
         raise ValueError(f"{directory.name}: phase annotation belongs to different frames")
     boundaries = annotation.get("boundaries")
+    # Equal neighbours mark a phase the recording skips: a DAgger correction that starts at the lever or at the
+    # final place has empty leading phases (run 13, 2026-11-26).
     if (not isinstance(boundaries, list) or len(boundaries) != len(PHASES) + 1
-            or any(type(v) is not int for v in boundaries) or boundaries[0] != 0
-            or boundaries[-1] != count or any(a >= b for a, b in zip(boundaries, boundaries[1:]))):
-        raise ValueError(f"{directory.name}: need six increasing frame boundaries from 0 to {count}")
+            or any(type(v) is not int for v in boundaries) or boundaries[0] != 0 or count < 1
+            or boundaries[-1] != count or any(a > b for a, b in zip(boundaries, boundaries[1:]))):
+        raise ValueError(f"{directory.name}: need six non-decreasing frame boundaries from 0 to {count}")
     return boundaries
 
 
