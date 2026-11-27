@@ -15,9 +15,10 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tools"))
 
-from teleop.utils.act_runtime import (ActionEnsemble, GravityModel, ensemble_window_ticks, ObservationBuilder, PolicyClient, PolicyGuard,
-                                      decode_request, decode_response, encode_request, encode_response, group_errors,
-                                      join_action, prepare_training_image, request_size, response_size, split_action)
+from teleop.utils.act_runtime import (ActionEnsemble, ChunkExecutor, GravityModel, ensemble_window_ticks, ObservationBuilder, PolicyClient,
+                                      PolicyGuard, decode_guide, decode_request, decode_response, encode_request, encode_response,
+                                      group_errors, join_action, odd_ticks, prepare_training_image, request_size, response_size,
+                                      rtc_weights, smooth_chunk, split_action)
 from teleop.utils.frame_sync import CameraSynchronizer
 
 HAS_TORCHVISION = importlib.util.find_spec("torchvision") is not None
@@ -657,6 +658,219 @@ class FlowModelTests(unittest.TestCase):
         self.assertEqual(train_r1_act.training_settings(flow)["head"], "flow")
         with self.assertRaises(SystemExit):
             train_r1_act.parse_args(["data", "--output", "run", "--head", "flow", "--flow-steps", "0"])
+
+
+class RealTimeChunkingTests(unittest.TestCase):
+    """--executor chunk / rtc (2026-11-26): follow the newest chunk, request every interval, smooth, crossfade,
+    and for rtc guide with the current chunk."""
+
+    def test_weights_freeze_the_delay_then_fall_to_zero_at_the_end_of_the_overlap(self):
+        weights = rtc_weights(10, 2, 7)
+        np.testing.assert_array_equal(weights[:2], [1.0, 1.0])
+        self.assertTrue(np.all(np.diff(weights[1:7]) < 0))
+        self.assertTrue(np.all((weights[2:7] > 0) & (weights[2:7] < 1)))
+        np.testing.assert_array_equal(weights[7:], [0.0, 0.0, 0.0])
+        np.testing.assert_array_equal(rtc_weights(10, 4, 0), np.zeros(10))
+        np.testing.assert_array_equal(rtc_weights(4, 9, 3), [1.0, 1.0, 1.0, 0.0])  # the freeze never outlives the chunk
+
+    def test_the_executor_follows_the_newest_chunk_alone(self):
+        executor = ChunkExecutor(4, 2, action_dim=1)
+        self.assertIsNone(executor.get(0))
+        executor.add(0, np.arange(4.0)[:, None])
+        executor.add(2, np.array([[10.0], [20.0], [30.0], [40.0]]))
+        executor.add(1, np.full((4, 1), 99.0))  # an older request answered late never replaces a newer chunk
+        self.assertEqual(executor.get(3)[0], 20.0)
+        self.assertEqual(executor.source, 2)
+        self.assertIsNone(executor.get(6))
+        executor.reset()
+        self.assertIsNone(executor.get(3))
+
+    def test_requests_go_out_at_once_then_every_interval(self):
+        executor = ChunkExecutor(80, 10)
+        self.assertTrue(executor.due(0))
+        executor.sent(0)
+        executor.add(0, np.zeros((80, 24)))
+        self.assertFalse(executor.due(9))
+        self.assertTrue(executor.due(10))
+
+    def test_the_guide_is_the_rest_of_the_current_chunk(self):
+        executor = ChunkExecutor(8, 3, action_dim=2)
+        chunk = np.arange(16.0).reshape(8, 2)
+        executor.add(5, chunk)
+        prefix, weights = executor.guide(8, 2)
+        np.testing.assert_array_equal(prefix[:5], chunk[3:])
+        np.testing.assert_array_equal(prefix[5:], np.zeros((3, 2)))
+        np.testing.assert_array_equal(weights, rtc_weights(8, 2, 5))
+
+    def test_the_guide_span_ends_guide_steps_after_the_freeze(self):
+        executor = ChunkExecutor(8, 3, action_dim=2, guide_steps=2)
+        executor.add(5, np.arange(16.0).reshape(8, 2))
+        np.testing.assert_array_equal(executor.guide(8, 1)[1], rtc_weights(8, 1, 3))
+        self.assertTrue(executor.guided)
+        self.assertFalse(ChunkExecutor(8, 3).guided)
+
+    def test_smoothing_follows_the_chunk_without_lag(self):
+        ramp = np.arange(10.0)[:, None] * np.ones((1, 3))
+        np.testing.assert_allclose(smooth_chunk(ramp, 5)[2:8], ramp[2:8])  # a straight line is left in place
+        jitter = np.zeros((10, 1))
+        jitter[4] = 5.0
+        np.testing.assert_allclose(smooth_chunk(jitter, 5)[2:7, 0], [1.0] * 5)
+        np.testing.assert_array_equal(smooth_chunk(jitter, 1), jitter)
+        self.assertEqual([odd_ticks(s, 40.0) for s in (0.0, 0.2, 0.25, 0.375)], [1, 9, 11, 15])
+        with self.assertRaises(ValueError):
+            ChunkExecutor(8, 3, smooth=4)
+
+    def test_a_switch_crossfades_from_the_old_chunk(self):
+        executor = ChunkExecutor(10, 3, action_dim=1, fade=3)
+        executor.add(0, np.zeros((10, 1)))
+        self.assertEqual(executor.get(0)[0], 0.0)
+        executor.add(2, np.full((10, 1), 4.0))
+        self.assertEqual([executor.get(t)[0] for t in (3, 4, 5, 6)], [1.0, 2.0, 3.0, 4.0])
+
+    def test_without_a_chunk_the_guide_asks_for_nothing(self):
+        prefix, weights = ChunkExecutor(8, 3).guide(0, 2)
+        self.assertEqual(prefix.shape, (8, 24))
+        self.assertFalse(prefix.any() or weights.any())
+
+    def test_the_interval_is_whole_ticks_inside_the_chunk(self):
+        for bad in (0, 8, 1.5, True):
+            with self.assertRaises(ValueError):
+                ChunkExecutor(8, bad)
+        for bad in (dict(fade=8), dict(fade=-1), dict(smooth=0), dict(guide_steps=-1)):
+            with self.assertRaises(ValueError):
+                ChunkExecutor(8, 3, **bad)
+
+    def test_a_guided_request_round_trips_at_its_declared_size(self):
+        qpos = np.arange(24, dtype=np.float32)
+        images = np.random.randint(0, 255, (4, 6, 8, 3), dtype=np.uint8)
+        prefix = np.random.rand(5, 24).astype(np.float32)
+        weights = rtc_weights(5, 1, 4)
+        payload = encode_request(qpos, images, None, (prefix, weights))
+        self.assertEqual(len(payload), request_size(24, 4, (6, 8), guide_shape=(5, 24)))
+        decoded_q, decoded_images, _ = decode_request(payload, 24, 4, (6, 8))
+        np.testing.assert_array_equal(decoded_q, qpos)
+        np.testing.assert_array_equal(decoded_images, images)
+        decoded_prefix, decoded_weights = decode_guide(payload, 5, 24)
+        np.testing.assert_array_equal(decoded_prefix, prefix)
+        np.testing.assert_array_equal(decoded_weights, weights)
+
+
+@unittest.skipUnless(HAS_TORCHVISION, "needs torchvision")
+class GuidedFlowTests(unittest.TestCase):
+    def setUp(self):
+        import torch
+        from teleop.utils.act_policy import ACTPolicy
+        self.torch = torch
+        torch.manual_seed(0)
+        self.model = ACTPolicy(24, 24, 4, chunk_size=5, hidden_dim=32, nheads=2, dim_feedforward=32, encoder_layers=1,
+                               decoder_layers=2, dropout=0.0, pretrained=False, head="flow", flow_steps=10).eval()
+        self.memory = torch.rand(1, 7, 32)
+
+    def test_the_guidance_weight_starts_at_beta_and_never_exceeds_it(self):
+        from teleop.utils.act_policy import rtc_guidance_weight
+        self.assertEqual(rtc_guidance_weight(0.0, 5.0), 5.0)
+        self.assertAlmostEqual(rtc_guidance_weight(0.5, 5.0), 2.0)
+        self.assertTrue(all(0 < rtc_guidance_weight(k / 10, 5.0) <= 5.0 for k in range(10)))
+
+    def test_zero_weights_sample_exactly_as_without_guidance(self):
+        prefix = self.torch.rand(1, 5, 24)
+        plain = self.model.sample(self.memory)
+        self.torch.testing.assert_close(self.model.sample_guided(self.memory, prefix, self.torch.zeros(5)), plain,
+                                        rtol=0, atol=0)
+
+    def test_guidance_pulls_the_weighted_steps_onto_the_prefix(self):
+        prefix = self.torch.randn(1, 5, 24)
+        weights = self.torch.tensor([1.0, 1.0, 1.0, 0.0, 0.0])
+        plain = self.model.sample(self.memory)
+        guided = self.model.sample_guided(self.memory, prefix, weights)
+        before = float((plain[0, :3] - prefix[0, :3]).abs().mean())
+        after = float((guided[0, :3] - prefix[0, :3]).abs().mean())
+        self.assertLess(after, 0.2 * before)
+        self.assertFalse(any(p.grad is not None for p in self.model.parameters()))
+
+    def test_the_predictor_continues_a_prefix_in_real_units(self):
+        from teleop.utils.act_policy import ChunkPredictor
+        normalization = {"qpos_mean": [0.0] * 24, "qpos_std": [1.0] * 24, "action_mean": [5.0] * 24, "action_std": [2.0] * 24}
+        predict = ChunkPredictor(self.model.requires_grad_(False), normalization, "cpu")
+        images, qpos = np.zeros((4, 48, 64, 3), dtype=np.uint8), np.zeros(24, dtype=np.float32)
+        plain, _ = predict(images, qpos)
+        same, _ = predict.guided(images, qpos, None, np.zeros((5, 24)), np.zeros(5))
+        np.testing.assert_array_equal(same, plain)
+        prefix = 5 + 2 * np.random.default_rng(1).standard_normal((5, 24)).astype(np.float32)
+        guided, _ = predict.guided(images, qpos, None, prefix, np.array([1, 1, 0, 0, 0], dtype=np.float32))
+        self.assertLess(np.abs(guided[:2] - prefix[:2]).mean(), 0.2 * np.abs(plain[:2] - prefix[:2]).mean())
+
+
+class RealTimeChunkingRunnerTests(unittest.TestCase):
+    def load(self):
+        import run_r1_act_policy
+        return run_r1_act_policy
+
+    def test_chunk_execution_is_off_by_default_and_its_settings_are_checked(self):
+        runner = self.load()
+        args = runner.parse_args(["policy.pt"])
+        self.assertEqual((args.executor, args.chunk_interval, args.chunk_smooth, args.chunk_fade, args.rtc_beta, args.rtc_guide),
+                         ("ensemble", 0.25, 0.375, 0.25, 5.0, 0.25))
+        args = runner.parse_args(["policy.pt", "--executor", "chunk", "--chunk-interval", "0.5", "--chunk-fade", "0"])
+        self.assertEqual((args.executor, args.chunk_interval, args.chunk_fade), ("chunk", 0.5, 0.0))
+        for bad in (["--chunk-interval", "0"], ["--rtc-beta", "-1"], ["--chunk-smooth", "-0.1"], ["--executor", "other"]):
+            with self.assertRaises(SystemExit):
+                runner.parse_args(["policy.pt", *bad])
+
+    def rtc_run(self, runner, log, executor=None):
+        arm = Mock()
+        arm.get_recording_snapshot.return_value = {"state": {"q": [0.0] * 14, "head_q": [0.0, 0.0], "waist_q": 0.0}}
+        hand = Mock()
+        hand.get_state.return_value = ([0.2] * 6, [4.8])
+        client = Mock(idle=True, failed=None)
+        client.poll.return_value = None
+        builder = Mock()
+        builder.build.return_value = (np.zeros(24, dtype=np.float32), np.zeros((4, 6, 8, 3), dtype=np.uint8), None)
+        run = runner.PolicyRun(arm, hand, lambda: (None, {}), client, builder,
+                               executor or ChunkExecutor(80, 10, guide_steps=10), PolicyGuard(NORMALIZATION), log)
+        run.fps = 1e-6  # ticks advance one per step, whatever the wall clock does
+        self.addCleanup(run.log.close)
+        return run
+
+    def test_requests_go_out_every_interval_with_the_current_chunk_as_their_guide(self):
+        runner = self.load()
+        with tempfile.TemporaryDirectory() as directory:
+            run = self.rtc_run(runner, Path(directory) / "ticks.jsonl")
+            chunk = np.linspace(0.0, 0.5, 80)[:, None] * np.ones((1, 24))
+            run.ensemble.add(0, chunk)
+            run.ensemble.sent(0)
+            targets = [run.step()[0] for _ in range(25)]
+            sent = run.client.send.call_args_list
+            self.assertEqual([call.args[0] for call in sent], [10, 20])
+            prefix, weights = sent[0].args[5]
+            np.testing.assert_allclose(prefix[:70], chunk[10:])
+            np.testing.assert_array_equal(weights, rtc_weights(80, 1, 11))  # the delay plus 10 guided steps
+            np.testing.assert_allclose(targets[12], chunk[12])
+            summary = run.summary()
+            self.assertEqual((summary["executor"], summary["interval_ticks"], summary["guided_requests"]), ("rtc", 10, 2))
+
+    def test_chunk_execution_paces_requests_but_sends_no_guide(self):
+        runner = self.load()
+        with tempfile.TemporaryDirectory() as directory:
+            run = self.rtc_run(runner, Path(directory) / "ticks.jsonl", ChunkExecutor(80, 10, smooth=15, fade=10))
+            run.ensemble.add(0, np.zeros((80, 24)))
+            run.ensemble.sent(0)
+            for _ in range(25):
+                run.step()
+            sent = run.client.send.call_args_list
+            self.assertEqual([(call.args[0], call.args[5]) for call in sent], [(10, None), (20, None)])
+            self.assertEqual((run.summary()["executor"], run.summary()["smooth_ticks"]), ("chunk", 15))
+
+    def test_the_freeze_covers_the_longest_recent_delay(self):
+        runner = self.load()
+        with tempfile.TemporaryDirectory() as directory:
+            run = self.rtc_run(runner, Path(directory) / "ticks.jsonl")
+            self.assertEqual(run.rtc_delay(), 1)
+            run.client.poll.side_effect = [((0, time.monotonic()), 30.0, np.zeros((80, 24)), None)] + [None] * 10
+            run.tick = 3
+            run.step()
+            self.assertEqual(run.rtc_delay(), 3)
+            self.assertEqual(run.ensemble.source, 0)
 
 
 if __name__ == "__main__":

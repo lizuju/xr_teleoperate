@@ -188,6 +188,35 @@ class ACTPolicy(nn.Module):
             x = x + self.velocity(memory, x, t).float() / steps
         return x
 
+    def sample_guided(self, memory, prefix, weights, beta=5.0, noise=None, steps=None):
+        """Real-time chunking (Black, Galliker and Levine 2025): sample() with a guidance term that pulls the chunk
+        toward prefix (batch, chunk, action, normalized) wherever weights (chunk,) are above 0.
+
+        At flow time t the model's estimate of the finished chunk is x + (1 - t) v. Its weighted error against the
+        prefix goes back to x through the vector-Jacobian product and is added to the velocity with weight
+        min(beta, (1 - t) / (t r^2)), r^2 = (1 - t)^2 / (t^2 + (1 - t)^2). Only the model's inputs get gradients;
+        all-zero weights give exactly sample().
+        """
+        weights = torch.as_tensor(weights, dtype=torch.float32, device=memory.device).view(1, -1, 1)
+        if not bool((weights > 0).any()):
+            return self.sample(memory, noise, steps)
+        batch = memory.shape[0]
+        x = (self.flow_noise.expand(batch, -1, -1) if noise is None else noise).float()
+        target = prefix.to(device=memory.device, dtype=torch.float32)
+        memory = memory.detach()
+        steps = self.flow_steps if steps is None else int(steps)
+        for k in range(steps):
+            tau = k / steps
+            t = torch.full((batch,), tau, device=x.device)
+            with torch.enable_grad():
+                current = x.detach().requires_grad_(True)
+                velocity = self.velocity(memory, current, t).float()
+                finished = current + (1 - tau) * velocity
+                correction, = torch.autograd.grad(finished, current,
+                                                  grad_outputs=(target - finished.detach()) * weights)
+            x = current.detach() + (velocity.detach() + rtc_guidance_weight(tau, beta) * correction) / steps
+        return x
+
     def flow_targets(self, images, qpos, actions, is_pad=None, context=None):
         """One rectified-flow training pass: predicted velocity, target velocity and completion logits.
 
@@ -208,6 +237,14 @@ class ACTPolicy(nn.Module):
         chosen = {id(p) for p in backbone}
         return [{"params": [p for p in self.parameters() if id(p) not in chosen and p.requires_grad], "lr": lr},
                 {"params": backbone, "lr": lr_backbone}]
+
+
+def rtc_guidance_weight(tau, beta):
+    """Guidance weight of real-time chunking at flow time tau: min(beta, (1 - tau) / (tau r^2)), beta at tau = 0."""
+    if tau <= 0:
+        return float(beta)
+    r2 = (1 - tau) ** 2 / (tau ** 2 + (1 - tau) ** 2)
+    return float(min(beta, (1 - tau) / (tau * r2)))
 
 
 def masked_l1(pred, target, is_pad):
@@ -282,14 +319,42 @@ class ChunkPredictor:
         self.stats = {key: torch.as_tensor(np.asarray(normalization[key], dtype=np.float32), device=device)
                       for key in ("qpos_mean", "qpos_std", "action_mean", "action_std")}
 
-    @torch.inference_mode()
-    def __call__(self, images, qpos, context=None):
+    def _inputs(self, images, qpos, context):
         images = torch.from_numpy(images).to(self.device).permute(0, 3, 1, 2)[None].float() / 255
         qpos = torch.from_numpy(qpos).to(self.device)[None]
         qpos = (qpos - self.stats["qpos_mean"]) / self.stats["qpos_std"]
-        with torch.autocast(self.device.split(":")[0], dtype=torch.bfloat16, enabled=self.device.startswith("cuda")):
-            task = None if context is None else torch.from_numpy(context).to(self.device)[None]
+        task = None if context is None else torch.from_numpy(context).to(self.device)[None]
+        return images, qpos, task
+
+    def _autocast(self):
+        return torch.autocast(self.device.split(":")[0], dtype=torch.bfloat16, enabled=self.device.startswith("cuda"))
+
+    def _real(self, chunk):
+        return (chunk.float() * self.stats["action_std"] + self.stats["action_mean"]).cpu().numpy()
+
+    @torch.inference_mode()
+    def __call__(self, images, qpos, context=None):
+        images, qpos, task = self._inputs(images, qpos, context)
+        with self._autocast():
             output = self.model(images, qpos, context=task)
             chunk = output[0][0]
             complete = None if output[3] is None else float(output[3].sigmoid()[0])
-        return (chunk.float() * self.stats["action_std"] + self.stats["action_mean"]).cpu().numpy(), complete
+        return self._real(chunk), complete
+
+    def guided(self, images, qpos, context, prefix, weights, beta=5.0):
+        """Real-time chunking: like __call__, but the flow integration continues prefix (real units, chunk x action)
+        where weights (chunk,) are above 0. All-zero weights are exactly __call__. Flow head only."""
+        weights = np.asarray(weights, dtype=np.float32)
+        if not (weights > 0).any():
+            return self(images, qpos, context)
+        if self.model.head != "flow":
+            raise ValueError("real-time chunking needs a flow policy")
+        images, qpos, task = self._inputs(images, qpos, context)
+        guide = torch.from_numpy(np.asarray(prefix, dtype=np.float32)).to(self.device)[None]
+        guide = (guide - self.stats["action_mean"]) / self.stats["action_std"]
+        with self._autocast():
+            with torch.no_grad():
+                memory, complete = self.model.encode_memory(images, qpos, task)
+            chunk = self.model.sample_guided(memory, guide, torch.from_numpy(weights), beta)[0]
+        complete = None if complete is None else float(complete.sigmoid()[0])
+        return self._real(chunk.detach()), complete

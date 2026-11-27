@@ -147,6 +147,125 @@ class ActionEnsemble:
         return (np.asarray(votes, dtype=np.float64) * (weights / weights.sum())[:, None]).sum(axis=0)
 
 
+def rtc_weights(chunk_size, delay, overlap):
+    """Real-time chunking guidance weights for a chunk requested while `overlap` steps of the current one remain.
+
+    The first `delay` steps run from the current chunk while the new one is computed, so they must match it (1).
+    From there the weight falls exponentially to 0 at the end of the current chunk (the soft mask of Black et al.
+    2025, c (e^c - 1) / (e - 1)), and the steps after it are left to the policy (0)."""
+    weights = np.zeros(chunk_size, dtype=np.float32)
+    overlap = max(0, min(int(overlap), chunk_size))
+    delay = max(0, min(int(delay), overlap))
+    weights[:delay] = 1.0
+    if overlap > delay:
+        c = (overlap - np.arange(delay, overlap)) / (overlap - delay + 1)
+        weights[delay:overlap] = c * np.expm1(c) / (math.e - 1)
+    return weights
+
+
+def smooth_chunk(chunk, window):
+    """Centered moving average along a chunk's own time axis (edge steps repeated), so it adds no lag.
+    window is a whole, odd number of steps; 1 leaves the chunk as it is."""
+    chunk = np.asarray(chunk, dtype=np.float64)
+    if window <= 1:
+        return chunk
+    pad = window // 2
+    padded = np.concatenate((np.repeat(chunk[:1], pad, axis=0), chunk, np.repeat(chunk[-1:], pad, axis=0)))
+    sums = np.cumsum(np.concatenate((np.zeros((1, chunk.shape[1])), padded)), axis=0)
+    return (sums[window:] - sums[:-window]) / window
+
+
+def odd_ticks(seconds, fps):
+    """A smoothing window in seconds as an odd number of ticks; 0 s is 1 tick (no smoothing)."""
+    ticks = max(1, int(round(seconds * fps)))
+    return ticks if ticks % 2 else ticks + 1
+
+
+class ChunkExecutor:
+    """Chunk execution instead of temporal ensembling: every tick follows the newest chunk alone, and a new chunk
+    is requested every `interval` ticks. A flow policy's chunk jitters from step to step, which ensembling used to
+    average away, so each chunk is smoothed along its own time axis (`smooth` steps, centered, no lag) and the
+    first `fade` ticks after a switch crossfade from the old chunk to the new one.
+
+    guide_steps turns on real-time chunking (Black, Galliker and Levine 2025): each request also carries the rest
+    of the current chunk, and the policy is guided to continue it over the frozen delay plus guide_steps steps.
+    None sends no guide. Same add/get/reset as ActionEnsemble."""
+
+    def __init__(self, chunk_size, interval, action_dim=ACTION_DIM, smooth=1, fade=0, guide_steps=None):
+        def whole(value, low, high, name):
+            if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
+                raise ValueError(f"{name} must be a whole number of ticks from {low} to {high}, not {value!r}")
+        whole(interval, 1, chunk_size - 1, "interval")
+        whole(smooth, 1, chunk_size, "smooth")
+        if smooth % 2 == 0:
+            raise ValueError(f"smooth must be odd, not {smooth}")
+        whole(fade, 0, chunk_size - 1, "fade")
+        if guide_steps is not None:
+            whole(guide_steps, 0, chunk_size, "guide_steps")
+        self.chunk_size, self.interval, self.action_dim = chunk_size, interval, action_dim
+        self.smooth, self.fade, self.guide_steps = smooth, fade, guide_steps
+        self.reset()
+
+    @property
+    def guided(self):
+        return self.guide_steps is not None
+
+    def reset(self):
+        self.current = self.previous = None
+        self.requested_at = self.switched_at = None
+        self._switching = False
+
+    def add(self, start_tick, chunk):
+        if len(chunk) != self.chunk_size:
+            raise ValueError(f"expected a chunk of {self.chunk_size}, got {len(chunk)}")
+        if self.current is None or start_tick >= self.current[0]:
+            self.previous = self.current
+            self.current = (start_tick, smooth_chunk(chunk, self.smooth))
+            self._switching = True
+
+    @property
+    def source(self):
+        """Request tick of the chunk being followed, or None."""
+        return None if self.current is None else self.current[0]
+
+    def get(self, tick):
+        if self.current is None:
+            return None
+        if self._switching:
+            self.switched_at, self._switching = tick, False
+        start, chunk = self.current
+        if not 0 <= tick - start < self.chunk_size:
+            return None
+        value = chunk[tick - start].copy()
+        since = tick - self.switched_at
+        if self.previous is not None and 0 <= since < self.fade:
+            old_start, old = self.previous
+            if 0 <= tick - old_start < self.chunk_size:
+                alpha = (since + 1) / (self.fade + 1)
+                value = (1 - alpha) * old[tick - old_start] + alpha * value
+        return value
+
+    def due(self, tick):
+        """Whether a request should go out at this tick: at once without a chunk, then every interval ticks."""
+        return self.current is None or self.requested_at is None or tick - self.requested_at >= self.interval
+
+    def guide(self, tick, delay):
+        """(prefix, weights) for a request sent at `tick` whose chunk is expected `delay` ticks later.
+        Without a current chunk the weights are all 0, which samples exactly as without guidance."""
+        prefix = np.zeros((self.chunk_size, self.action_dim), dtype=np.float32)
+        if self.current is None:
+            return prefix, np.zeros(self.chunk_size, dtype=np.float32)
+        start, chunk = self.current
+        overlap = max(0, self.chunk_size - max(0, tick - start))
+        if overlap:
+            prefix[:overlap] = chunk[self.chunk_size - overlap:]
+        span = overlap if self.guide_steps is None else min(overlap, delay + self.guide_steps)
+        return prefix, rtc_weights(self.chunk_size, delay, span)
+
+    def sent(self, tick):
+        self.requested_at = tick
+
+
 class ObservationBuilder:
     """Rebuilds one training row from live data, under the same rules as the exporter."""
 
@@ -279,25 +398,43 @@ class GravityModel:
         return np.array(self.pin.rnea(self.model, self.data, np.asarray(arm_q, dtype=np.float64), self.zero, self.zero))
 
 
-def request_size(state_dim, cameras, image_hw, context_dim=0):
-    return (state_dim + context_dim) * 4 + cameras * image_hw[0] * image_hw[1] * 3
+def guide_size(guide_shape):
+    """Bytes of a real-time chunking guide: the prefix (chunk x action) and its weights (chunk), float32."""
+    return 0 if guide_shape is None else (guide_shape[0] * guide_shape[1] + guide_shape[0]) * 4
+
+
+def request_size(state_dim, cameras, image_hw, context_dim=0, guide_shape=None):
+    """guide_shape (chunk, action) for a real-time chunking worker, whose every request ends with a guide."""
+    return (state_dim + context_dim) * 4 + cameras * image_hw[0] * image_hw[1] * 3 + guide_size(guide_shape)
 
 
 def response_size(chunk_size, action_dim):
     return 16 + chunk_size * action_dim * 4
 
 
-def encode_request(qpos, images, context=None):
+def encode_request(qpos, images, context=None, guide=None):
+    """guide = (prefix, weights) is appended after the images, for a real-time chunking worker."""
     task = b"" if context is None else np.asarray(context, dtype=np.float32).tobytes()
-    return np.asarray(qpos, dtype=np.float32).tobytes() + task + np.asarray(images, dtype=np.uint8).tobytes()
+    tail = b"" if guide is None else (np.asarray(guide[0], dtype=np.float32).tobytes()
+                                      + np.asarray(guide[1], dtype=np.float32).tobytes())
+    return np.asarray(qpos, dtype=np.float32).tobytes() + task + np.asarray(images, dtype=np.uint8).tobytes() + tail
 
 
 def decode_request(payload, state_dim, cameras, image_hw, context_dim=0):
     split = state_dim * 4
     end = split + context_dim * 4
+    image_end = end + cameras * image_hw[0] * image_hw[1] * 3
     return (np.frombuffer(payload[:split], dtype=np.float32).copy(),
-            np.frombuffer(payload[end:], dtype=np.uint8).reshape(cameras, *image_hw, 3).copy(),
+            np.frombuffer(payload[end:image_end], dtype=np.uint8).reshape(cameras, *image_hw, 3).copy(),
             np.frombuffer(payload[split:end], dtype=np.float32).copy())
+
+
+def decode_guide(payload, chunk_size, action_dim):
+    """The (prefix, weights) a real-time chunking request ends with."""
+    tail = payload[len(payload) - guide_size((chunk_size, action_dim)):]
+    split = chunk_size * action_dim * 4
+    return (np.frombuffer(tail[:split], dtype=np.float32).reshape(chunk_size, action_dim).copy(),
+            np.frombuffer(tail[split:], dtype=np.float32).copy())
 
 
 def encode_response(inference_ms, chunk, completion=None):
@@ -378,10 +515,10 @@ class PolicyClient:
         with self._lock:
             return self._pending is None and not self._responses
 
-    def send(self, tick, sent_at, qpos, images, context=None):
+    def send(self, tick, sent_at, qpos, images, context=None, guide=None):
         with self._lock:
             self._pending = (tick, sent_at)
-        self._outbox.put_nowait(encode_request(qpos, images, context))
+        self._outbox.put_nowait(encode_request(qpos, images, context, guide))
 
     def poll(self):
         """((tick, sent_at), inference_ms, chunk, completion) for a finished request, else None."""
